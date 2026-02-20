@@ -8,8 +8,6 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Only run if NOT pushed by getlisa (Vercel auto-deploys for getlisa)
-    if: github.actor != 'getlisa'
 
     steps:
       - name: Deploy to Vercel Production
