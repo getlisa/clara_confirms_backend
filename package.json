@@ -1,0 +1,26 @@
+{
+  "name": "clara_confirms_backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "test-db.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:db": "node test-db.js",
+    "migrate": "node scripts/run-migrations.js",
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@sendgrid/mail": "^8.1.6",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.18.0"
+  }
+}
