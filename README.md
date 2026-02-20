@@ -21,6 +21,8 @@ npm run dev
 
 Runs at `http://localhost:3000` by default.
 
+**ServiceTrade integration** (optional): set `SERVICETRADE_USERNAME` and `SERVICETRADE_PASSWORD` in `.env` for basic auth. Optional: `SERVICETRADE_BASE_URL` (default `https://api.servicetrade.com/api`). Authenticated endpoints: `POST /integrations/servicetrade/login`, `GET /integrations/servicetrade/status`, `DELETE /integrations/servicetrade/session`.
+
 ### Frontend
 
 ```bash

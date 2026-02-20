@@ -27,4 +27,9 @@ module.exports = {
     fromEmail: process.env.SENDGRID_FROM_EMAIL || "developer@justclara.ai",
     fromName: process.env.SENDGRID_FROM_NAME || "Clara Confirms",
   },
+  servicetrade: {
+    baseUrl: (process.env.SERVICETRADE_BASE_URL || "https://api.servicetrade.com/api").replace(/\/$/, ""),
+    username: process.env.SERVICETRADE_USERNAME || "",
+    password: process.env.SERVICETRADE_PASSWORD || "",
+  },
 };

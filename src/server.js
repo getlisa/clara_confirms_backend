@@ -12,6 +12,7 @@ const db = require("./db");
 const { authRoutes } = require("./auth");
 const companyRoutes = require("./routes/company");
 const usersRoutes = require("./routes/users");
+const servicetradeRoutes = require("./routes/servicetrade");
 
 const app = express();
 
@@ -93,6 +94,9 @@ app.use("/company", companyRoutes);
 
 // Users routes - requires auth (admin for most operations)
 app.use("/users", usersRoutes);
+
+// ServiceTrade integration - requires auth
+app.use("/integrations/servicetrade", servicetradeRoutes);
 
 // 404 handler
 app.use((req, res) => {
