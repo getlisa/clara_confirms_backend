@@ -1,0 +1,69 @@
+name: Deploy to Vercel
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Only run if NOT pushed by getlisa (Vercel auto-deploys for getlisa)
+    if: github.actor != 'getlisa'
+
+    steps:
+      - name: Deploy to Vercel Production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          # For personal/free account leave empty; for team use e.g. team_xxxx
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          # Personal account: use URL without teamId. Team: append "?teamId=$VERCEL_TEAM_ID"
+          if [ -z "${VERCEL_TEAM_ID:-}" ]; then
+            DEPLOY_URL="https://api.vercel.com/v13/deployments"
+          else
+            DEPLOY_URL="https://api.vercel.com/v13/deployments?teamId=${VERCEL_TEAM_ID}"
+          fi
+
+          RESPONSE="$(curl -sS -X POST "$DEPLOY_URL" \
+            -H "Authorization: Bearer $VERCEL_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "clara-confirms-backend",
+              "project": "prj_k2T5i9l3qTcklxa1Gnle69k6cQ48",
+              "target": "production",
+              "gitSource": {
+                "type": "github",
+                "repo": "getlisa/clara_confirms_backend",
+                "ref": "main",
+                "repoId": 1162888161
+              }
+            }')"
+
+          echo "$RESPONSE"
+
+          export RESPONSE_JSON="$RESPONSE"
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          data = json.loads(os.environ.get("RESPONSE_JSON", "{}"))
+          error = data.get("error")
+          if error:
+              if isinstance(error, dict):
+                  message = error.get("message", str(error))
+              else:
+                  message = str(error)
+              print(f"Vercel deploy failed: {message}")
+              sys.exit(1)
+
+          url = data.get("url")
+          if not url:
+              print("Vercel deploy failed: missing deployment URL")
+              sys.exit(1)
+
+          print(f"Deployment URL: https://{url}")
+          PY
