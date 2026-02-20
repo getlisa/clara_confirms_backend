@@ -141,6 +141,8 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-start();
+if (process.env.VERCEL !== "1") {
+  start();
+}
 
 module.exports = app;
