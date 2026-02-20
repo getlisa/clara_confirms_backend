@@ -5,7 +5,7 @@ Confirm inspections with confidence. Manage locations, inspections, calls, and a
 ## Repo structure
 
 - **clara-confirms** – Frontend (React + Vite), deploy to Vercel
-- **clara_confirms_backend** – Backend (Node.js + Express + PostgreSQL), deploy to Railway / Render / Fly.io
+- **clara_confirms_backend** – Backend (Node.js + Express + PostgreSQL)
 
 ## Local setup
 
