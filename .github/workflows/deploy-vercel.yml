@@ -1,24 +1,37 @@
 name: Deploy to Vercel
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy'
+        required: true
+        default: 'main'
+        type: string
+      environment:
+        description: 'Deployment target'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - preview
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Deploy to Vercel Production
+      - name: Deploy to Vercel
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          # For personal/free account leave empty; for team use e.g. team_xxxx
           VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
         run: |
           set -euo pipefail
 
-          # Personal account: use URL without teamId. Team: append "?teamId=$VERCEL_TEAM_ID"
+          TARGET="${{ github.event.inputs.environment }}"
+          BRANCH="${{ github.event.inputs.branch }}"
+          echo "Deploying branch '$BRANCH' to $TARGET..."
+
           if [ -z "${VERCEL_TEAM_ID:-}" ]; then
             DEPLOY_URL="https://api.vercel.com/v13/deployments"
           else
@@ -28,17 +41,17 @@ jobs:
           RESPONSE="$(curl -sS -X POST "$DEPLOY_URL" \
             -H "Authorization: Bearer $VERCEL_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{
-              "name": "clara-confirms-backend",
-              "project": "prj_k2T5i9l3qTcklxa1Gnle69k6cQ48",
-              "target": "production",
-              "gitSource": {
-                "type": "github",
-                "repo": "getlisa/clara_confirms_backend",
-                "ref": "main",
-                "repoId": 1162888161
+            -d "{
+              \"name\": \"clara-confirms-backend\",
+              \"project\": \"prj_k2T5i9l3qTcklxa1Gnle69k6cQ48\",
+              \"target\": \"$TARGET\",
+              \"gitSource\": {
+                \"type\": \"github\",
+                \"repo\": \"getlisa/clara_confirms_backend\",
+                \"ref\": \"$BRANCH\",
+                \"repoId\": 1162888161
               }
-            }')"
+            }")"
 
           echo "$RESPONSE"
 
