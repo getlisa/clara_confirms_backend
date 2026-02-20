@@ -14,7 +14,7 @@ class Database {
       min: isServerless ? 0 : config.database.poolMin,
       max: isServerless ? 2 : config.database.poolMax,
       idleTimeoutMillis: isPgBouncer ? 0 : 30000,
-      connectionTimeoutMillis: isServerless ? 30000 : 10000,
+      connectionTimeoutMillis: isServerless ? 30000 : 15000,
       statement_timeout: isServerless ? 30000 : undefined,
       ssl:
         process.env.DATABASE_URL?.includes("sslmode=require") ||
