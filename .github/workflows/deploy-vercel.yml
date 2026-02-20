@@ -1,6 +1,9 @@
 name: Deploy to Vercel
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       branch:
@@ -20,6 +23,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    if: github.actor != 'getlisa'
     steps:
       - name: Deploy to Vercel
         env:
@@ -28,8 +32,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          TARGET="${{ github.event.inputs.environment }}"
-          BRANCH="${{ github.event.inputs.branch }}"
+          TARGET="${{ github.event.inputs.environment || 'production' }}"
+          BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
           echo "Deploying branch '$BRANCH' to $TARGET..."
 
           if [ -z "${VERCEL_TEAM_ID:-}" ]; then
