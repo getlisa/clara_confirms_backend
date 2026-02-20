@@ -11,6 +11,7 @@ const logger = require("./utils/logger");
 const db = require("./db");
 const { authRoutes } = require("./auth");
 const companyRoutes = require("./routes/company");
+const usersRoutes = require("./routes/users");
 
 const app = express();
 
@@ -89,6 +90,9 @@ app.use("/auth", authRoutes);
 
 // Company (tenant) routes - requires auth
 app.use("/company", companyRoutes);
+
+// Users routes - requires auth (admin for most operations)
+app.use("/users", usersRoutes);
 
 // 404 handler
 app.use((req, res) => {

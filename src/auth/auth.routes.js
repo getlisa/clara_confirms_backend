@@ -369,6 +369,7 @@ router.post("/verify-email-link", async (req, res) => {
 /**
  * POST /auth/reset-password
  * Reset password using token from email (SendGrid link)
+ * Supports both password_reset tokens and invite tokens
  * Body: { token } or { access_token }, and { new_password }
  */
 router.post("/reset-password", async (req, res) => {
@@ -389,26 +390,32 @@ router.post("/reset-password", async (req, res) => {
     }
 
     let email;
+    let isInvite = false;
     try {
       const decoded = jwt.verify(token, config.jwt.secret);
-      if (decoded.type !== "password_reset" || !decoded.email) {
+      if (decoded.type === "password_reset" && decoded.email) {
+        email = decoded.email;
+      } else if (decoded.type === "invite" && decoded.email) {
+        email = decoded.email;
+        isInvite = true;
+      } else {
         throw new Error("Invalid token type");
       }
-      email = decoded.email;
     } catch (e) {
-      return res.status(400).json({ error: "Invalid or expired reset token" });
+      return res.status(400).json({ error: "Invalid or expired token" });
     }
 
     const user = await authService.getUserByEmail(email);
     if (!user) {
-      return res.status(400).json({ error: "Invalid or expired reset token" });
+      return res.status(400).json({ error: "Invalid or expired token" });
     }
 
     await authService.updatePasswordByEmail(email, newPassword);
     clearUserCache(user.id);
 
-    logger.info("Password reset successful", { email: email.substring(0, 3) + "***" });
-    return res.json({ message: "Password reset successful" });
+    const message = isInvite ? "Account setup successful" : "Password reset successful";
+    logger.info(message, { email: email.substring(0, 3) + "***", isInvite });
+    return res.json({ message });
   } catch (err) {
     logger.error("Password reset failed", { error: err.message });
     return res.status(err.status || 500).json({
