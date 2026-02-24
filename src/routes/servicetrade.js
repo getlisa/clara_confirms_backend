@@ -1,6 +1,6 @@
 /**
  * ServiceTrade integration routes
- * Credentials are stored per company in company_servicetrade table.
+ * Stores auth_code (session token) per company only; password is never stored.
  * All routes require app authentication.
  */
 
@@ -17,12 +17,12 @@ router.use(authenticate);
 
 /**
  * POST /integrations/servicetrade/credentials
- * Save ServiceTrade username/password for the current user's company and connect.
- * Body: { username, password }
+ * Log in to ServiceTrade with username/password (password not stored), save auth_code and connect.
+ * Body: { username, password, metadata? } — on reconnect, metadata is merged with existing.
  */
 router.post("/credentials", async (req, res) => {
   const companyId = req.user.companyId;
-  const { username, password } = req.body || {};
+  const { username, password, metadata } = req.body || {};
 
   if (!username || !password) {
     return res.status(400).json({
@@ -31,15 +31,14 @@ router.post("/credentials", async (req, res) => {
   }
 
   try {
-    await credentialsDb.upsert(companyId, username.trim(), password);
     const result = await servicetrade.login(companyId, username.trim(), password);
     if (!result) {
       return res.status(403).json({
         connected: false,
         error: "Invalid ServiceTrade credentials",
-        message: "Credentials were saved. Check username and password and try again.",
       });
     }
+    await credentialsDb.upsert(companyId, username.trim(), result.authToken, metadata);
     return res.json({
       connected: true,
       user: result.user,
@@ -56,52 +55,32 @@ router.post("/credentials", async (req, res) => {
 
 /**
  * POST /integrations/servicetrade/login
- * Log in using stored credentials for the company (no body).
- * Use after credentials are already saved via POST /credentials.
+ * Cannot re-login without password; password is not stored. Use POST /credentials with username and password to connect.
  */
 router.post("/login", async (req, res) => {
-  const companyId = req.user.companyId;
-
-  try {
-    const creds = await credentialsDb.getByCompanyId(companyId);
-    if (!creds) {
-      return res.status(400).json({
-        error: "ServiceTrade credentials not configured for this company",
-        detail: "Save credentials first via POST /integrations/servicetrade/credentials",
-      });
-    }
-
-    const result = await servicetrade.login(companyId, creds.username, creds.password);
-    if (!result) {
-      return res.status(403).json({
-        connected: false,
-        error: "Invalid ServiceTrade credentials",
-      });
-    }
-    return res.json({
-      connected: true,
-      user: result.user,
-      message: "Successfully authenticated with ServiceTrade",
-    });
-  } catch (err) {
-    logger.error("ServiceTrade login error", { error: err.message });
-    return res.status(502).json({
-      connected: false,
-      error: "ServiceTrade request failed",
-      detail: config.nodeEnv === "development" ? err.message : undefined,
-    });
-  }
+  return res.status(400).json({
+    error: "Password is not stored. Use POST /credentials with username and password to connect.",
+  });
 });
 
 /**
  * GET /integrations/servicetrade/status
- * Check current ServiceTrade connection for the company (uses stored creds if needed).
+ * Check connection using stored auth_code (no password). If token invalid, user must connect again.
  */
 router.get("/status", async (req, res) => {
   const companyId = req.user.companyId;
 
   try {
-    let session = await servicetrade.getSession(companyId);
+    const creds = await credentialsDb.getByCompanyId(companyId);
+    if (!creds) {
+      return res.json({
+        connected: false,
+        hasCredentials: false,
+        message: "No ServiceTrade connection. Connect with username and password.",
+      });
+    }
+
+    const session = await servicetrade.getSession(companyId, creds.authCode);
     if (session) {
       return res.json({
         connected: true,
@@ -110,28 +89,10 @@ router.get("/status", async (req, res) => {
       });
     }
 
-    const creds = await credentialsDb.getByCompanyId(companyId);
-    if (!creds) {
-      return res.json({
-        connected: false,
-        hasCredentials: false,
-        message: "No ServiceTrade credentials saved. Connect with username and password.",
-      });
-    }
-
-    const result = await servicetrade.login(companyId, creds.username, creds.password);
-    if (result) {
-      return res.json({
-        connected: true,
-        user: result.user,
-        hasCredentials: true,
-      });
-    }
-
     return res.json({
       connected: false,
-      hasCredentials: true,
-      message: "Saved credentials are invalid. Update them to reconnect.",
+      hasCredentials: false,
+      message: "Session expired or invalid. Connect again with username and password.",
     });
   } catch (err) {
     logger.error("ServiceTrade status error", { error: err.message });
@@ -145,13 +106,17 @@ router.get("/status", async (req, res) => {
 
 /**
  * DELETE /integrations/servicetrade/session
- * Close current ServiceTrade session for the company (does not delete saved credentials).
+ * Close ServiceTrade session and clear stored username and auth_code; metadata is preserved.
  */
 router.delete("/session", async (req, res) => {
   const companyId = req.user.companyId;
 
   try {
-    await servicetrade.logout(companyId);
+    const creds = await credentialsDb.getByCompanyId(companyId);
+    if (creds) {
+      await servicetrade.logout(companyId, creds.authCode);
+    }
+    await credentialsDb.clearCredentials(companyId);
     return res.status(204).send();
   } catch (err) {
     logger.error("ServiceTrade logout error", { error: err.message });
