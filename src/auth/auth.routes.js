@@ -329,7 +329,7 @@ router.post("/verify-email-link", async (req, res) => {
     }
 
     const user = await authService.getUserByEmail(decoded.email);
-    if (!user || !user.active) {
+    if (!user || !user.is_active) {
       return res.status(400).json({ error: "Invalid or expired link" });
     }
 

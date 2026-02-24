@@ -11,6 +11,7 @@ const config = require("../config");
 const logger = require("../utils/logger");
 const { authenticate, requireRole } = require("../auth/auth.middleware");
 const { sendMail, buildEmailTemplate } = require("../utils/email");
+const companySettings = require("../db/company-settings");
 
 const router = express.Router();
 
@@ -21,9 +22,9 @@ const router = express.Router();
 router.get("/", authenticate, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT id, email, first_name, last_name, role, active, created_at, last_login
+      `SELECT id, email, first_name, last_name, role, is_active, created_at, last_login
        FROM users
-       WHERE company_id = $1
+       WHERE company_id = $1 AND is_deleted = FALSE
        ORDER BY created_at ASC`,
       [req.user.companyId]
     );
@@ -35,7 +36,7 @@ router.get("/", authenticate, async (req, res) => {
       last_name: row.last_name,
       name: [row.first_name, row.last_name].filter(Boolean).join(" ").trim(),
       role: row.role,
-      active: row.active,
+      active: row.is_active,
       created_at: row.created_at,
       last_login: row.last_login,
     }));
@@ -73,6 +74,27 @@ router.post("/invite", authenticate, requireRole("admin"), async (req, res) => {
       return res.status(409).json({ error: "Email is already registered" });
     }
 
+    // Enforce max_users from company_settings (count only non-deleted users)
+    const companyId = req.user.companyId;
+    if (companyId == null) {
+      logger.warn("Invite rejected: company context missing");
+      return res.status(400).json({ error: "Company context missing" });
+    }
+    const maxUsers = Number(await companySettings.getMaxUsers(companyId)) || companySettings.DEFAULT_MAX_USERS;
+    const countResult = await db.query(
+      "SELECT COUNT(*)::int AS count FROM users WHERE company_id = $1 AND is_deleted = FALSE",
+      [companyId]
+    );
+    const currentCount = Number(countResult.rows[0]?.count ?? 0);
+    logger.info("Invite max_users check", { companyId, currentCount, maxUsers, allowed: currentCount < maxUsers });
+    if (currentCount >= maxUsers) {
+      return res.status(403).json({
+        error: "User limit reached",
+        message: `This company can have up to ${maxUsers} user(s). Contact your admin to increase the limit.`,
+        max_users: maxUsers,
+      });
+    }
+
     // Get company name for the email
     const companyResult = await db.query(
       "SELECT name FROM companies WHERE id = $1",
@@ -82,9 +104,9 @@ router.post("/invite", authenticate, requireRole("admin"), async (req, res) => {
 
     // Insert user without password (invited, pending setup)
     const insertResult = await db.query(
-      `INSERT INTO users (company_id, email, first_name, last_name, role, active)
+      `INSERT INTO users (company_id, email, first_name, last_name, role, is_active)
        VALUES ($1, $2, $3, $4, $5, true)
-       RETURNING id, email, first_name, last_name, role, active, created_at`,
+       RETURNING id, email, first_name, last_name, role, is_active, created_at`,
       [req.user.companyId, normalizedEmail, first_name.trim(), (last_name || "").trim(), userRole]
     );
     const newUser = insertResult.rows[0];
@@ -138,7 +160,7 @@ router.post("/invite", authenticate, requireRole("admin"), async (req, res) => {
         last_name: newUser.last_name,
         name: [newUser.first_name, newUser.last_name].filter(Boolean).join(" ").trim(),
         role: newUser.role,
-        active: newUser.active,
+        active: newUser.is_active,
         created_at: newUser.created_at,
       },
     });
@@ -159,9 +181,9 @@ router.patch("/:id", authenticate, requireRole("admin"), async (req, res) => {
     const userId = req.params.id;
     const { role, active } = req.body;
 
-    // Verify user belongs to the same company
+    // Verify user belongs to the same company and is not soft-deleted
     const userResult = await db.query(
-      "SELECT id, company_id, email, first_name, last_name, role, active FROM users WHERE id = $1",
+      "SELECT id, company_id, email, first_name, last_name, role, is_active FROM users WHERE id = $1 AND is_deleted = FALSE",
       [userId]
     );
     if (userResult.rows.length === 0) {
@@ -194,7 +216,7 @@ router.patch("/:id", authenticate, requireRole("admin"), async (req, res) => {
       values.push(newRole);
     }
     if (active !== undefined) {
-      updates.push(`active = $${i++}`);
+      updates.push(`is_active = $${i++}`);
       values.push(Boolean(active));
     }
 
@@ -210,7 +232,7 @@ router.patch("/:id", authenticate, requireRole("admin"), async (req, res) => {
 
     // Fetch updated user
     const updatedResult = await db.query(
-      "SELECT id, email, first_name, last_name, role, active, created_at, last_login FROM users WHERE id = $1",
+      "SELECT id, email, first_name, last_name, role, is_active, created_at, last_login FROM users WHERE id = $1",
       [userId]
     );
     const updatedUser = updatedResult.rows[0];
@@ -229,7 +251,7 @@ router.patch("/:id", authenticate, requireRole("admin"), async (req, res) => {
         last_name: updatedUser.last_name,
         name: [updatedUser.first_name, updatedUser.last_name].filter(Boolean).join(" ").trim(),
         role: updatedUser.role,
-        active: updatedUser.active,
+        active: updatedUser.is_active,
         created_at: updatedUser.created_at,
         last_login: updatedUser.last_login,
       },
@@ -242,16 +264,16 @@ router.patch("/:id", authenticate, requireRole("admin"), async (req, res) => {
 
 /**
  * DELETE /users/:id
- * Delete a user from the company
- * Admin only
+ * Soft-delete a user: set is_deleted = TRUE, is_active = FALSE (row kept).
+ * Admin only.
  */
 router.delete("/:id", authenticate, requireRole("admin"), async (req, res) => {
   try {
     const userId = req.params.id;
 
-    // Verify user belongs to the same company
+    // Verify user belongs to the same company and is not already soft-deleted
     const userResult = await db.query(
-      "SELECT id, company_id, email FROM users WHERE id = $1",
+      "SELECT id, company_id, email FROM users WHERE id = $1 AND is_deleted = FALSE",
       [userId]
     );
     if (userResult.rows.length === 0) {
@@ -268,10 +290,13 @@ router.delete("/:id", authenticate, requireRole("admin"), async (req, res) => {
       return res.status(400).json({ error: "You cannot delete yourself" });
     }
 
-    // Delete user
-    await db.query("DELETE FROM users WHERE id = $1", [userId]);
+    // Soft delete: set is_deleted and is_active
+    await db.query(
+      "UPDATE users SET is_deleted = TRUE, is_active = FALSE, updated_at = NOW() WHERE id = $1",
+      [userId]
+    );
 
-    logger.info("User deleted", {
+    logger.info("User soft-deleted", {
       deletedUserId: userId,
       deletedBy: req.user.userId,
       companyId: req.user.companyId,
