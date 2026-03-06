@@ -12,6 +12,23 @@ const BASE = config.servicetrade.baseUrl;
 // Per-company token cache: companyId -> { authToken }
 const tokenCache = new Map();
 
+function buildFetchError(error, details) {
+  const wrapped = new Error(error && error.message ? error.message : "ServiceTrade fetch failed");
+  wrapped.name = "ServiceTradeFetchError";
+  wrapped.code = error && error.code ? error.code : undefined;
+  wrapped.cause = error;
+  wrapped.details = details;
+  return wrapped;
+}
+
+async function performFetch(url, requestOptions, details) {
+  try {
+    return await fetch(url, requestOptions);
+  } catch (error) {
+    throw buildFetchError(error, details);
+  }
+}
+
 /**
  * Login with username and password; cache token for company.
  * @param {string|number} companyId
@@ -26,11 +43,15 @@ async function login(companyId, username, password) {
   }
 
   const url = `${BASE}/auth`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password }),
-  });
+  const res = await performFetch(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    },
+    { companyId, method: "POST", path: "/auth" }
+  );
 
   const body = await res.json().catch(() => ({}));
   const data = body.data || body;
@@ -67,13 +88,17 @@ async function getSession(companyId, token) {
   if (!authToken) return null;
 
   const url = `${BASE}/auth`;
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-      Cookie: `PHPSESSID=${authToken}`,
+  const res = await performFetch(
+    url,
+    {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: `PHPSESSID=${authToken}`,
+      },
     },
-  });
+    { companyId, method: "GET", path: "/auth" }
+  );
 
   const body = await res.json().catch(() => ({}));
   const data = body.data || body;
@@ -112,11 +137,18 @@ async function ensureSession(companyId, credentials) {
  * @param {string} method - GET, POST, PUT, DELETE
  * @param {string} path - e.g. "/company/123"
  * @param {object} [options] - { body } for JSON body
- * @param {{ username: string, password: string }|null} [credentials] - for retry login
+ * @param {{ username?: string, password?: string, authCode?: string }|null} [credentials] - DB creds { username, authCode } or login { username, password } for retry
  * @returns {Promise<{ ok: boolean, status: number, data?: object, messages?: object }>}
  */
 async function request(companyId, method, path, options = {}, credentials = null) {
-  let token = await ensureSession(companyId, credentials);
+  let token = null;
+  if (credentials && (credentials.authCode != null && credentials.authCode !== "")) {
+    token = credentials.authCode;
+    tokenCache.set(String(companyId), { authToken: token });
+  }
+  if (!token) {
+    token = await ensureSession(companyId, credentials);
+  }
   if (!token) {
     return { ok: false, status: 401, data: null, messages: { error: ["ServiceTrade not authenticated"] } };
   }
@@ -128,22 +160,33 @@ async function request(companyId, method, path, options = {}, credentials = null
     ...options.headers,
   };
 
-  let res = await fetch(url, {
-    method,
-    headers,
-    body: options.body != null ? (typeof options.body === "string" ? options.body : JSON.stringify(options.body)) : undefined,
-  });
+  const requestBody =
+    options.body != null ? (typeof options.body === "string" ? options.body : JSON.stringify(options.body)) : undefined;
+
+  let res = await performFetch(
+    url,
+    {
+      method,
+      headers,
+      body: requestBody,
+    },
+    { companyId, method, path, hasBody: requestBody != null }
+  );
 
   if ((res.status === 401 || res.status === 404) && credentials) {
     tokenCache.delete(String(companyId));
     token = await ensureSession(companyId, credentials);
     if (token) {
       headers.Cookie = `PHPSESSID=${token}`;
-      res = await fetch(url, {
-        method,
-        headers,
-        body: options.body != null ? (typeof options.body === "string" ? options.body : JSON.stringify(options.body)) : undefined,
-      });
+      res = await performFetch(
+        url,
+        {
+          method,
+          headers,
+          body: requestBody,
+        },
+        { companyId, method, path, hasBody: requestBody != null, retriedAfterAuthRefresh: true }
+      );
     }
   }
 
@@ -170,10 +213,14 @@ async function logout(companyId, token) {
   if (!authToken) return;
 
   const url = `${BASE}/auth`;
-  await fetch(url, {
-    method: "DELETE",
-    headers: { Cookie: `PHPSESSID=${authToken}` },
-  });
+  await performFetch(
+    url,
+    {
+      method: "DELETE",
+      headers: { Cookie: `PHPSESSID=${authToken}` },
+    },
+    { companyId, method: "DELETE", path: "/auth" }
+  );
   tokenCache.delete(String(companyId));
   logger.info("ServiceTrade session closed", { companyId });
 }

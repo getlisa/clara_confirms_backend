@@ -11,7 +11,7 @@ const db = require("./index");
  */
 async function getByCompanyId(companyId) {
   const result = await db.query(
-    `SELECT username, auth_code FROM company_servicetrade
+    `SELECT username, auth_code FROM servicetrade_integration
      WHERE company_id = $1 AND is_active = TRUE AND is_deleted = FALSE
        AND auth_code IS NOT NULL AND auth_code != ''`,
     [companyId]
@@ -32,7 +32,7 @@ async function getByCompanyId(companyId) {
 async function upsert(companyId, username, authCode, metadata = null) {
   if (metadata != null && typeof metadata === "object") {
     await db.query(
-      `INSERT INTO company_servicetrade (company_id, username, auth_code, updated_at, is_active, is_deleted, metadata)
+      `INSERT INTO servicetrade_integration (company_id, username, auth_code, updated_at, is_active, is_deleted, metadata)
        VALUES ($1, $2, $3, NOW(), TRUE, FALSE, COALESCE($4::jsonb, '{}'::jsonb))
        ON CONFLICT (company_id) DO UPDATE SET
          username = EXCLUDED.username,
@@ -40,12 +40,12 @@ async function upsert(companyId, username, authCode, metadata = null) {
          updated_at = NOW(),
          is_active = TRUE,
          is_deleted = FALSE,
-         metadata = COALESCE(company_servicetrade.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)`,
+         metadata = COALESCE(servicetrade_integration.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)`,
       [companyId, username, authCode, JSON.stringify(metadata)]
     );
   } else {
     await db.query(
-      `INSERT INTO company_servicetrade (company_id, username, auth_code, updated_at, is_active, is_deleted)
+      `INSERT INTO servicetrade_integration (company_id, username, auth_code, updated_at, is_active, is_deleted)
        VALUES ($1, $2, $3, NOW(), TRUE, FALSE)
        ON CONFLICT (company_id) DO UPDATE SET
          username = EXCLUDED.username,
@@ -64,7 +64,7 @@ async function upsert(companyId, username, authCode, metadata = null) {
  */
 async function clearCredentials(companyId) {
   await db.query(
-    `UPDATE company_servicetrade
+    `UPDATE servicetrade_integration
      SET username = '', auth_code = NULL, is_active = FALSE, updated_at = NOW()
      WHERE company_id = $1`,
     [companyId]
@@ -78,7 +78,7 @@ async function clearCredentials(companyId) {
  */
 async function hasCredentials(companyId) {
   const result = await db.query(
-    `SELECT 1 FROM company_servicetrade
+    `SELECT 1 FROM servicetrade_integration
      WHERE company_id = $1 AND is_active = TRUE AND is_deleted = FALSE
        AND auth_code IS NOT NULL AND auth_code != ''`,
     [companyId]

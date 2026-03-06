@@ -1,4 +1,4 @@
--- Add is_active and is_deleted to all tables; add metadata to company_servicetrade; create company_settings
+-- Add is_active and is_deleted to all tables; add metadata to servicetrade_integration; create company_settings
 -- Convention: is_active BOOLEAN DEFAULT TRUE, is_deleted BOOLEAN DEFAULT FALSE
 
 -- ============================================================================
@@ -25,15 +25,15 @@ CREATE INDEX IF NOT EXISTS idx_users_is_active ON users(is_active);
 CREATE INDEX IF NOT EXISTS idx_users_is_deleted ON users(is_deleted);
 
 -- ============================================================================
--- Company ServiceTrade: is_active, is_deleted, metadata
+-- ServiceTrade integration: is_active, is_deleted, metadata
 -- ============================================================================
 
-ALTER TABLE company_servicetrade ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE company_servicetrade ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE company_servicetrade ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE servicetrade_integration ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE servicetrade_integration ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE servicetrade_integration ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;
 
-CREATE INDEX IF NOT EXISTS idx_company_servicetrade_is_active ON company_servicetrade(is_active);
-CREATE INDEX IF NOT EXISTS idx_company_servicetrade_is_deleted ON company_servicetrade(is_deleted);
+CREATE INDEX IF NOT EXISTS idx_servicetrade_integration_is_active ON servicetrade_integration(is_active);
+CREATE INDEX IF NOT EXISTS idx_servicetrade_integration_is_deleted ON servicetrade_integration(is_deleted);
 
 -- ============================================================================
 -- Company settings: max users and future config (one row per company)
