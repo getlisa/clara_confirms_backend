@@ -2,11 +2,166 @@
  * ServiceTrade sync tables: upserts and list queries.
  * All tables use (servicetrade_id, company_id) for idempotent upserts.
  * Batch upserts for sync performance.
+ *
+ * Sync state: per-entity dual cursors (createdAfter / updatedAfter) with
+ * status tracking — mirrors the approach in clara-lead-agent-server.
  */
 
 const db = require("./index");
 
 const BATCH_SIZE = 500;
+
+// ============================================================================
+// Sync state (per-entity dual cursors)
+// ============================================================================
+
+/**
+ * Get full sync state for a company.
+ * @param {string|number} companyId
+ * @returns {Promise<object|null>}
+ */
+async function getSyncState(companyId) {
+  const r = await db.query(
+    `SELECT
+       last_sync_at,
+       last_companies_created_at,
+       last_companies_updated_at,
+       last_locations_created_at,
+       last_locations_updated_at,
+       last_contacts_created_at,
+       last_contacts_updated_at,
+       last_service_requests_created_at,
+       last_service_requests_updated_at,
+       last_assets_created_at,
+       last_assets_updated_at,
+       last_full_sync_at,
+       last_sync_status,
+       last_sync_error
+     FROM servicetrade_sync_state
+     WHERE company_id = $1`,
+    [companyId]
+  );
+  return r.rows[0] || null;
+}
+
+/**
+ * Upsert sync state — only updates the columns that are explicitly provided.
+ * @param {string|number} companyId
+ * @param {object} data — key/value pairs of columns to set
+ */
+async function updateSyncState(companyId, data) {
+  const allowedKeys = [
+    "last_sync_at",
+    "last_companies_created_at",
+    "last_companies_updated_at",
+    "last_locations_created_at",
+    "last_locations_updated_at",
+    "last_contacts_created_at",
+    "last_contacts_updated_at",
+    "last_service_requests_created_at",
+    "last_service_requests_updated_at",
+    "last_assets_created_at",
+    "last_assets_updated_at",
+    "last_full_sync_at",
+    "last_sync_status",
+    "last_sync_error",
+  ];
+
+  const entries = Object.entries(data).filter(
+    ([key, value]) => allowedKeys.includes(key) && value !== undefined
+  );
+
+  if (entries.length === 0) return;
+
+  const setClauses = [];
+  const params = [companyId];
+  let idx = 1;
+
+  for (const [key, value] of entries) {
+    idx++;
+    setClauses.push(`${key} = $${idx}`);
+    params.push(value);
+  }
+
+  // Build the INSERT columns/values for the upsert
+  const insertCols = ["company_id", ...entries.map(([k]) => k)];
+  const insertVals = [`$1`, ...entries.map((_, i) => `$${i + 2}`)];
+
+  await db.query(
+    `INSERT INTO servicetrade_sync_state (${insertCols.join(", ")})
+     VALUES (${insertVals.join(", ")})
+     ON CONFLICT (company_id) DO UPDATE SET
+       ${setClauses.join(", ")}`,
+    params
+  );
+}
+
+// Legacy compatibility
+async function getLastSyncAt(companyId) {
+  const state = await getSyncState(companyId);
+  return state ? Number(state.last_sync_at) || null : null;
+}
+
+async function setLastSyncAt(companyId, lastSyncAtUnixSeconds) {
+  await updateSyncState(companyId, { last_sync_at: lastSyncAtUnixSeconds });
+}
+
+// ============================================================================
+// Companies
+// ============================================================================
+
+/** Batch upsert companies with individual address columns. */
+async function upsertCompaniesBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const values = [];
+    const params = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(
+        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`
+      );
+      params.push(
+        companyId,
+        r.servicetrade_id,
+        r.name != null ? r.name : null,
+        r.phone_number != null ? r.phone_number : null,
+        r.status != null ? r.status : null,
+        r.ref_number != null ? r.ref_number : null,
+        r.street != null ? r.street : null,
+        r.city != null ? r.city : null,
+        r.state != null ? r.state : null,
+        r.postal_code != null ? r.postal_code : null,
+        r.country != null ? r.country : null,
+        r.address != null ? normalizeAddressText(r.address) : null,
+        r.is_active !== false,
+        r.is_deleted === true,
+        r.payload ? JSON.stringify(r.payload) : null
+      );
+    });
+    await db.query(
+      `INSERT INTO servicetrade_companies (company_id, servicetrade_id, name, phone_number, status, ref_number, street, city, state, postal_code, country, address, is_active, is_deleted, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (servicetrade_id, company_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         phone_number = EXCLUDED.phone_number,
+         status = EXCLUDED.status,
+         ref_number = EXCLUDED.ref_number,
+         street = EXCLUDED.street,
+         city = EXCLUDED.city,
+         state = EXCLUDED.state,
+         postal_code = EXCLUDED.postal_code,
+         country = EXCLUDED.country,
+         address = EXCLUDED.address,
+         is_active = EXCLUDED.is_active,
+         is_deleted = EXCLUDED.is_deleted,
+         payload = EXCLUDED.payload,
+         updated_at = NOW()`,
+      params
+    );
+  }
+}
 
 function normalizeAddressText(address) {
   if (address == null) return null;
@@ -21,127 +176,11 @@ function normalizeAddressText(address) {
   }
 }
 
-// ---------- Companies ----------
-async function upsertCompany(companyId, row) {
-  const {
-    servicetrade_id,
-    name,
-    phone_number,
-    address,
-    is_active = true,
-    is_deleted = false,
-    payload,
-  } = row;
-  await db.query(
-    `INSERT INTO servicetrade_companies (company_id, servicetrade_id, name, phone_number, address, is_active, is_deleted, payload, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW())
-     ON CONFLICT (servicetrade_id, company_id) DO UPDATE SET
-       name = EXCLUDED.name,
-       phone_number = EXCLUDED.phone_number,
-       address = EXCLUDED.address,
-       is_active = EXCLUDED.is_active,
-       is_deleted = EXCLUDED.is_deleted,
-       payload = EXCLUDED.payload,
-       updated_at = NOW()`,
-    [
-      companyId,
-      servicetrade_id,
-      name || null,
-      phone_number || null,
-      normalizeAddressText(address),
-      is_active,
-      is_deleted,
-      payload ? JSON.stringify(payload) : null,
-    ]
-  );
-}
+// ============================================================================
+// Locations
+// ============================================================================
 
-/** Batch upsert companies. rows: array of { servicetrade_id, name, phone_number?, address?, is_active?, is_deleted?, payload? } */
-async function upsertCompaniesBatch(companyId, rows) {
-  if (rows.length === 0) return;
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const chunk = rows.slice(i, i + BATCH_SIZE);
-    const values = [];
-    const params = [];
-    let idx = 0;
-    chunk.forEach((r) => {
-      values.push(
-        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`
-      );
-      params.push(
-        companyId,
-        r.servicetrade_id,
-        r.name != null ? r.name : null,
-        r.phone_number != null ? r.phone_number : null,
-        normalizeAddressText(r.address),
-        r.is_active !== false,
-        r.is_deleted === true,
-        r.payload ? JSON.stringify(r.payload) : null
-      );
-    });
-    await db.query(
-      `INSERT INTO servicetrade_companies (company_id, servicetrade_id, name, phone_number, address, is_active, is_deleted, payload, updated_at)
-       VALUES ${values.join(", ")}
-       ON CONFLICT (servicetrade_id, company_id) DO UPDATE SET
-         name = EXCLUDED.name,
-         phone_number = EXCLUDED.phone_number,
-         address = EXCLUDED.address,
-         is_active = EXCLUDED.is_active,
-         is_deleted = EXCLUDED.is_deleted,
-         payload = EXCLUDED.payload,
-         updated_at = NOW()`,
-      params
-    );
-  }
-}
-
-// ---------- Locations ----------
-async function upsertLocation(companyId, row, locationIdByStId) {
-  const {
-    servicetrade_id,
-    servicetrade_company_id,
-    name,
-    phone_number,
-    email,
-    address,
-    is_active = true,
-    is_deleted = false,
-    payload,
-  } = row;
-  await db.query(
-    `INSERT INTO servicetrade_locations (company_id, servicetrade_id, servicetrade_company_id, name, phone_number, email, address, is_active, is_deleted, payload, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10::jsonb, NOW())
-     ON CONFLICT (servicetrade_id, company_id) DO UPDATE SET
-       servicetrade_company_id = EXCLUDED.servicetrade_company_id,
-       name = EXCLUDED.name,
-       phone_number = EXCLUDED.phone_number,
-       email = EXCLUDED.email,
-       address = EXCLUDED.address,
-       is_active = EXCLUDED.is_active,
-       is_deleted = EXCLUDED.is_deleted,
-       payload = EXCLUDED.payload,
-       updated_at = NOW()`,
-    [
-      companyId,
-      servicetrade_id,
-      servicetrade_company_id != null ? servicetrade_company_id : null,
-      name || null,
-      phone_number || null,
-      email || null,
-      address ? JSON.stringify(address) : null,
-      is_active,
-      is_deleted,
-      payload ? JSON.stringify(payload) : null,
-    ]
-  );
-  const r = await db.query(
-    `SELECT id FROM servicetrade_locations WHERE company_id = $1 AND servicetrade_id = $2`,
-    [companyId, servicetrade_id]
-  );
-  if (r.rows[0]) locationIdByStId.set(Number(servicetrade_id), r.rows[0].id);
-}
-
-/** Batch upsert locations. Returns Map<servicetrade_id, our_id>. rows: array of { servicetrade_id, servicetrade_company_id?, name, ... } */
+/** Batch upsert locations with individual address columns. Returns Map<servicetrade_id, our_id>. */
 async function upsertLocationsBatch(companyId, rows) {
   if (rows.length === 0) return new Map();
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
@@ -151,7 +190,7 @@ async function upsertLocationsBatch(companyId, rows) {
     let idx = 0;
     chunk.forEach((r) => {
       values.push(
-        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`
+        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`
       );
       params.push(
         companyId,
@@ -160,6 +199,12 @@ async function upsertLocationsBatch(companyId, rows) {
         r.name != null ? r.name : null,
         r.phone_number != null ? r.phone_number : null,
         r.email != null ? r.email : null,
+        r.status != null ? r.status : null,
+        r.ref_number != null ? r.ref_number : null,
+        r.street != null ? r.street : null,
+        r.city != null ? r.city : null,
+        r.state != null ? r.state : null,
+        r.postal_code != null ? r.postal_code : null,
         r.address ? JSON.stringify(r.address) : null,
         r.is_active !== false,
         r.is_deleted === true,
@@ -167,13 +212,19 @@ async function upsertLocationsBatch(companyId, rows) {
       );
     });
     await db.query(
-      `INSERT INTO servicetrade_locations (company_id, servicetrade_id, servicetrade_company_id, name, phone_number, email, address, is_active, is_deleted, payload, updated_at)
+      `INSERT INTO servicetrade_locations (company_id, servicetrade_id, servicetrade_company_id, name, phone_number, email, status, ref_number, street, city, state, postal_code, address, is_active, is_deleted, payload, updated_at)
        VALUES ${values.join(", ")}
        ON CONFLICT (servicetrade_id, company_id) DO UPDATE SET
          servicetrade_company_id = EXCLUDED.servicetrade_company_id,
          name = EXCLUDED.name,
          phone_number = EXCLUDED.phone_number,
          email = EXCLUDED.email,
+         status = EXCLUDED.status,
+         ref_number = EXCLUDED.ref_number,
+         street = EXCLUDED.street,
+         city = EXCLUDED.city,
+         state = EXCLUDED.state,
+         postal_code = EXCLUDED.postal_code,
          address = EXCLUDED.address,
          is_active = EXCLUDED.is_active,
          is_deleted = EXCLUDED.is_deleted,
@@ -182,6 +233,7 @@ async function upsertLocationsBatch(companyId, rows) {
       params
     );
   }
+
   const r = await db.query(
     `SELECT id, servicetrade_id FROM servicetrade_locations WHERE company_id = $1`,
     [companyId]
@@ -191,48 +243,11 @@ async function upsertLocationsBatch(companyId, rows) {
   return map;
 }
 
-// ---------- Service requests ----------
-async function upsertServiceRequest(companyId, row) {
-  const {
-    servicetrade_id,
-    location_id,
-    job_id,
-    asset_id,
-    description,
-    status,
-    window_start,
-    window_end,
-    payload,
-  } = row;
-  await db.query(
-    `INSERT INTO servicetrade_service_requests (company_id, servicetrade_id, location_id, job_id, asset_id, description, status, window_start, window_end, payload, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW())
-     ON CONFLICT (servicetrade_id, company_id) DO UPDATE SET
-       location_id = EXCLUDED.location_id,
-       job_id = EXCLUDED.job_id,
-       asset_id = EXCLUDED.asset_id,
-       description = EXCLUDED.description,
-       status = EXCLUDED.status,
-       window_start = EXCLUDED.window_start,
-       window_end = EXCLUDED.window_end,
-       payload = EXCLUDED.payload,
-       updated_at = NOW()`,
-    [
-      companyId,
-      servicetrade_id,
-      location_id,
-      job_id || null,
-      asset_id || null,
-      description || null,
-      status || null,
-      window_start || null,
-      window_end || null,
-      payload ? JSON.stringify(payload) : null,
-    ]
-  );
-}
+// ============================================================================
+// Service Requests
+// ============================================================================
 
-/** Batch upsert service requests. rows: array of { servicetrade_id, location_id, job_id?, asset_id?, description?, status?, window_start?, window_end?, payload? } */
+/** Batch upsert service requests. */
 async function upsertServiceRequestsBatch(companyId, rows) {
   if (rows.length === 0) return;
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
@@ -275,52 +290,14 @@ async function upsertServiceRequestsBatch(companyId, rows) {
   }
 }
 
-// ---------- Contacts ----------
-async function upsertContact(companyId, row) {
-  const {
-    servicetrade_id,
-    first_name,
-    last_name,
-    phone,
-    mobile,
-    email,
-    type,
-    location_id,
-    payload,
-  } = row;
-  await db.query(
-    `INSERT INTO servicetrade_contacts (company_id, servicetrade_id, first_name, last_name, phone, mobile, email, type, location_id, payload, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW())
-     ON CONFLICT (servicetrade_id, company_id) DO UPDATE SET
-       first_name = EXCLUDED.first_name,
-       last_name = EXCLUDED.last_name,
-       phone = EXCLUDED.phone,
-       mobile = EXCLUDED.mobile,
-       email = EXCLUDED.email,
-       type = EXCLUDED.type,
-       location_id = EXCLUDED.location_id,
-       payload = EXCLUDED.payload,
-       updated_at = NOW()`,
-    [
-      companyId,
-      servicetrade_id,
-      first_name || null,
-      last_name || null,
-      phone || null,
-      mobile || null,
-      email || null,
-      type || null,
-      location_id || null,
-      payload ? JSON.stringify(payload) : null,
-    ]
-  );
-}
+// ============================================================================
+// Contacts
+// ============================================================================
 
-/** Batch upsert contacts. */
+/** Batch upsert contacts with alternate_phone + servicetrade_company_id. */
 async function upsertContactsBatch(companyId, rows) {
   if (rows.length === 0) return;
-  // De-duplicate by servicetrade_id so one INSERT statement never tries to
-  // affect the same conflict key multiple times.
+  // De-duplicate by servicetrade_id
   const dedupedMap = new Map();
   rows.forEach((row) => {
     if (!row || row.servicetrade_id == null) return;
@@ -355,7 +332,7 @@ async function upsertContactsBatch(companyId, rows) {
     let idx = 0;
     chunk.forEach((r) => {
       values.push(
-        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`
+        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`
       );
       params.push(
         companyId,
@@ -364,22 +341,26 @@ async function upsertContactsBatch(companyId, rows) {
         r.last_name != null ? r.last_name : null,
         r.phone != null ? r.phone : null,
         r.mobile != null ? r.mobile : null,
+        r.alternate_phone != null ? r.alternate_phone : null,
         r.email != null ? r.email : null,
         r.type != null ? r.type : null,
+        r.servicetrade_company_id != null ? r.servicetrade_company_id : null,
         r.location_id != null ? r.location_id : null,
         r.payload ? JSON.stringify(r.payload) : null
       );
     });
     await db.query(
-      `INSERT INTO servicetrade_contacts (company_id, servicetrade_id, first_name, last_name, phone, mobile, email, type, location_id, payload, updated_at)
+      `INSERT INTO servicetrade_contacts (company_id, servicetrade_id, first_name, last_name, phone, mobile, alternate_phone, email, type, servicetrade_company_id, location_id, payload, updated_at)
        VALUES ${values.join(", ")}
        ON CONFLICT (servicetrade_id, company_id) DO UPDATE SET
          first_name = EXCLUDED.first_name,
          last_name = EXCLUDED.last_name,
          phone = EXCLUDED.phone,
          mobile = EXCLUDED.mobile,
+         alternate_phone = EXCLUDED.alternate_phone,
          email = EXCLUDED.email,
          type = EXCLUDED.type,
+         servicetrade_company_id = EXCLUDED.servicetrade_company_id,
          location_id = EXCLUDED.location_id,
          payload = EXCLUDED.payload,
          updated_at = NOW()`,
@@ -387,6 +368,10 @@ async function upsertContactsBatch(companyId, rows) {
     );
   }
 }
+
+// ============================================================================
+// Contact-Location links
+// ============================================================================
 
 async function replaceContactLocationLinks(companyId, rows) {
   await db.query("DELETE FROM servicetrade_contact_locations WHERE company_id = $1", [companyId]);
@@ -418,6 +403,10 @@ async function replaceContactLocationLinks(companyId, rows) {
   }
 }
 
+// ============================================================================
+// Contact-Company links
+// ============================================================================
+
 async function replaceContactCompanyLinks(companyId, rows) {
   await db.query("DELETE FROM servicetrade_contact_companies WHERE company_id = $1", [companyId]);
   if (!Array.isArray(rows) || rows.length === 0) return;
@@ -448,28 +437,9 @@ async function replaceContactCompanyLinks(companyId, rows) {
   }
 }
 
-// ---------- Assets ----------
-async function upsertAsset(companyId, row) {
-  const { servicetrade_id, location_id, service_request_id, name, payload } = row;
-  await db.query(
-    `INSERT INTO servicetrade_assets (company_id, servicetrade_id, location_id, service_request_id, name, payload, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())
-     ON CONFLICT (servicetrade_id, company_id) DO UPDATE SET
-       location_id = EXCLUDED.location_id,
-       service_request_id = EXCLUDED.service_request_id,
-       name = EXCLUDED.name,
-       payload = EXCLUDED.payload,
-       updated_at = NOW()`,
-    [
-      companyId,
-      servicetrade_id,
-      location_id,
-      service_request_id || null,
-      name || null,
-      payload ? JSON.stringify(payload) : null,
-    ]
-  );
-}
+// ============================================================================
+// Assets
+// ============================================================================
 
 /** Batch upsert assets. */
 async function upsertAssetsBatch(companyId, rows) {
@@ -506,7 +476,10 @@ async function upsertAssetsBatch(companyId, rows) {
   }
 }
 
-// ---------- Delete all sync data (for company) ----------
+// ============================================================================
+// Delete all sync data (for company)
+// ============================================================================
+
 async function deleteAllSyncData(companyId) {
   await db.query("DELETE FROM servicetrade_contact_locations WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_contact_companies WHERE company_id = $1", [companyId]);
@@ -518,25 +491,10 @@ async function deleteAllSyncData(companyId) {
   await db.query("DELETE FROM servicetrade_sync_state WHERE company_id = $1", [companyId]);
 }
 
-// ---------- Sync state ----------
-async function getLastSyncAt(companyId) {
-  const r = await db.query(
-    `SELECT last_sync_at FROM servicetrade_sync_state WHERE company_id = $1`,
-    [companyId]
-  );
-  return r.rows[0] ? Number(r.rows[0].last_sync_at) : null;
-}
+// ============================================================================
+// Recompute is_active
+// ============================================================================
 
-async function setLastSyncAt(companyId, lastSyncAtUnixSeconds) {
-  await db.query(
-    `INSERT INTO servicetrade_sync_state (company_id, last_sync_at)
-     VALUES ($1, $2)
-     ON CONFLICT (company_id) DO UPDATE SET last_sync_at = EXCLUDED.last_sync_at`,
-    [companyId, lastSyncAtUnixSeconds]
-  );
-}
-
-// ---------- Recompute is_active ----------
 /** Set location is_active = true iff it has at least one SR with status in (open, in_progress, pending). */
 async function recomputeLocationIsActive(companyId) {
   await db.query(
@@ -565,7 +523,10 @@ async function recomputeCompanyIsActive(companyId) {
   );
 }
 
-// ---------- List APIs for UI ----------
+// ============================================================================
+// List APIs for UI
+// ============================================================================
+
 async function listCompanies(companyId, includeInactive = false, page = 1, perPage = 50) {
   const safePage = Number.isFinite(page) && page > 0 ? Math.floor(page) : 1;
   const safePerPage = Number.isFinite(perPage) && perPage > 0 ? Math.min(Math.floor(perPage), 200) : 50;
@@ -575,7 +536,7 @@ async function listCompanies(companyId, includeInactive = false, page = 1, perPa
     : `company_id = $1 AND is_deleted = FALSE AND is_active = TRUE`;
 
   const rowsResult = await db.query(
-    `SELECT id, servicetrade_id, name, phone_number, address, is_active, is_deleted
+    `SELECT id, servicetrade_id, name, phone_number, status, ref_number, street, city, state, postal_code, country, address, is_active, is_deleted
      FROM servicetrade_companies
      WHERE ${where}
      ORDER BY name
@@ -616,8 +577,8 @@ async function countLocationsByStCompanyBulk(companyId, servicetradeCompanyIds) 
 
 async function listLocationsByStCompany(companyId, servicetradeCompanyId, includeInactive = false) {
   const q = includeInactive
-    ? `SELECT id, servicetrade_id, name, phone_number, email, address, is_active FROM servicetrade_locations WHERE company_id = $1 AND servicetrade_company_id = $2 ORDER BY name`
-    : `SELECT id, servicetrade_id, name, phone_number, email, address, is_active FROM servicetrade_locations WHERE company_id = $1 AND servicetrade_company_id = $2 AND is_deleted = FALSE AND is_active = TRUE ORDER BY name`;
+    ? `SELECT id, servicetrade_id, name, phone_number, email, status, ref_number, street, city, state, postal_code, address, is_active FROM servicetrade_locations WHERE company_id = $1 AND servicetrade_company_id = $2 ORDER BY name`
+    : `SELECT id, servicetrade_id, name, phone_number, email, status, ref_number, street, city, state, postal_code, address, is_active FROM servicetrade_locations WHERE company_id = $1 AND servicetrade_company_id = $2 AND is_deleted = FALSE AND is_active = TRUE ORDER BY name`;
   const r = await db.query(q, [companyId, servicetradeCompanyId]);
   return r.rows;
 }
@@ -652,7 +613,7 @@ async function listServiceRequestsByLocation(companyId, locationId) {
 
 async function listContactsByLocation(companyId, locationId) {
   const r = await db.query(
-    `SELECT DISTINCT c.id, c.servicetrade_id, c.first_name, c.last_name, c.phone, c.mobile, c.email, c.type
+    `SELECT DISTINCT c.id, c.servicetrade_id, c.first_name, c.last_name, c.phone, c.mobile, c.alternate_phone, c.email, c.type
      FROM servicetrade_contacts c
      JOIN servicetrade_contact_locations cl ON cl.contact_id = c.id
      WHERE c.company_id = $1 AND cl.location_id = $2
@@ -675,7 +636,7 @@ async function listAssetsByLocation(companyId, locationId) {
 
 async function getLocationById(companyId, locationId) {
   const r = await db.query(
-    `SELECT id, servicetrade_id, servicetrade_company_id, name, phone_number, email, address, is_active
+    `SELECT id, servicetrade_id, servicetrade_company_id, name, phone_number, email, status, ref_number, street, city, state, postal_code, address, is_active
      FROM servicetrade_locations WHERE company_id = $1 AND id = $2`,
     [companyId, locationId]
   );
@@ -684,18 +645,20 @@ async function getLocationById(companyId, locationId) {
 
 async function getStCompanyById(companyId, servicetradeCompanyId) {
   const r = await db.query(
-    `SELECT id, servicetrade_id, name, phone_number, address, is_active FROM servicetrade_companies WHERE company_id = $1 AND servicetrade_id = $2`,
+    `SELECT id, servicetrade_id, name, phone_number, status, ref_number, street, city, state, postal_code, country, address, is_active
+     FROM servicetrade_companies WHERE company_id = $1 AND servicetrade_id = $2`,
     [companyId, servicetradeCompanyId]
   );
   return r.rows[0] || null;
 }
 
 module.exports = {
-  upsertCompany,
-  upsertLocation,
-  upsertServiceRequest,
-  upsertContact,
-  upsertAsset,
+  // Sync state
+  getSyncState,
+  updateSyncState,
+  getLastSyncAt,
+  setLastSyncAt,
+  // Upserts
   upsertCompaniesBatch,
   upsertLocationsBatch,
   upsertServiceRequestsBatch,
@@ -703,11 +666,12 @@ module.exports = {
   replaceContactLocationLinks,
   replaceContactCompanyLinks,
   upsertAssetsBatch,
+  // Cleanup
   deleteAllSyncData,
-  getLastSyncAt,
-  setLastSyncAt,
+  // Recompute
   recomputeLocationIsActive,
   recomputeCompanyIsActive,
+  // List APIs
   listCompanies,
   countLocationsByStCompanyBulk,
   listLocationsByStCompany,
