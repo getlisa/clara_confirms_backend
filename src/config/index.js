@@ -32,4 +32,9 @@ module.exports = {
     username: process.env.SERVICETRADE_USERNAME || "",
     password: process.env.SERVICETRADE_PASSWORD || "",
   },
+  retell: {
+    apiKey: process.env.RETELL_API_KEY || "",
+    webhookSecret: process.env.RETELL_WEBHOOK_SECRET || "",
+    defaultVoiceId: process.env.RETELL_DEFAULT_VOICE_ID || "11labs-Adrian",
+  },
 };

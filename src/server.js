@@ -13,6 +13,10 @@ const { authRoutes } = require("./auth");
 const companyRoutes = require("./routes/company");
 const usersRoutes = require("./routes/users");
 const servicetradeRoutes = require("./routes/servicetrade");
+const agentSettingsRoutes = require("./routes/agent-settings");
+const retellRoutes = require("./routes/retell");
+const todosRoutes = require("./routes/todos");
+const callsRoutes = require("./routes/calls");
 
 const app = express();
 
@@ -43,6 +47,9 @@ app.use(
     ],
   })
 );
+
+// Retell webhook — mounted BEFORE body parsers so it can read the raw stream for signature verification
+app.use("/retell", retellRoutes);
 
 // Body parsing
 app.use(express.json());
@@ -97,6 +104,15 @@ app.use("/users", usersRoutes);
 
 // ServiceTrade integration - requires auth
 app.use("/integrations/servicetrade", servicetradeRoutes);
+
+// Agent settings - requires auth
+app.use("/agent-settings", agentSettingsRoutes);
+
+// Todos (post-call action items) - requires auth
+app.use("/todos", todosRoutes);
+
+// Calls history - requires auth
+app.use("/calls", callsRoutes);
 
 // 404 handler
 app.use((req, res) => {

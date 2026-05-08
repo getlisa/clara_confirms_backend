@@ -15,7 +15,10 @@ class Database {
       max: isServerless ? 2 : config.database.poolMax,
       idleTimeoutMillis: isPgBouncer ? 0 : 30000,
       connectionTimeoutMillis: isServerless ? 30000 : 15000,
-      statement_timeout: isServerless ? 30000 : undefined,
+      statement_timeout: 30000,
+      query_timeout: 35000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
       ssl:
         process.env.DATABASE_URL?.includes("sslmode=require") ||
         process.env.DATABASE_URL?.includes("supabase")
@@ -57,9 +60,9 @@ class Database {
       return result;
     } catch (error) {
       const isConnectionError =
-        /connection terminated|ECONNRESET|ECONNREFUSED|connect ENOENT|Connection lost/i.test(
+        /connection terminated|ECONNRESET|ECONNREFUSED|connect ENOENT|Connection lost|ETIMEDOUT/i.test(
           error.message
-        ) || error.code === "57P01";
+        ) || error.code === "57P01" || error.code === "ETIMEDOUT";
       if (isConnectionError && !retried) {
         logger.warn("Database connection error, retrying once", {
           message: error.message,

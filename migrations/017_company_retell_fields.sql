@@ -1,0 +1,3 @@
+ALTER TABLE companies
+  ADD COLUMN IF NOT EXISTS retell_agent_id VARCHAR,
+  ADD COLUMN IF NOT EXISTS retell_llm_id   VARCHAR;
