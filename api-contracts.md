@@ -239,45 +239,216 @@ Soft-delete (sets `is_deleted=true`, `is_active=false`).
 ## 4. Agent Settings
 
 ### `GET /agent-settings` 🔒
-Returns the company's agent configuration. If no row has been saved yet, returns defaults (`null` for text fields, `2` for `days_before_confirmation`).
+Returns the company's global agent identity. If no row exists yet, returns `null` for text fields.
 
 **Response `200`**
 ```json
 {
   "agent_settings": {
-    "representative_name": "Clara",
-    "begin_message": "Hi, this is Clara calling from {{company_name}}...",
-    "general_prompt": "You are Clara, a friendly and professional scheduling assistant...",
-    "days_before_confirmation": 2
+    "representative_name": "Clara"
   }
 }
 ```
 
-**Supported placeholders in `begin_message`:**
-
-| Placeholder | Replaced with |
-|---|---|
-| `{{company_name}}` | Company name |
-| `{{customer_name}}` | Customer name |
-| `{{representative_name}}` | Value of `representative_name` field |
-
 ---
 
 ### `PATCH /agent-settings` 🔒
-All fields optional (partial update). Upserts — safe to call before a row exists.  
-Saving any field automatically syncs the Retell LLM + Agent in the background.
+Partial update. Upserts — safe to call before a row exists.
 
 **Request**
 ```json
 {
-  "representative_name": "Clara",
-  "begin_message": "Hi, this is Clara calling from {{company_name}}...",
-  "general_prompt": "You are Clara, a friendly and professional scheduling assistant...",
-  "days_before_confirmation": 3
+  "representative_name": "Clara"
 }
 ```
-**Response `200`** `{ "agent_settings": { ...saved } }`  
-**Response `400`** `{ "error": "days_before_confirmation must be an integer >= 1" }`
+**Response `200`** `{ "agent_settings": { "representative_name": "Clara" } }`
+
+---
+
+## 4a. Call Type Settings
+
+Each company has three independently configurable call types. The scheduler reads these to decide when and how to place each call.
+
+### Call type identifiers
+
+| `type` | Who is called | When triggered |
+|---|---|---|
+| `customer_confirmation` | End customer | N days before the job |
+| `technician_confirmation` | Assigned technician | N days before the job |
+| `technician_reschedule` | Assigned technician | N days before the job when technician is marked unavailable |
+
+---
+
+### `GET /agent-settings/call-types` 🔒
+Returns all three call type configs for the company. Missing rows are returned with default values.
+
+**Response `200`**
+```json
+{
+  "call_types": [
+    {
+      "type": "customer_confirmation",
+      "enabled": true,
+      "days_before": 2,
+      "begin_message": "Hi {{customer_name}}, this is {{representative_name}} calling from {{company_name}}...",
+      "general_prompt": "You are {{representative_name}}, a friendly scheduling assistant..."
+    },
+    {
+      "type": "technician_confirmation",
+      "enabled": true,
+      "days_before": 1,
+      "begin_message": "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}...",
+      "general_prompt": "You are {{representative_name}}, a scheduling coordinator..."
+    },
+    {
+      "type": "technician_reschedule",
+      "enabled": false,
+      "days_before": 1,
+      "begin_message": "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}...",
+      "general_prompt": "You are {{representative_name}}, a scheduling coordinator..."
+    }
+  ]
+}
+```
+
+---
+
+### `POST /agent-settings/call-types` 🔒
+Create a custom call type. Built-in types cannot be created via this endpoint.
+
+**Request**
+```json
+{
+  "name": "Post-job Follow-up",
+  "description": "Call the customer after the job is completed to confirm satisfaction.",
+  "days_before": 0,
+  "begin_message": "Hi {{customer_name}}, this is {{representative_name}} from {{company_name}}...",
+  "general_prompt": "You are {{representative_name}}, a customer satisfaction assistant..."
+}
+```
+- `name` — required, must be unique within the company
+- `description` — required
+- `days_before`, `begin_message`, `general_prompt` — optional, default to `2`, empty string, empty string
+
+**Response `201`**
+```json
+{
+  "call_type": {
+    "type": "post_job_follow_up",
+    "name": "Post-job Follow-up",
+    "description": "Call the customer after the job is completed to confirm satisfaction.",
+    "is_custom": true,
+    "enabled": false,
+    "days_before": 2,
+    "begin_message": "...",
+    "general_prompt": "..."
+  }
+}
+```
+> `type` (slug) is auto-generated from `name` on the backend (e.g. `"Post-job Follow-up"` → `"post_job_follow_up"`). It is used as the URL param for subsequent PATCH/DELETE calls.
+
+**Response `400`** `{ "error": "name is required" }`  
+**Response `409`** `{ "error": "A call type with this name already exists" }`
+
+---
+
+### `PATCH /agent-settings/call-types/:type` 🔒
+Partial update for any call type (built-in or custom). Upserts for built-ins — safe to call before a row exists.  
+`:type` is the slug: built-in (`customer_confirmation`, etc.) or custom (auto-generated slug).
+
+**Request** _(all fields optional)_
+```json
+{
+  "name": "Post-job Follow-up",
+  "description": "Updated description.",
+  "enabled": true,
+  "days_before": 2,
+  "begin_message": "Hi {{customer_name}}, this is {{representative_name}}...",
+  "general_prompt": "You are {{representative_name}}, a scheduling assistant..."
+}
+```
+> `name` and `description` are only updatable on custom types. They are ignored for built-in types.
+
+**Response `200`** `{ "call_type": { ...saved } }`  
+**Response `400`** `{ "error": "days_before must be an integer >= 1" }`  
+**Response `404`** `{ "error": "Call type not found" }`
+
+---
+
+### `DELETE /agent-settings/call-types/:type` 🔒
+Delete a custom call type. Built-in types cannot be deleted.
+
+**Response `200`** `{ "message": "Deleted" }`  
+**Response `403`** `{ "error": "Built-in call types cannot be deleted" }`  
+**Response `404`** `{ "error": "Call type not found" }`
+
+---
+
+### Data model — `call_type_configs` table
+
+```sql
+CREATE TABLE call_type_configs (
+  id            SERIAL PRIMARY KEY,
+  company_id    INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  type          VARCHAR NOT NULL,                     -- slug; built-in or auto-generated
+  name          VARCHAR NOT NULL,                     -- display name
+  description   TEXT NOT NULL DEFAULT '',
+  is_custom     BOOLEAN NOT NULL DEFAULT false,
+  enabled       BOOLEAN NOT NULL DEFAULT false,
+  days_before   INTEGER NOT NULL DEFAULT 2 CHECK (days_before >= 1),
+  begin_message TEXT,
+  general_prompt TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (company_id, type)
+);
+```
+
+Seed the three built-in rows for every new company on registration:
+```sql
+INSERT INTO call_type_configs (company_id, type, name, description, is_custom, enabled, days_before)
+VALUES
+  (<id>, 'customer_confirmation',   'Customer Confirmation',         'Call the end customer to confirm their upcoming appointment.',              false, true,  2),
+  (<id>, 'technician_confirmation', 'Technician Confirmation',       'Call the assigned technician to confirm availability for the job.',         false, true,  1),
+  (<id>, 'technician_reschedule',   'Technician Reschedule Notice',  'Notify the technician that their job needs to be rescheduled.',             false, false, 1);
+```
+
+---
+
+### Placeholder reference
+
+| Placeholder | Available in |
+|---|---|
+| `{{company_name}}` | All types |
+| `{{representative_name}}` | All types |
+| `{{job_date}}` | All types |
+| `{{job_id}}` | All types |
+| `{{customer_name}}` | `customer_confirmation` |
+| `{{technician_name}}` | `technician_confirmation`, `technician_reschedule` |
+| `{{customer_address}}` | `technician_confirmation`, `technician_reschedule` |
+
+---
+
+### Scheduler logic (backend daily job)
+
+```
+For each company:
+  For each enabled call_type_config:
+    target_date = today + days_before
+    jobs = fetch jobs where job_date = target_date
+
+    if type = customer_confirmation:
+      for each job: place call to job.customer.phone
+    
+    if type = technician_confirmation:
+      for each job: place call to job.technician.phone
+    
+    if type = technician_reschedule:
+      for each job where technician.available = false:
+        place call to job.technician.phone
+```
+
+The call is placed via the Retell AI API using the call type's `begin_message` and `general_prompt`, with all `{{placeholders}}` substituted at call time.
 
 ---
 
@@ -640,9 +811,19 @@ interface User {
 
 interface AgentSettings {
   representative_name: string | null;
+}
+
+type CallTypeName = 'customer_confirmation' | 'technician_confirmation' | 'technician_reschedule';
+
+interface CallTypeConfig {
+  type: string;            // built-in slug or auto-generated custom slug
+  name: string;            // display name
+  description: string;
+  is_custom: boolean;
+  enabled: boolean;
+  days_before: number;     // integer >= 1
   begin_message: string | null;
   general_prompt: string | null;
-  days_before_confirmation: number;   // integer >= 1, default 2
 }
 
 // ─── Calls ───────────────────────────────────────────────────────────────────

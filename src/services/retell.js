@@ -11,27 +11,44 @@ function getClient() {
   return _client;
 }
 
-/**
- * Build Retell LLM params from agent_settings row.
- */
-function buildLlmParams(agentSettings, companyName) {
-  const repName = agentSettings.representative_name || "Clara";
+function buildLlmParams(callType, representativeName, companyName) {
+  const repName = representativeName || "Clara";
   return {
     model: "claude-4.6-sonnet",
     start_speaker: "agent",
-    general_prompt: agentSettings.general_prompt ||
-      `You are ${repName}, a friendly and professional scheduling assistant calling on behalf of ${companyName}. Your goal is to confirm the customer's upcoming service appointment.`,
-    begin_message: agentSettings.begin_message ||
-      `Hi, this is ${repName} calling from ${companyName}. I'm reaching out to confirm your upcoming service appointment. Is now a good time to talk?`,
+    general_prompt: callType.general_prompt ||
+      `You are ${repName}, a scheduling assistant calling on behalf of ${companyName}. ${callType.description || ""}`.trim(),
+    begin_message: callType.begin_message ||
+      `Hi, this is ${repName} calling from ${companyName}. Is now a good time to talk?`,
+  };
+}
+
+function buildAgentParams(llmId, companyName, callTypeName) {
+  const slug = `${companyName}_${callTypeName}`
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .substring(0, 60);
+  return {
+    response_engine: { type: "retell-llm", llm_id: llmId },
+    agent_name: slug,
+    voice_id: config.retell.defaultVoiceId,
+    language: "en-US",
+    enable_backchannel: true,
+    responsiveness: 1,
+    interruption_sensitivity: 1,
+    end_call_after_silence_ms: 600000,
+    max_call_duration_ms: 3600000,
+    voicemail_detection_enabled: true,
+    voicemail_action: "hangup",
+    post_call_analysis_model: "gpt-4.1-mini",
+    post_call_analysis_data: POST_CALL_ANALYSIS_DATA,
   };
 }
 
 const POST_CALL_ANALYSIS_DATA = [
-  // System presets
   { type: "system-presets", name: "call_summary" },
   { type: "system-presets", name: "call_successful" },
   { type: "system-presets", name: "user_sentiment" },
-  // Confirmation-specific fields
   {
     type: "enum",
     name: "appointment_confirmed",
@@ -51,74 +68,54 @@ const POST_CALL_ANALYSIS_DATA = [
 ];
 
 /**
- * Build Retell Agent params.
+ * Provision or update the Retell LLM + Agent for a single call type.
+ * Each call type has its own LLM + Agent stored on call_type_configs.
+ * Idempotent — creates on first call, updates on subsequent calls.
  */
-function buildAgentParams(llmId, companyName) {
-  return {
-    response_engine: { type: "retell-llm", llm_id: llmId },
-    agent_name: `CONFIRM_${companyName.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`,
-    voice_id: config.retell.defaultVoiceId,
-    language: "en-US",
-    enable_backchannel: true,
-    responsiveness: 1,
-    interruption_sensitivity: 1,
-    end_call_after_silence_ms: 600000,
-    max_call_duration_ms: 3600000,
-    voicemail_detection_enabled: true,
-    voicemail_action: "hangup",
-    post_call_analysis_model: "gpt-4.1-mini",
-    post_call_analysis_data: POST_CALL_ANALYSIS_DATA,
-  };
-}
-
-/**
- * Provision a Retell LLM + Agent for a company. Stores IDs back to the companies table.
- * Idempotent: if IDs already exist, updates the LLM/agent in place.
- */
-async function syncAgentForCompany(companyId, agentSettings) {
+async function syncAgentForCallType(companyId, callType) {
   const client = getClient();
 
   const companyResult = await db.query(
-    `SELECT name, retell_agent_id, retell_llm_id FROM companies WHERE id = $1`,
+    `SELECT c.name, cs.representative_name
+     FROM companies c
+     LEFT JOIN agent_settings cs ON cs.company_id = c.id
+     WHERE c.id = $1`,
     [companyId]
   );
   const company = companyResult.rows[0];
   if (!company) throw new Error(`Company ${companyId} not found`);
 
-  const companyName = company.name;
-  const llmParams = buildLlmParams(agentSettings, companyName);
-  const existingLlmId = company.retell_llm_id;
-  const existingAgentId = company.retell_agent_id;
+  const llmParams = buildLlmParams(callType, company.representative_name, company.name);
 
-  let llmId = existingLlmId;
-  let agentId = existingAgentId;
+  let { retell_llm_id: llmId, retell_agent_id: agentId } = callType;
 
-  if (existingLlmId) {
-    await client.llm.update(existingLlmId, llmParams);
-    logger.info("Retell LLM updated", { companyId, llmId: existingLlmId });
+  if (llmId) {
+    await client.llm.update(llmId, llmParams);
+    logger.info("Retell LLM updated", { companyId, callType: callType.type, llmId });
   } else {
     const llm = await client.llm.create(llmParams);
     llmId = llm.llm_id;
-    logger.info("Retell LLM created", { companyId, llmId });
+    logger.info("Retell LLM created", { companyId, callType: callType.type, llmId });
   }
 
-  const agentParams = buildAgentParams(llmId, companyName);
+  const agentParams = buildAgentParams(llmId, company.name, callType.type);
 
-  if (existingAgentId) {
-    await client.agent.update(existingAgentId, agentParams);
-    logger.info("Retell Agent updated", { companyId, agentId: existingAgentId });
+  if (agentId) {
+    await client.agent.update(agentId, agentParams);
+    logger.info("Retell Agent updated", { companyId, callType: callType.type, agentId });
   } else {
     const agent = await client.agent.create(agentParams);
     agentId = agent.agent_id;
-    logger.info("Retell Agent created", { companyId, agentId });
+    logger.info("Retell Agent created", { companyId, callType: callType.type, agentId });
   }
 
-  if (!existingLlmId || !existingAgentId) {
-    await db.query(
-      `UPDATE companies SET retell_llm_id = $1, retell_agent_id = $2, updated_at = NOW() WHERE id = $3`,
-      [llmId, agentId, companyId]
-    );
-  }
+  // Persist IDs back to the call_type_configs row
+  await db.query(
+    `UPDATE call_type_configs
+     SET retell_llm_id = $1, retell_agent_id = $2, updated_at = NOW()
+     WHERE company_id = $3 AND type = $4`,
+    [llmId, agentId, companyId, callType.type]
+  );
 
   return { llmId, agentId };
 }
@@ -138,29 +135,42 @@ function verifyWebhookSignature(rawBody, signature) {
 }
 
 /**
- * Initiate an outbound call via Retell.
+ * Initiate an outbound call via Retell for a specific call type.
+ * Falls back to any provisioned agent for the company if callType not specified.
  */
-async function createCall({ fromNumber, toNumber, companyId, metadata = {} }) {
+async function createCall({ fromNumber, toNumber, companyId, callType, metadata = {} }) {
   const client = getClient();
 
-  const companyResult = await db.query(
-    `SELECT retell_agent_id FROM companies WHERE id = $1`,
-    [companyId]
-  );
-  const company = companyResult.rows[0];
-  if (!company?.retell_agent_id) {
-    throw new Error(`No Retell agent provisioned for company ${companyId}`);
+  let agentId;
+
+  if (callType) {
+    const row = await db.query(
+      `SELECT retell_agent_id FROM call_type_configs WHERE company_id = $1 AND type = $2`,
+      [companyId, callType]
+    );
+    agentId = row.rows[0]?.retell_agent_id;
+    if (!agentId) throw new Error(`No Retell agent provisioned for call type "${callType}" on company ${companyId}`);
+  } else {
+    // Fallback: use first available agent across call types
+    const row = await db.query(
+      `SELECT retell_agent_id FROM call_type_configs
+       WHERE company_id = $1 AND retell_agent_id IS NOT NULL
+       ORDER BY is_custom ASC, created_at ASC LIMIT 1`,
+      [companyId]
+    );
+    agentId = row.rows[0]?.retell_agent_id;
+    if (!agentId) throw new Error(`No Retell agent provisioned for company ${companyId}`);
   }
 
   const call = await client.call.createPhoneCall({
     from_number: fromNumber,
     to_number: toNumber,
-    override_agent_id: company.retell_agent_id,
-    metadata: { company_id: String(companyId), ...metadata },
+    override_agent_id: agentId,
+    metadata: { company_id: String(companyId), call_type: callType || null, ...metadata },
   });
 
-  logger.info("Retell call initiated", { companyId, callId: call.call_id, toNumber });
+  logger.info("Retell call initiated", { companyId, callType, callId: call.call_id, toNumber });
   return call;
 }
 
-module.exports = { syncAgentForCompany, verifyWebhookSignature, createCall, getClient };
+module.exports = { syncAgentForCallType, verifyWebhookSignature, createCall, getClient };
