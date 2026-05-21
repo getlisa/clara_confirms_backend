@@ -36,5 +36,11 @@ module.exports = {
     apiKey: process.env.RETELL_API_KEY || "",
     webhookSecret: process.env.RETELL_WEBHOOK_SECRET || "",
     defaultVoiceId: process.env.RETELL_DEFAULT_VOICE_ID || "11labs-Adrian",
+    webhookUrl: process.env.RETELL_WEBHOOK_URL || "",
+    // Phone number auto-purchase settings
+    phoneAreaCode: process.env.RETELL_PHONE_AREA_CODE
+      ? parseInt(process.env.RETELL_PHONE_AREA_CODE, 10)
+      : undefined,
+    phoneCountryCode: process.env.RETELL_PHONE_COUNTRY_CODE || "US",
   },
 };

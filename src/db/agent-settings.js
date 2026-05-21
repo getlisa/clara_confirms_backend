@@ -1,39 +1,32 @@
 const db = require("./index");
 
-const DEFAULTS = {
-  representative_name: null,
-  begin_message: null,
-  general_prompt: null,
-  days_before_confirmation: 2,
-};
+// Fields updatable by the user (representative_name only — prompts live on call_type_configs)
+const USER_FIELDS = ["representative_name"];
 
-const ALLOWED_FIELDS = [
-  "representative_name",
-  "begin_message",
-  "general_prompt",
-  "days_before_confirmation",
-];
 
 function rowToObject(row) {
   return {
     representative_name: row.representative_name ?? null,
-    begin_message: row.begin_message ?? null,
-    general_prompt: row.general_prompt ?? null,
-    days_before_confirmation: Number(row.days_before_confirmation),
+    subagent_count:      Number(row.subagent_count ?? 0),
   };
 }
 
 async function getByCompanyId(companyId) {
   const result = await db.query(
-    `SELECT representative_name, begin_message, general_prompt, days_before_confirmation
+    `SELECT representative_name, subagent_count
      FROM agent_settings WHERE company_id = $1`,
     [companyId]
   );
-  return result.rows[0] ? rowToObject(result.rows[0]) : { ...DEFAULTS };
+  return result.rows[0]
+    ? rowToObject(result.rows[0])
+    : { representative_name: null, subagent_count: 0 };
 }
 
+/**
+ * Upsert user-editable fields (representative_name).
+ */
 async function upsert(companyId, fields) {
-  const provided = ALLOWED_FIELDS.filter((k) => k in fields);
+  const provided = USER_FIELDS.filter((k) => k in fields);
   if (provided.length === 0) return getByCompanyId(companyId);
 
   const values = [companyId, ...provided.map((k) => fields[k])];
@@ -47,10 +40,27 @@ async function upsert(companyId, fields) {
      ON CONFLICT (company_id) DO UPDATE SET
        ${setClauses},
        updated_at = NOW()
-     RETURNING representative_name, begin_message, general_prompt, days_before_confirmation`,
+     RETURNING representative_name, retell_agent_id, retell_conversation_flow_id, subagent_count`,
     values
   );
   return rowToObject(result.rows[0]);
 }
 
-module.exports = { getByCompanyId, upsert };
+/**
+ * Update Retell-managed fields after a flow sync.
+ * Called by syncFlowForCompany — not exposed to the user.
+ */
+async function updateRetellIds(companyId, { retellAgentId, retellConversationFlowId, subagentCount }) {
+  await db.query(
+    `INSERT INTO agent_settings (company_id, retell_agent_id, retell_conversation_flow_id, subagent_count)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (company_id) DO UPDATE SET
+       retell_agent_id             = $2,
+       retell_conversation_flow_id = $3,
+       subagent_count              = $4,
+       updated_at                  = NOW()`,
+    [companyId, retellAgentId, retellConversationFlowId, subagentCount]
+  );
+}
+
+module.exports = { getByCompanyId, upsert, updateRetellIds };

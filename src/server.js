@@ -17,6 +17,9 @@ const agentSettingsRoutes = require("./routes/agent-settings");
 const retellRoutes = require("./routes/retell");
 const todosRoutes = require("./routes/todos");
 const callsRoutes = require("./routes/calls");
+const callSettingsRoutes = require("./routes/call-settings");
+const testRoutes = require("./routes/test");
+const schedulerRoutes = require("./routes/scheduler");
 
 const app = express();
 
@@ -113,6 +116,15 @@ app.use("/todos", todosRoutes);
 
 // Calls history - requires auth
 app.use("/calls", callsRoutes);
+
+// Call settings (office hours, attempts, voicemail) - requires auth
+app.use("/call-settings", callSettingsRoutes);
+
+// Test call trigger - requires auth
+app.use("/test", testRoutes);
+
+// Scheduler cron endpoints - protected by CRON_SECRET
+app.use("/scheduler", schedulerRoutes);
 
 // 404 handler
 app.use((req, res) => {

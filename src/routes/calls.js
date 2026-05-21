@@ -15,12 +15,13 @@ router.get("/", async (req, res) => {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
-    const { status, appointment_confirmed, limit, offset } = req.query;
+    const { status, appointment_confirmed, limit, offset, is_test } = req.query;
     const calls = await callsDb.list(companyId, {
       status: status || undefined,
       appointmentConfirmed: appointment_confirmed || undefined,
       limit: limit ? Math.min(Number(limit), 200) : 50,
       offset: offset ? Number(offset) : 0,
+      isTest: is_test === "true",
     });
     return res.json({ calls });
   } catch (err) {

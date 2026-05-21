@@ -118,16 +118,14 @@ function slugify(name) {
 
 function rowToObject(row) {
   return {
-    type:             row.type,
-    name:             row.name,
-    description:      row.description ?? "",
-    is_custom:        row.is_custom,
-    enabled:          row.enabled,
-    days_before:      Number(row.days_before),
-    begin_message:    row.begin_message ?? null,
-    general_prompt:   row.general_prompt ?? null,
-    retell_llm_id:    row.retell_llm_id ?? null,
-    retell_agent_id:  row.retell_agent_id ?? null,
+    type:           row.type,
+    name:           row.name,
+    description:    row.description ?? "",
+    is_custom:      row.is_custom,
+    enabled:        row.enabled,
+    days_before:    Number(row.days_before),
+    begin_message:  row.begin_message ?? null,
+    general_prompt: row.general_prompt ?? null,
   };
 }
 

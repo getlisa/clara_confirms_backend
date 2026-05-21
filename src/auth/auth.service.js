@@ -9,6 +9,7 @@ const db = require("../db");
 const config = require("../config");
 const logger = require("../utils/logger");
 const callTypeConfigsDb = require("../db/call-type-configs");
+const { syncFlowForCompany } = require("../services/retell-flow");
 
 const SALT_ROUNDS = 12;
 
@@ -83,7 +84,7 @@ async function register({ email, password, name, companyName }) {
   const first = nameStr.split(/\s+/)[0] || "";
   const last = nameStr.includes(" ") ? nameStr.replace(/^\s*\S+\s*/, "").trim() : "";
 
-  return db.transaction(async (client) => {
+  const result = await db.transaction(async (client) => {
     // Check if email already exists
     const existingUser = await client.query(
       "SELECT id FROM users WHERE email = $1",
@@ -146,6 +147,16 @@ async function register({ email, password, name, companyName }) {
       refreshToken,
     };
   });
+
+  // Provision the Retell conversation flow after the DB transaction commits
+  syncFlowForCompany(result.user.company_id).catch((err) =>
+    logger.warn("Retell flow provisioning failed during registration", {
+      companyId: result.user.company_id,
+      error: err.message,
+    })
+  );
+
+  return result;
 }
 
 /**
