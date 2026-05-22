@@ -108,7 +108,7 @@ function buildSubagentNode(callType) {
         destination_node_id: NODE_END,
         transition_condition: {
           type: "prompt",
-          prompt: "The conversation has reached a natural conclusion — the customer has confirmed, declined, requested a reschedule, or ended the call.",
+          prompt: "The agent has said a clear farewell such as 'goodbye', 'have a great day', 'take care', or 'talk to you soon', AND the customer has also said goodbye OR the customer has explicitly hung up. Do NOT transition if the customer has asked a question, requested a reschedule, expressed concerns, or if the conversation is still actively ongoing.",
         },
       },
     ],
