@@ -49,7 +49,7 @@ async function verifyWebhookSignature(rawBody, signature) {
  * Initiate an outbound call via the company's flow-backed Retell agent.
  * Pass call_type and job dynamic variables so the flow routes to the right subagent.
  */
-async function createCall({ fromNumber, toNumber, companyId, callType, dynamicVariables = {}, metadata = {} }) {
+async function createCall({ fromNumber, toNumber, companyId, callType, dynamicVariables = {}, metadata = {}, voicemailMessage }) {
   if (!callType) throw new Error("callType is required — the branch router needs it to route to the correct subagent");
 
   const client = getClient();
@@ -62,11 +62,10 @@ async function createCall({ fromNumber, toNumber, companyId, callType, dynamicVa
   if (!company?.retell_agent_id) throw new Error(`No Retell agent provisioned for company ${companyId}`);
   const agentId = company.retell_agent_id;
 
-  // Fall back to company's registered phone number if fromNumber not explicitly provided
   const resolvedFromNumber = fromNumber || company.retell_phone_number;
   if (!resolvedFromNumber) throw new Error(`No from_number available for company ${companyId} — set retell_phone_number on the company`);
 
-  const call = await client.call.createPhoneCall({
+  const callParams = {
     from_number: resolvedFromNumber,
     to_number: toNumber,
     override_agent_id: agentId,
@@ -75,7 +74,14 @@ async function createCall({ fromNumber, toNumber, companyId, callType, dynamicVa
       ...dynamicVariables,
     },
     metadata: { company_id: String(companyId), call_type: callType || null, ...metadata },
-  });
+  };
+
+  // Override voicemail message per call so each call type has context-appropriate wording
+  if (voicemailMessage !== undefined) {
+    callParams.agent_override = { voicemail_message: voicemailMessage };
+  }
+
+  const call = await client.call.createPhoneCall(callParams);
 
   logger.info("Retell call initiated", { companyId, callType, callId: call.call_id, toNumber });
   return call;

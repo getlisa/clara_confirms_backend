@@ -6,6 +6,8 @@
  *   2. Create Agent             (response_engine: conversation-flow)
  *   3. Buy phone number         (auto-purchased, linked as outbound + inbound)
  *   4. Store all IDs on company
+ *   5. Register default tools on each subagent node
+ *   6. Sync full workflow prompts to each subagent node
  *
  * Every subsequent UI change (call type add/edit/delete, representative_name)
  * calls syncFlowForCompany again — idempotent, patches in place.
@@ -136,6 +138,8 @@ const DEFAULT_DYNAMIC_VARIABLES = {
   company_name:        "",
   representative_name: "",
   customer_address:    "",
+  current_date:        "",
+  current_time:        "",
 };
 
 // ── Phone number purchase ──────────────────────────────────────────────────────
@@ -364,6 +368,25 @@ async function syncFlowForCompany(companyId) {
       companyId,
     ]
   );
+
+  // ── Step 7: Attach default tools + full workflow prompts ─────────────────────
+  // Must run AFTER IDs are stamped to call_type_configs (Step 4) so the
+  // tool/prompt services can look up retell_llm_id and retell_subagent_node_id.
+  try {
+    const { registerToolsForCompany } = require("./retell-tools");
+    await registerToolsForCompany(companyId);
+    logger.info("syncFlowForCompany: tools registered", { companyId });
+  } catch (err) {
+    logger.warn("syncFlowForCompany: tool registration failed (non-fatal)", { companyId, error: err.message });
+  }
+
+  try {
+    const { syncPromptsForCompany } = require("./prompt-sync");
+    await syncPromptsForCompany(companyId);
+    logger.info("syncFlowForCompany: prompts synced", { companyId });
+  } catch (err) {
+    logger.warn("syncFlowForCompany: prompt sync failed (non-fatal)", { companyId, error: err.message });
+  }
 
   logger.info("Retell provisioning complete", {
     companyId,

@@ -1,6 +1,11 @@
 const db = require("./index");
 
-const BUILTIN_TYPES = ["customer_confirmation", "technician_confirmation", "technician_reschedule"];
+const BUILTIN_TYPES = [
+  "customer_confirmation",
+  "technician_confirmation",
+  "technician_reschedule",
+  "quotation_followup",
+];
 
 const BUILTIN_SEEDS = [
   {
@@ -24,6 +29,13 @@ const BUILTIN_SEEDS = [
     enabled: false,
     days_before: 1,
   },
+  {
+    type: "quotation_followup",
+    name: "Quotation Follow-up",
+    description: "Follow up with the customer on a sent or viewed quotation that hasn't been accepted yet.",
+    enabled: false,
+    days_before: 3,
+  },
 ];
 
 /**
@@ -36,19 +48,51 @@ function generateDefaultPrompts(type, name, description) {
     return {
       begin_message:
         "Hi {{customer_name}}, this is {{representative_name}} calling from {{company_name}}. " +
-        "I'm reaching out to confirm your upcoming service appointment on {{job_date}}. " +
+        "I'm reaching out about the {{job_name}} job scheduled for {{job_date}}. " +
         "Is now a good time to talk?",
       general_prompt:
-        "You are {{representative_name}}, a friendly and professional scheduling assistant " +
-        "calling on behalf of {{company_name}}. Your goal is to confirm the customer's " +
-        "upcoming service appointment (Job #{{job_id}}) scheduled for {{job_date}}.\n\n" +
-        "When calling:\n" +
-        "- Greet the customer warmly and introduce yourself\n" +
-        "- Confirm the appointment date and time\n" +
-        "- Ask if they have any questions or need to reschedule\n" +
-        "- If they want to reschedule, collect their preferred time and let them know someone will follow up\n" +
-        "- Be concise, polite, and professional throughout\n" +
-        "- Do not discuss pricing, contracts, or anything outside of appointment confirmation",
+        "[Opening — say this exactly when the call connects]:\n" +
+        "Hi {{customer_name}}, this is {{representative_name}} calling from {{company_name}}. " +
+        "I'm reaching out about the {{job_name}} job scheduled for {{job_date}}. Is now a good time to talk?\n\n" +
+        "You are {{representative_name}}, a friendly and professional scheduling assistant calling on behalf of {{company_name}}.\n\n" +
+        "Current date and time: {{current_date}} at {{current_time}}\n\n" +
+        "Job details for this call:\n" +
+        "- Job: {{job_name}}\n" +
+        "- Description: {{job_description}}\n" +
+        "- Scheduled date: {{job_date}}\n" +
+        "- Job ID: {{job_id}}\n" +
+        "- Appointment ID: {{appointment_id}}\n" +
+        "- Customer address: {{customer_address}}\n\n" +
+        "━━━ YOUR MAIN WORKFLOW ━━━\n\n" +
+        "STEP 1 — Call the get_job tool with job_id={{job_id}} to check the current appointment status.\n\n" +
+        "STEP 2 — Based on the result:\n\n" +
+        "── CASE A: Job has an active appointment (has_active_appointment = true) ──────────\n" +
+        "The appointment already exists. Your goal is to confirm it.\n\n" +
+        "  If customer CONFIRMS they will be available:\n" +
+        "    → Call confirm_appointment with the appointment_id from the get_job result.\n" +
+        "    → Say: \"Great, I've confirmed your appointment. See you on [date]!\"\n\n" +
+        "  If customer wants to RESCHEDULE:\n" +
+        "    → Ask: \"What date and time works best for you?\"\n" +
+        "    → Call reschedule_appointment with appointment_id and the new scheduled_start (format: YYYY-MM-DDTHH:MM:SS).\n" +
+        "    → Confirm the new time back to the customer.\n\n" +
+        "  If customer wants to CANCEL:\n" +
+        "    → Acknowledge and say a team member will follow up to discuss.\n" +
+        "    → Do NOT cancel anything yourself.\n\n" +
+        "── CASE B: No active appointment (has_active_appointment = false) ──────────────────\n" +
+        "No appointment has been booked yet. Your goal is to schedule one.\n\n" +
+        "  Ask the customer: \"We'd like to get that scheduled for you — do you have a preferred date and time for the {{job_name}}?\"\n\n" +
+        "  If customer GIVES a time preference:\n" +
+        "    → Call create_appointment with job_id={{job_id}} and their preferred scheduled_start (format: YYYY-MM-DDTHH:MM:SS, in the customer's local time).\n" +
+        "    → Confirm back: \"I've scheduled your appointment for [date and time]. Our team will be there!\"\n\n" +
+        "  If customer has NO preference or says \"anytime\" / \"whatever works\":\n" +
+        "    → Say: \"No problem at all — our scheduling team will reach out soon to confirm a time that works for everyone.\"\n" +
+        "    → Do NOT create an appointment. End the call politely.\n" +
+        "    → (The system will automatically create a follow-up action for the team to book this appointment.)\n\n" +
+        "━━━ GENERAL RULES ━━━\n" +
+        "- Always call get_job first before taking any action.\n" +
+        "- If the customer has questions about the job, answer based on {{job_description}} — for anything beyond that, say the team will follow up.\n" +
+        "- Do not discuss pricing, contracts, or anything outside scheduling.\n" +
+        "- Only say goodbye once the conversation is fully resolved.",
     };
   }
 
@@ -56,17 +100,39 @@ function generateDefaultPrompts(type, name, description) {
     return {
       begin_message:
         "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}. " +
-        "I'm calling to confirm you're available for a job on {{job_date}} at {{customer_address}}. " +
+        "I'm calling to confirm you're available for the {{job_name}} job on {{job_date}} at {{customer_address}}. " +
         "Do you have a moment?",
       general_prompt:
-        "You are {{representative_name}}, a scheduling coordinator calling on behalf of {{company_name}}. " +
-        "Your goal is to confirm the technician's availability for Job #{{job_id}} " +
-        "scheduled on {{job_date}} at {{customer_address}}.\n\n" +
-        "When calling:\n" +
-        "- Confirm the job date, time, and location\n" +
-        "- Ask if they have any conflicts or concerns\n" +
-        "- If they are unavailable, collect their availability and let them know a coordinator will follow up\n" +
-        "- Be professional and concise",
+        "[Opening — say this exactly when the call connects]:\n" +
+        "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}. " +
+        "I'm calling to confirm you're available for the {{job_name}} job on {{job_date}} at {{customer_address}}. Do you have a moment?\n\n" +
+        "You are {{representative_name}}, a scheduling coordinator calling on behalf of {{company_name}}.\n\n" +
+        "Current date and time: {{current_date}} at {{current_time}}\n\n" +
+        "Job details for this call:\n" +
+        "- Job: {{job_name}}\n" +
+        "- Description: {{job_description}}\n" +
+        "- Customer: {{customer_name}}\n" +
+        "- Location: {{customer_address}}\n" +
+        "- Scheduled date: {{job_date}}\n" +
+        "- Job ID: {{job_id}}\n" +
+        "- Appointment ID: {{appointment_id}}\n\n" +
+        "━━━ YOUR MAIN WORKFLOW ━━━\n\n" +
+        "STEP 1 — Call the get_job tool with job_id={{job_id}} to confirm current job details.\n\n" +
+        "STEP 2 — Confirm availability:\n\n" +
+        "  If technician CONFIRMS availability:\n" +
+        "    → Call confirm_appointment with appointment_id={{appointment_id}} to record confirmation.\n" +
+        "    → Say: \"Great, you're confirmed for the {{job_name}} on {{job_date}}. See you there!\"\n\n" +
+        "  If technician is UNAVAILABLE:\n" +
+        "    → Ask: \"When would you be available?\"\n" +
+        "    → Note their availability and say: \"I'll pass this on to the scheduling team who will follow up.\"\n" +
+        "    → Do NOT reschedule yourself.\n\n" +
+        "  If technician has QUESTIONS about the job:\n" +
+        "    → Answer based on {{job_description}} and the get_job result.\n" +
+        "    → For anything beyond that, say the team will follow up.\n\n" +
+        "━━━ GENERAL RULES ━━━\n" +
+        "- Be professional and concise.\n" +
+        "- Do not discuss pay, contracts, or anything outside of availability confirmation.\n" +
+        "- Only say goodbye once the conversation is fully resolved.",
     };
   }
 
@@ -74,21 +140,67 @@ function generateDefaultPrompts(type, name, description) {
     return {
       begin_message:
         "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}. " +
-        "I'm calling regarding Job #{{job_id}} at {{customer_address}} on {{job_date}} — " +
+        "I'm calling regarding the {{job_name}} job on {{job_date}} at {{customer_address}} — " +
         "we need to discuss rescheduling. Do you have a moment?",
       general_prompt:
-        "You are {{representative_name}}, a scheduling coordinator calling on behalf of {{company_name}}. " +
-        "The purpose of this call is to notify the technician that Job #{{job_id}} " +
-        "scheduled on {{job_date}} at {{customer_address}} needs to be rescheduled.\n\n" +
+        "[Opening — say this exactly when the call connects]:\n" +
+        "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}. " +
+        "I'm calling regarding the {{job_name}} job on {{job_date}} at {{customer_address}} — we need to discuss rescheduling. Do you have a moment?\n\n" +
+        "You are {{representative_name}}, a scheduling coordinator calling on behalf of {{company_name}}.\n\n" +
+        "Current date and time: {{current_date}} at {{current_time}}\n\n" +
+        "Job details:\n" +
+        "- Job: {{job_name}}\n" +
+        "- Customer: {{customer_name}}\n" +
+        "- Location: {{customer_address}}\n" +
+        "- Original date: {{job_date}}\n" +
+        "- Job ID: {{job_id}}\n\n" +
+        "Your goal is to notify the technician that the job needs rescheduling and collect their availability.\n\n" +
         "When calling:\n" +
-        "- Explain that the job needs to be rescheduled\n" +
-        "- Collect the technician's availability for an alternative time\n" +
-        "- Be professional and empathetic\n" +
-        "- Confirm that a coordinator will follow up with the new schedule",
+        "- Explain clearly that the job needs to be rescheduled.\n" +
+        "- Ask for their availability: \"What dates and times work for you in the coming days?\"\n" +
+        "- Note the times they provide.\n" +
+        "- Reassure them: \"I'll pass this to the scheduling team who will confirm the new time.\"\n" +
+        "- Be empathetic and professional.\n" +
+        "- Do not confirm a new time yourself.",
     };
   }
 
-  // Generic defaults for custom types — derived from name and description
+  if (type === "quotation_followup") {
+    return {
+      begin_message:
+        "Hi {{customer_name}}, this is {{representative_name}} calling from {{company_name}}. " +
+        "I'm following up on the quote we sent you for {{job_name}} — do you have a moment to discuss it?",
+      general_prompt:
+        "[Opening — say this exactly when the call connects]:\n" +
+        "Hi {{customer_name}}, this is {{representative_name}} calling from {{company_name}}. " +
+        "I'm following up on the quote we sent you for {{job_name}} — do you have a moment to discuss it?\n\n" +
+        "You are {{representative_name}}, a friendly and professional representative calling on behalf of {{company_name}}.\n\n" +
+        "Quote details for this call:\n" +
+        "- Quote for: {{job_name}}\n" +
+        "- Total amount: {{total_amount}}\n" +
+        "- Job ID: {{job_id}}\n\n" +
+        "━━━ YOUR MAIN WORKFLOW ━━━\n\n" +
+        "STEP 1 — Call the get_quotation tool with job_id={{job_id}} to fetch full quote details.\n\n" +
+        "STEP 2 — Based on the customer's response:\n\n" +
+        "  If customer is READY TO PROCEED:\n" +
+        "    → Say: \"That's great news! I'll let the team know and they'll be in touch to schedule the work.\"\n" +
+        "    → Do NOT schedule anything yourself.\n\n" +
+        "  If customer has QUESTIONS about the quote:\n" +
+        "    → Answer based on the get_quotation result (line items, scope, validity).\n" +
+        "    → For pricing changes or special requests: \"I'll pass that on to the team who can review it for you.\"\n\n" +
+        "  If customer wants to DECLINE:\n" +
+        "    → Thank them politely and ask if they'd like to share their reason.\n" +
+        "    → Note the reason and close the call respectfully.\n\n" +
+        "  If customer asks for a CALLBACK or more time:\n" +
+        "    → Acknowledge and say the team will follow up.\n\n" +
+        "━━━ GENERAL RULES ━━━\n" +
+        "- Do not make pricing commitments or modify the quote.\n" +
+        "- Do not schedule work during this call — that is a separate step.\n" +
+        "- Be professional, friendly, and respect the customer's decision.",
+    };
+  }
+
+  // Generic defaults for custom types
   return {
     begin_message:
       `Hi {{customer_name}}, this is {{representative_name}} calling from {{company_name}}. ` +
@@ -106,6 +218,40 @@ function generateDefaultPrompts(type, name, description) {
 }
 
 /**
+ * Default voicemail messages per call type.
+ * Supports {{representative_name}}, {{company_name}}, {{customer_name}}, {{technician_name}}.
+ * These placeholders are resolved at call-creation time in the dispatcher.
+ */
+function generateDefaultVoicemailMessage(type) {
+  switch (type) {
+    case "customer_confirmation":
+      return "Hi {{customer_name}}, this is {{representative_name}} from {{company_name}}. " +
+             "We were calling to confirm your upcoming service appointment. " +
+             "Please call us back at your earliest convenience. Thank you!";
+
+    case "technician_confirmation":
+      return "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}. " +
+             "We were calling to confirm your availability for an upcoming job. " +
+             "Please call us back when you get a chance. Thank you!";
+
+    case "technician_reschedule":
+      return "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}. " +
+             "We need to discuss rescheduling one of your upcoming jobs. " +
+             "Please call us back as soon as possible. Thank you!";
+
+    case "quotation_followup":
+      return "Hi {{customer_name}}, this is {{representative_name}} from {{company_name}}. " +
+             "We were following up on a quote we recently sent you. " +
+             "Please call us back when you have a moment. Thank you!";
+
+    default:
+      return "Hi, this is {{representative_name}} from {{company_name}}. " +
+             "We had a question for you and would love to connect. " +
+             "Please call us back at your earliest convenience. Thank you!";
+  }
+}
+
+/**
  * Generate a URL-safe slug from a display name.
  * e.g. "Post-job Follow-up" → "post_job_follow_up"
  */
@@ -118,14 +264,15 @@ function slugify(name) {
 
 function rowToObject(row) {
   return {
-    type:           row.type,
-    name:           row.name,
-    description:    row.description ?? "",
-    is_custom:      row.is_custom,
-    enabled:        row.enabled,
-    days_before:    Number(row.days_before),
-    begin_message:  row.begin_message ?? null,
-    general_prompt: row.general_prompt ?? null,
+    type:              row.type,
+    name:              row.name,
+    description:       row.description ?? "",
+    is_custom:         row.is_custom,
+    enabled:           row.enabled,
+    days_before:       Number(row.days_before),
+    begin_message:     row.begin_message ?? null,
+    general_prompt:    row.general_prompt ?? null,
+    voicemail_message: row.voicemail_message ?? generateDefaultVoicemailMessage(row.type),
   };
 }
 
@@ -137,12 +284,13 @@ async function seedBuiltins(companyId, client) {
   const run = client ?? db;
   for (const seed of BUILTIN_SEEDS) {
     const { begin_message, general_prompt } = generateDefaultPrompts(seed.type, seed.name, seed.description);
+    const voicemail_message = generateDefaultVoicemailMessage(seed.type);
     await run.query(
       `INSERT INTO call_type_configs
-         (company_id, type, name, description, is_custom, enabled, days_before, begin_message, general_prompt)
-       VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8)
+         (company_id, type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, voicemail_message)
+       VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8, $9)
        ON CONFLICT (company_id, type) DO NOTHING`,
-      [companyId, seed.type, seed.name, seed.description, seed.enabled, seed.days_before, begin_message, general_prompt]
+      [companyId, seed.type, seed.name, seed.description, seed.enabled, seed.days_before, begin_message, general_prompt, voicemail_message]
     );
   }
 }
@@ -152,7 +300,7 @@ async function seedBuiltins(companyId, client) {
  */
 async function getAllByCompanyId(companyId) {
   const result = await db.query(
-    `SELECT type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, retell_llm_id, retell_agent_id
+    `SELECT type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id
      FROM call_type_configs
      WHERE company_id = $1
      ORDER BY is_custom ASC, created_at ASC`,
@@ -182,7 +330,7 @@ async function create(companyId, { name, description, days_before }) {
     `INSERT INTO call_type_configs
        (company_id, type, name, description, is_custom, enabled, days_before, begin_message, general_prompt)
      VALUES ($1, $2, $3, $4, true, false, $5, $6, $7)
-     RETURNING type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, retell_llm_id, retell_agent_id`,
+     RETURNING type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id`,
     [companyId, slug, name, description ?? "", days_before ?? 2, begin_message, general_prompt]
   );
   return rowToObject(result.rows[0]);
@@ -193,7 +341,7 @@ async function create(companyId, { name, description, days_before }) {
  */
 async function getByType(companyId, type) {
   const result = await db.query(
-    `SELECT type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, retell_llm_id, retell_agent_id
+    `SELECT type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id
      FROM call_type_configs WHERE company_id = $1 AND type = $2`,
     [companyId, type]
   );
@@ -208,7 +356,7 @@ async function upsert(companyId, type, fields) {
   const isBuiltin = BUILTIN_TYPES.includes(type);
 
   // For built-ins, always upsert (create if missing). For custom, only update existing.
-  const allowed = ["enabled", "days_before", "begin_message", "general_prompt"];
+  const allowed = ["enabled", "days_before", "begin_message", "general_prompt", "voicemail_message"];
   if (!isBuiltin) allowed.push("name", "description");
 
   const provided = allowed.filter((k) => k in fields);
@@ -271,4 +419,4 @@ async function nameExists(companyId, name, excludeType) {
   return result.rowCount > 0;
 }
 
-module.exports = { BUILTIN_TYPES, seedBuiltins, getAllByCompanyId, create, getByType, upsert, remove, nameExists };
+module.exports = { BUILTIN_TYPES, BUILTIN_SEEDS, generateDefaultPrompts, generateDefaultVoicemailMessage, seedBuiltins, getAllByCompanyId, create, getByType, upsert, remove, nameExists };

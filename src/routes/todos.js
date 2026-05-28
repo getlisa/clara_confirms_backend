@@ -16,13 +16,14 @@ router.get("/", async (req, res) => {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
-    const { status, type, assigned_to, limit, offset } = req.query;
+    const { status, type, assigned_to, limit, offset, is_test } = req.query;
     const todos = await todosDb.list(companyId, {
       status: status || undefined,
       type: type || undefined,
       assignedTo: assigned_to ? Number(assigned_to) : undefined,
       limit: limit ? Math.min(Number(limit), 200) : 50,
       offset: offset ? Number(offset) : 0,
+      isTest: is_test === "false",
     });
     return res.json({ todos });
   } catch (err) {

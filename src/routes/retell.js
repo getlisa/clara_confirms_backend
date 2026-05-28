@@ -9,7 +9,9 @@ const logger = require("../utils/logger");
 const router = express.Router();
 
 // Raw body capture for webhook signature verification — before express.json()
+// Skip for /tools/* paths which are handled by retellToolsRoutes after body parsers
 router.use((req, res, next) => {
+  if (req.path.startsWith("/tools")) return next();
   let data = "";
   req.on("data", (chunk) => { data += chunk; });
   req.on("end", () => {
@@ -195,6 +197,7 @@ async function handleCallAnalyzed(callData) {
     appointmentConfirmed: outcome.appointmentConfirmed,
     rescheduleRequested: outcome.rescheduleRequested,
     cancellationRequested: outcome.cancellationRequested,
+    customerOutcome: custom.customer_outcome ?? null,
   });
 
   if (todoType) {
@@ -202,6 +205,7 @@ async function handleCallAnalyzed(callData) {
       companyId,
       callId,
       type: todoType,
+      isTest,
       metadata: {
         retell_call_id: call_id,
         to_number: callData.to_number,

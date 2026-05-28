@@ -12,14 +12,21 @@ const db = require("./db");
 const { authRoutes } = require("./auth");
 const companyRoutes = require("./routes/company");
 const usersRoutes = require("./routes/users");
+const customersRoutes = require("./routes/customers");
+const jobsRoutes = require("./routes/jobs");
 const servicetradeRoutes = require("./routes/servicetrade");
 const agentSettingsRoutes = require("./routes/agent-settings");
 const retellRoutes = require("./routes/retell");
 const todosRoutes = require("./routes/todos");
 const callsRoutes = require("./routes/calls");
 const callSettingsRoutes = require("./routes/call-settings");
+const callTriggersRoutes = require("./routes/call-triggers");
+const scheduledCallsRoutes = require("./routes/scheduled-calls");
 const testRoutes = require("./routes/test");
 const schedulerRoutes = require("./routes/scheduler");
+const retellToolsRoutes = require("./routes/retell-tools");
+const callAnalysisConfigsRoutes = require("./routes/call-analysis-configs");
+const dashboardRoutes = require("./routes/dashboard");
 
 const app = express();
 
@@ -75,6 +82,7 @@ app.use((req, res, next) => {
 // Health check
 app.get("/health", async (req, res) => {
   try {
+    logger.debug("Health check");
     const dbHealthy = await db.checkConnection();
     if (!dbHealthy) {
       return res.status(503).json({
@@ -105,6 +113,12 @@ app.use("/company", companyRoutes);
 // Users routes - requires auth (admin for most operations)
 app.use("/users", usersRoutes);
 
+// Customers - requires auth
+app.use("/customers", customersRoutes);
+
+// Jobs & Appointments - requires auth
+app.use("/jobs", jobsRoutes);
+
 // ServiceTrade integration - requires auth
 app.use("/integrations/servicetrade", servicetradeRoutes);
 
@@ -120,11 +134,26 @@ app.use("/calls", callsRoutes);
 // Call settings (office hours, attempts, voicemail) - requires auth
 app.use("/call-settings", callSettingsRoutes);
 
+// Call trigger configs (when to auto-call customers) - requires auth
+app.use("/call-triggers", callTriggersRoutes);
+
+// Scheduled calls queue (view + cancel) - requires auth
+app.use("/scheduled-calls", scheduledCallsRoutes);
+
 // Test call trigger - requires auth
 app.use("/test", testRoutes);
 
 // Scheduler cron endpoints - protected by CRON_SECRET
 app.use("/scheduler", schedulerRoutes);
+
+// Retell tool webhooks - called by Retell during live calls, protected by RETELL_TOOL_SECRET
+app.use("/retell/tools", retellToolsRoutes);
+
+// Call analysis priority configs - requires auth
+app.use("/call-analysis-configs", callAnalysisConfigsRoutes);
+
+// Dashboard stats - requires auth
+app.use("/dashboard", dashboardRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -151,6 +180,7 @@ async function start() {
       throw new Error("Database connection failed");
     }
     logger.info("Database connected");
+    logger.info("Hi, Welcome!")
 
     // Start HTTP server
     app.listen(config.port, () => {

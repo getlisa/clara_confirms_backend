@@ -1,8 +1,14 @@
 const db = require("../db");
 const callSettingsDb = require("../db/call-settings");
+const callTriggerConfigsDb = require("../db/call-trigger-configs");
+const callTypeConfigsDb = require("../db/call-type-configs");
 const scheduledCallsDb = require("../db/scheduled-calls");
 const retell = require("./retell");
 const logger = require("../utils/logger");
+
+const isDev = process.env.NODE_ENV === "development";
+
+// ── Time helpers ──────────────────────────────────────────────────────────────
 
 function toLocalHHMM(date, tz) {
   try {
@@ -40,70 +46,492 @@ function snapToWindowStart(s, tz, targetDate) {
   return c;
 }
 
+function formatDateInTz(date, tz) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(date);
+  } catch {
+    return date.toISOString().split("T")[0];
+  }
+}
+
+// ── Dispatcher ────────────────────────────────────────────────────────────────
+
 async function runDispatcher(batchSize = 10) {
+  // Log every pending call and why it is/isn't being picked up this run
+  const { rows: allPending } = await db.query(
+    `SELECT id, call_type, job_id, job_name, customer_name, phone_number,
+            scheduled_at, is_test, status, attempt_number, max_attempts,
+            scheduled_at <= NOW() AS due
+     FROM scheduled_calls
+     WHERE status = 'pending'
+     ORDER BY scheduled_at ASC`
+  );
+
+  if (allPending.length === 0) {
+    logger.info("Dispatcher: no pending calls in queue");
+  } else {
+    logger.info(`Dispatcher: ${allPending.length} pending call(s) in queue`);
+    for (const r of allPending) {
+      if (r.due) {
+        logger.info("Dispatcher: call is due — will attempt", {
+          rowId: r.id, callType: r.call_type, jobId: r.job_id, jobName: r.job_name,
+          customer: r.customer_name, scheduledAt: r.scheduled_at, attempt: r.attempt_number,
+        });
+      } else {
+        const secsUntilDue = Math.round((new Date(r.scheduled_at) - Date.now()) / 1000);
+        const minsUntilDue = Math.ceil(secsUntilDue / 60);
+        logger.info("Dispatcher: call not due yet — skipping this run", {
+          rowId: r.id, callType: r.call_type, jobId: r.job_id, jobName: r.job_name,
+          customer: r.customer_name, scheduledAt: r.scheduled_at,
+          reason: `scheduled_at is ${minsUntilDue} min in the future`,
+        });
+      }
+    }
+  }
+
   const rows = await scheduledCallsDb.claimPending(batchSize);
-  if (rows.length === 0) return { fired: 0, skipped: 0, failed: 0 };
+  if (rows.length === 0) {
+    logger.info("Dispatcher: no due calls to process");
+    return { fired: 0, skipped: 0, failed: 0 };
+  }
+
+  logger.info(`Dispatcher: claimed ${rows.length} due call(s) for processing`);
   let fired = 0, skipped = 0, failed = 0;
+
   for (const row of rows) {
+    const ctx = {
+      rowId: row.id,
+      callType: row.call_type,
+      jobId: row.job_id,
+      jobName: row.job_name,
+      customer: row.customer_name,
+      phone: row.phone_number,
+      scheduledAt: row.scheduled_at,
+      isTest: row.is_test,
+      attempt: row.attempt_number,
+    };
+
     try {
       const { rows: cr } = await db.query(`SELECT default_timezone FROM companies WHERE id = $1`, [row.company_id]);
       const tz = cr[0]?.default_timezone || "America/New_York";
-      if (!row.is_test) {
+
+      // In production: check office hours and reschedule if outside window
+      if (!isDev) {
         const cs = await callSettingsDb.getByCompanyId(row.company_id);
         if (!isWithinActiveHours(cs, tz)) {
-          await scheduledCallsDb.advanceToNextWindow(row.id, getNextWindowStart(cs, tz));
+          const nextWindow = getNextWindowStart(cs, tz);
+          await scheduledCallsDb.advanceToNextWindow(row.id, nextWindow);
+          logger.info("Dispatcher: skipped — outside office hours", {
+            ...ctx,
+            reason: `Current time is outside business hours (${cs.business_hours_start}–${cs.business_hours_end} ${tz})`,
+            rescheduledTo: nextWindow,
+          });
           skipped++; continue;
         }
       }
+
+      const now = new Date();
+      const callTz = tz;
       const dynVars = {
-        call_type: row.call_type,
+        call_type:    row.call_type,
+        current_date: now.toLocaleDateString("en-US", { timeZone: callTz, weekday: "long", year: "numeric", month: "long", day: "numeric" }),
+        current_time: now.toLocaleTimeString("en-US", { timeZone: callTz, hour: "2-digit", minute: "2-digit", hour12: true }),
         ...(row.customer_name    && { customer_name:    row.customer_name }),
         ...(row.technician_name  && { technician_name:  row.technician_name }),
         ...(row.customer_address && { customer_address: row.customer_address }),
         ...(row.job_date && { job_date: new Date(row.job_date).toLocaleDateString("en-US", { weekday:"long", month:"long", day:"numeric", year:"numeric" }) }),
-        ...(row.job_id   && { job_id: String(row.job_id) }),
+        ...(row.job_id          && { job_id:          String(row.job_id) }),
+        ...(row.appointment_id  && { appointment_id:  String(row.appointment_id) }),
+        ...(row.job_name        && { job_name:        row.job_name }),
+        ...(row.job_description && { job_description: row.job_description }),
+        ...(row.job_type        && { job_type:        row.job_type }),
+        ...(row.total_amount != null && { total_amount: String(row.total_amount) }),
       };
-      const call = await retell.createCall({ toNumber: row.phone_number, companyId: row.company_id, callType: row.call_type, dynamicVariables: dynVars, metadata: { scheduled_call_id: String(row.id), is_test: row.is_test } });
+
+      // Resolve call-type-specific voicemail message with actual values
+      const callTypeCfg = await callTypeConfigsDb.getByType(row.company_id, row.call_type);
+      const vmTemplate = callTypeCfg?.voicemail_message
+        || callTypeConfigsDb.generateDefaultVoicemailMessage(row.call_type);
+      const { rows: coRows } = await db.query(
+        `SELECT c.name AS company_name, a.representative_name
+         FROM companies c LEFT JOIN agent_settings a ON a.company_id = c.id WHERE c.id = $1`,
+        [row.company_id]
+      );
+      const co = coRows[0] || {};
+      const voicemailMessage = vmTemplate
+        .replace(/\{\{customer_name\}\}/g,      row.customer_name   || "")
+        .replace(/\{\{technician_name\}\}/g,     row.technician_name || "")
+        .replace(/\{\{representative_name\}\}/g, co.representative_name || "Clara")
+        .replace(/\{\{company_name\}\}/g,        co.company_name || "our company");
+
+      const call = await retell.createCall({
+        toNumber: row.phone_number,
+        companyId: row.company_id,
+        callType: row.call_type,
+        dynamicVariables: dynVars,
+        metadata: { scheduled_call_id: String(row.id), is_test: row.is_test },
+        voicemailMessage,
+      });
       await scheduledCallsDb.markCompleted(row.id, call.call_id);
-      logger.info("Dispatcher: fired", { rowId: row.id, callId: call.call_id });
+      logger.info("Dispatcher: fired", { ...ctx, retellCallId: call.call_id });
       fired++;
     } catch (err) {
       const st = await scheduledCallsDb.markFailedOrRetry(row.id, err.message);
-      logger.error("Dispatcher: failed", { rowId: row.id, error: err.message, status: st });
+      logger.error("Dispatcher: failed to fire call", {
+        ...ctx,
+        error: err.message,
+        newStatus: st,
+        reason: st === "failed"
+          ? `Exceeded max attempts (${row.max_attempts})`
+          : `Will retry in X minutes (attempt ${row.attempt_number + 1}/${row.max_attempts})`,
+      });
       failed++;
     }
   }
+
+  logger.info("Dispatcher: run complete", { fired, skipped, failed });
   return { fired, skipped, failed };
 }
 
+// ── Daily job ─────────────────────────────────────────────────────────────────
+
 async function runDailyJob() {
-  const { rows: companies } = await db.query(`SELECT id, default_timezone FROM companies WHERE is_active = true OR is_active IS NULL`);
+  const env = isDev ? "development" : "production";
+  logger.info(`Daily job: started (${env} mode)`);
+
+  const { rows: companies } = await db.query(
+    `SELECT id, default_timezone FROM companies WHERE is_active = true OR is_active IS NULL`
+  );
+  logger.info(`Daily job: processing ${companies.length} company(ies)`);
+
   let created = 0, skipped = 0;
+
   for (const co of companies) {
     try {
-      const { rows: callTypes } = await db.query(`SELECT type, days_before FROM call_type_configs WHERE company_id = $1 AND enabled = true`, [co.id]);
+      const triggers = await callTriggerConfigsDb.getEnabledByCompanyId(co.id);
+      if (triggers.length === 0) {
+        logger.info("Daily job: skipped company — no enabled triggers", { companyId: co.id });
+        continue;
+      }
+
       const cs = await callSettingsDb.getByCompanyId(co.id);
-      for (const ct of callTypes) {
-        const td = new Date(); td.setDate(td.getDate() + ct.days_before);
-        const tds = td.toISOString().split("T")[0];
-        const { rows: srs } = await db.query(
-          `SELECT sr.servicetrade_id AS job_id, loc.phone_number AS location_phone, loc.address::text AS customer_address, comp.name AS customer_name
-           FROM servicetrade_service_requests sr
-           JOIN servicetrade_locations loc ON loc.servicetrade_id = sr.location_id
-           JOIN servicetrade_companies comp ON comp.servicetrade_id = loc.company_id
-           WHERE sr.company_id=$1 AND DATE(sr.window_start AT TIME ZONE $2)=$3::date AND sr.status NOT IN ('cancelled','closed') AND loc.phone_number IS NOT NULL`,
-          [co.id, co.default_timezone || "America/New_York", tds]
-        );
-        for (const sr of srs) {
-          if (await scheduledCallsDb.existsForJob(co.id, String(sr.job_id), ct.type)) { skipped++; continue; }
-          await scheduledCallsDb.create({ companyId: co.id, callType: ct.type, phoneNumber: sr.location_phone, jobId: String(sr.job_id), jobDate: td, customerName: sr.customer_name, customerAddress: sr.customer_address, scheduledAt: snapToWindowStart(cs, co.default_timezone || "America/New_York", td), isTest: false, maxAttempts: cs.max_attempts });
-          created++;
+      const tz = co.default_timezone || "America/New_York";
+      logger.info(`Daily job: company has ${triggers.length} enabled trigger(s)`, {
+        companyId: co.id, tz, triggers: triggers.map(t => t.trigger_type),
+      });
+
+      for (const trigger of triggers) {
+        try {
+          const { c, s } = await processTrigger(co.id, trigger, cs, tz);
+          created += c; skipped += s;
+          logger.info(`Daily job: trigger processed`, {
+            companyId: co.id, trigger: trigger.trigger_type, created: c, skipped: s,
+          });
+        } catch (err) {
+          logger.error("Daily job: trigger error", { companyId: co.id, trigger: trigger.trigger_type, error: err.message });
         }
       }
-    } catch (err) { logger.error("Daily job: company failed", { companyId: co.id, error: err.message }); }
+    } catch (err) {
+      logger.error("Daily job: company error", { companyId: co.id, error: err.message });
+    }
   }
-  logger.info("Daily job complete", { created, skipped });
+
+  logger.info("Daily job: complete", { created, skipped, env });
   return { created, skipped };
+}
+
+// ── Trigger processors ────────────────────────────────────────────────────────
+
+async function scheduleCall(params) {
+  try {
+    await scheduledCallsDb.create(params);
+    logger.info("Scheduler: call queued", {
+      companyId: params.companyId,
+      callType: params.callType,
+      jobId: params.jobId,
+      jobName: params.jobName,
+      customer: params.customerName,
+      technician: params.technicianName,
+      phone: params.phoneNumber,
+      scheduledAt: params.scheduledAt,
+      isTest: params.isTest,
+    });
+    return true;
+  } catch (err) {
+    if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return false;
+    throw err;
+  }
+}
+
+async function processTrigger(companyId, trigger, callSettings, tz) {
+  switch (trigger.trigger_type) {
+    case "scheduled_unconfirmed":  return processScheduledUnconfirmed(companyId, trigger, callSettings, tz);
+    case "quotation_pending":      return processQuotationPending(companyId, trigger, callSettings, tz);
+    case "open_job_due_soon":      return processOpenJobDueSoon(companyId, trigger, callSettings, tz);
+    case "technician_unconfirmed": return processTechnicianUnconfirmed(companyId, trigger, callSettings, tz);
+    default: return { c: 0, s: 0 };
+  }
+}
+
+/**
+ * Dev:  schedule NOW+5min, is_test=true, match any upcoming unconfirmed appointment
+ * Prod: schedule at business-hours window N days from now, is_test=false
+ */
+async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz) {
+  const targetDate = new Date();
+  targetDate.setDate(targetDate.getDate() + trigger.days_before);
+  const targetDateStr = formatDateInTz(targetDate, tz);
+
+  const dateFilter = isDev ? "a.scheduled_start >= NOW()" : "j.scheduled_date = $2::date";
+  const params = isDev ? [companyId] : [companyId, targetDateStr];
+
+  const { rows } = await db.query(
+    `SELECT DISTINCT ON (j.id)
+            j.id AS job_id, j.scheduled_date,
+            j.title AS job_name, j.description AS job_description, j.job_type,
+            c.phone AS customer_phone, c.full_name AS customer_name,
+            c.address_line1, c.city, c.state
+     FROM jobs j
+     JOIN appointments a ON a.job_id = j.id AND a.status = 'scheduled'
+     JOIN customers c ON c.id = j.customer_id
+     WHERE j.company_id = $1
+       AND j.status = 'scheduled'
+       AND (a.customer_confirmed IS NULL OR a.customer_confirmed = false)
+       AND ${dateFilter}
+       AND c.phone IS NOT NULL
+     ORDER BY j.id, a.scheduled_start ASC`,
+    params
+  );
+
+  logger.info(`Scheduler [scheduled_unconfirmed]: found ${rows.length} unconfirmed appointment(s)`, { companyId, targetDate: targetDateStr });
+
+  let c = 0, s = 0;
+  for (const row of rows) {
+    const jobId = String(row.job_id);
+    if (await scheduledCallsDb.existsForCustomerJob(companyId, jobId, trigger.call_type, isDev)) {
+      logger.info("Scheduler [scheduled_unconfirmed]: skipped — call already exists", {
+        companyId, jobId, jobName: row.job_name, customer: row.customer_name,
+        reason: "Active or completed scheduled call already exists for this job",
+      });
+      s++; continue;
+    }
+
+    const scheduledAt = isDev
+      ? new Date()
+      : snapToWindowStart(callSettings, tz, targetDate);
+
+    const inserted = await scheduleCall({
+      companyId, callType: trigger.call_type,
+      phoneNumber: row.customer_phone,
+      jobId, jobDate: targetDate,
+      appointmentId: row.appointment_id || null,
+      customerName: row.customer_name,
+      customerAddress: [row.address_line1, row.city, row.state].filter(Boolean).join(", ") || null,
+      jobName: row.job_name || null,
+      jobDescription: row.job_description || null,
+      jobType: row.job_type || null,
+      scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
+    });
+    if (inserted) c++; else {
+      logger.info("Scheduler [scheduled_unconfirmed]: skipped — duplicate on insert", { companyId, jobId });
+      s++;
+    }
+  }
+  return { c, s };
+}
+
+async function processQuotationPending(companyId, trigger, callSettings, tz) {
+  const cfg = trigger.trigger_config;
+  const quoteStatuses = cfg.quote_statuses ?? ["sent", "viewed"];
+  const daysAfterSent = cfg.days_after_sent ?? 3;
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - daysAfterSent);
+
+  const { rows } = await db.query(
+    `SELECT q.id AS quotation_id, q.job_id, q.title AS quote_title, q.notes AS quote_description,
+            q.total_amount, q.currency,
+            c.phone AS customer_phone, c.full_name AS customer_name
+     FROM quotations q
+     JOIN customers c ON c.id = q.customer_id
+     WHERE q.company_id = $1
+       AND q.status = ANY($2::varchar[])
+       AND q.created_at <= $3
+       AND c.phone IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM jobs j
+         WHERE j.id = q.job_id AND j.status = 'completed'
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM appointments a
+         JOIN jobs j ON j.id = a.job_id
+         WHERE j.id = q.job_id AND a.status = 'completed'
+       )`,
+    [companyId, quoteStatuses, cutoff.toISOString()]
+  );
+
+  logger.info(`Scheduler [quotation_pending]: found ${rows.length} eligible quotation(s) (excludes completed jobs/appointments)`, { companyId, cutoff: cutoff.toISOString() });
+
+  let c = 0, s = 0;
+  for (const row of rows) {
+    const jobId = scheduledCallsDb.quotationJobId(row.quotation_id);
+    if (await scheduledCallsDb.existsForQuotation(companyId, row.quotation_id, row.job_id, trigger.call_type, isDev)) {
+      logger.info("Scheduler [quotation_pending]: skipped — call already exists", {
+        companyId, quotationId: row.quotation_id, jobName: row.quote_title, customer: row.customer_name,
+        reason: "Active or completed scheduled call already exists for this quotation",
+      });
+      s++; continue;
+    }
+
+    const scheduledAt = isDev
+      ? new Date()
+      : getNextWindowStart(callSettings, tz);
+
+    const inserted = await scheduleCall({
+      companyId, callType: trigger.call_type,
+      phoneNumber: row.customer_phone,
+      jobId, jobDate: null,
+      customerName: row.customer_name,
+      jobName: row.quote_title || null,
+      jobDescription: row.quote_description || null,
+      totalAmount: row.total_amount ?? null,
+      scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
+    });
+    if (inserted) c++; else {
+      logger.info("Scheduler [quotation_pending]: skipped — duplicate on insert", { companyId, quotationId: row.quotation_id });
+      s++;
+    }
+  }
+  return { c, s };
+}
+
+async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
+  const targetDate = new Date();
+  targetDate.setDate(targetDate.getDate() + trigger.days_before);
+  const targetDateStr = formatDateInTz(targetDate, tz);
+  const cfg = trigger.trigger_config;
+
+  const dateClause = isDev ? "j.scheduled_date >= CURRENT_DATE" : "j.scheduled_date = $2::date";
+
+  let query = `
+    SELECT j.id AS job_id, j.scheduled_date,
+           j.title AS job_name, j.description AS job_description, j.job_type,
+           c.phone AS customer_phone, c.full_name AS customer_name,
+           c.address_line1, c.city, c.state
+    FROM jobs j
+    JOIN customers c ON c.id = j.customer_id
+    WHERE j.company_id = $1
+      AND j.status = 'open'
+      AND ${dateClause}
+      AND c.phone IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM appointments ap
+        WHERE ap.job_id = j.id AND ap.status NOT IN ('cancelled')
+      )`;
+
+  if (cfg.only_if_technician_assigned) query += " AND j.technician_id IS NOT NULL";
+
+  const { rows } = await db.query(query, isDev ? [companyId] : [companyId, targetDateStr]);
+
+  logger.info(`Scheduler [open_job_due_soon]: found ${rows.length} open job(s) due soon`, { companyId, targetDate: targetDateStr });
+
+  let c = 0, s = 0;
+  for (const row of rows) {
+    const jobId = String(row.job_id);
+    if (await scheduledCallsDb.existsForCustomerJob(companyId, jobId, trigger.call_type, isDev)) {
+      logger.info("Scheduler [open_job_due_soon]: skipped — call already exists", {
+        companyId, jobId, jobName: row.job_name, customer: row.customer_name,
+        reason: "Active or completed scheduled call already exists for this job",
+      });
+      s++; continue;
+    }
+
+    const scheduledAt = isDev
+      ? new Date()
+      : snapToWindowStart(callSettings, tz, targetDate);
+
+    const inserted = await scheduleCall({
+      companyId, callType: trigger.call_type,
+      phoneNumber: row.customer_phone,
+      jobId, jobDate: targetDate,
+      customerName: row.customer_name,
+      customerAddress: [row.address_line1, row.city, row.state].filter(Boolean).join(", ") || null,
+      jobName: row.job_name || null,
+      jobDescription: row.job_description || null,
+      jobType: row.job_type || null,
+      scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
+    });
+    if (inserted) c++; else {
+      logger.info("Scheduler [open_job_due_soon]: skipped — duplicate on insert", { companyId, jobId });
+      s++;
+    }
+  }
+  return { c, s };
+}
+
+async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz) {
+  const targetDate = new Date();
+  targetDate.setDate(targetDate.getDate() + trigger.days_before);
+  const targetDateStr = formatDateInTz(targetDate, tz);
+
+  const dateFilter = isDev ? "a.scheduled_start >= NOW()" : `DATE(a.scheduled_start AT TIME ZONE $2) = $3::date`;
+  const techParams = isDev ? [companyId] : [companyId, tz, targetDateStr];
+
+  const { rows } = await db.query(
+    `SELECT a.id AS appointment_id, j.id AS job_id, j.scheduled_date,
+            j.title AS job_name, j.description AS job_description, j.job_type,
+            t.phone AS technician_phone, t.first_name || ' ' || t.last_name AS technician_name,
+            c.full_name AS customer_name,
+            c.address_line1, c.city, c.state
+     FROM appointments a
+     JOIN jobs j        ON j.id = a.job_id
+     JOIN technicians t ON t.id = a.technician_id
+     JOIN customers c   ON c.id = j.customer_id
+     WHERE j.company_id = $1
+       AND a.status = 'scheduled'
+       AND a.technician_id IS NOT NULL
+       AND (a.technician_confirmed IS NULL OR a.technician_confirmed = false)
+       AND ${dateFilter}
+       AND t.phone IS NOT NULL
+       AND t.is_active = true`,
+    techParams
+  );
+
+  logger.info(`Scheduler [technician_unconfirmed]: found ${rows.length} unconfirmed technician appointment(s)`, { companyId, targetDate: targetDateStr });
+
+  let c = 0, s = 0;
+  for (const row of rows) {
+    const jobId = String(row.job_id);
+    if (await scheduledCallsDb.existsForJob(companyId, jobId, trigger.call_type, isDev)) {
+      logger.info("Scheduler [technician_unconfirmed]: skipped — call already exists", {
+        companyId, jobId, jobName: row.job_name, technician: row.technician_name,
+        reason: "Active or completed scheduled call already exists for this job",
+      });
+      s++; continue;
+    }
+
+    const scheduledAt = isDev
+      ? new Date()
+      : snapToWindowStart(callSettings, tz, targetDate);
+
+    const inserted = await scheduleCall({
+      companyId, callType: trigger.call_type,
+      phoneNumber: row.technician_phone,
+      jobId, jobDate: targetDate,
+      appointmentId: row.appointment_id || null,
+      technicianName: row.technician_name,
+      customerName:   row.customer_name,
+      customerAddress: [row.address_line1, row.city, row.state].filter(Boolean).join(", ") || null,
+      jobName: row.job_name || null,
+      jobDescription: row.job_description || null,
+      jobType: row.job_type || null,
+      scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
+    });
+    if (inserted) c++; else {
+      logger.info("Scheduler [technician_unconfirmed]: skipped — duplicate on insert", { companyId, jobId });
+      s++;
+    }
+  }
+  return { c, s };
 }
 
 module.exports = { runDispatcher, runDailyJob, isWithinActiveHours, getNextWindowStart };

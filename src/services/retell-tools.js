@@ -1,0 +1,162 @@
+/**
+ * Retell custom tool registration.
+ *
+ * Tool definitions are stored in the `tool_definitions` DB table (single source
+ * of truth). This service reads them, builds Retell-compatible objects, and
+ * pushes them to each company's conversation flow nodes.
+ *
+ * - is_write_tool = false  → always registered (read-only: get_job, get_quotation…)
+ * - is_write_tool = true   → only registered when agent_can_make_changes = true
+ */
+const retell = require("./retell");
+const db = require("../db");
+const callSettingsDb = require("../db/call-settings");
+const toolDefsDb = require("../db/tool-definitions");
+const logger = require("../utils/logger");
+
+function getBaseUrl() {
+  const webhookUrl = process.env.RETELL_WEBHOOK_URL || "";
+  return webhookUrl.replace(/\/retell\/webhook\/?$/, "").replace(/\/$/, "");
+}
+
+/**
+ * Convert a DB tool_definitions row into a Retell-compatible custom tool object.
+ * Injects company_id as a query param so the webhook knows the tenant.
+ */
+function dbRowToRetellTool(row, baseUrl, companyId) {
+  const secret = process.env.RETELL_TOOL_SECRET || "";
+  const headers = secret ? { x_tool_secret: secret } : {};
+  const suffix = companyId ? `?company_id=${companyId}` : "";
+
+  const tool = {
+    type: "custom",
+    name: row.name,
+    description: row.description,
+    url: `${baseUrl}${row.endpoint}${suffix}`,
+    method: row.method || "POST",
+    speak_during_execution: row.speak_during_execution,
+    speak_after_execution: row.speak_after_execution,
+    headers,
+  };
+
+  if (row.execution_message_description) {
+    tool.execution_message_description = row.execution_message_description;
+  }
+  if (row.parameters) {
+    tool.parameters = typeof row.parameters === "string"
+      ? JSON.parse(row.parameters)
+      : row.parameters;
+  }
+
+  return tool;
+}
+
+/**
+ * Push tools from tool_definitions DB → each subagent node in the company's
+ * conversation flow. Respects agent_can_make_changes: when false, write tools
+ * are omitted and the node prompt is annotated with a read-only notice.
+ */
+async function registerToolsForCompany(companyId) {
+  const baseUrl = getBaseUrl();
+  if (!baseUrl) {
+    logger.warn("registerToolsForCompany: RETELL_WEBHOOK_URL not set — skipping");
+    return;
+  }
+
+  // Fetch agent_can_make_changes for this company
+  const settings = await callSettingsDb.getByCompanyId(companyId);
+  const canMakeChanges = settings.agent_can_make_changes !== false;
+
+  // Fetch subagent node IDs per call type
+  const { rows: callTypeRows } = await db.query(
+    `SELECT type, retell_llm_id, retell_subagent_node_id
+     FROM call_type_configs
+     WHERE company_id = $1
+       AND retell_llm_id IS NOT NULL
+       AND retell_subagent_node_id IS NOT NULL`,
+    [companyId]
+  );
+
+  if (callTypeRows.length === 0) {
+    logger.warn("registerToolsForCompany: no provisioned subagent nodes found", { companyId });
+    return;
+  }
+
+  // Load all enabled tools from DB, filtered by write permission
+  const allToolRows = await toolDefsDb.getAll({ writeToolsEnabled: canMakeChanges });
+
+  // Group by call_type for fast lookup
+  const toolsByCallType = {};
+  for (const t of allToolRows) {
+    if (!toolsByCallType[t.call_type]) toolsByCallType[t.call_type] = [];
+    toolsByCallType[t.call_type].push(dbRowToRetellTool(t, baseUrl, companyId));
+  }
+
+  const flowId = callTypeRows[0].retell_llm_id;
+  const client = retell.getClient();
+  const flow = await client.conversationFlow.retrieve(flowId);
+  const nodes = flow.nodes ?? [];
+
+  const changeNote = canMakeChanges
+    ? ""
+    : "\n\n[IMPORTANT: You are in read-only mode. Do NOT confirm, reschedule, or create appointments. " +
+      "Collect the customer's intent and preferences, let them know a team member will follow up, then end the call politely.]";
+
+  let updated = 0;
+  for (const row of callTypeRows) {
+    const tools = toolsByCallType[row.type];
+    if (!tools || tools.length === 0) continue;
+
+    const nodeIdx = nodes.findIndex(n => n.id === row.retell_subagent_node_id);
+    if (nodeIdx === -1) {
+      logger.warn("registerToolsForCompany: node not found", { nodeId: row.retell_subagent_node_id });
+      continue;
+    }
+
+    const currentText = nodes[nodeIdx].instruction?.text || "";
+    const cleanedText = currentText.replace(/\n\n\[IMPORTANT: You are in read-only mode[\s\S]*?\]/, "");
+    const newText = cleanedText + changeNote;
+
+    nodes[nodeIdx] = {
+      ...nodes[nodeIdx],
+      tools,
+      instruction: { ...nodes[nodeIdx].instruction, text: newText },
+    };
+    updated++;
+    logger.info("registerToolsForCompany: node patched", {
+      type: row.type,
+      nodeId: row.retell_subagent_node_id,
+      toolCount: tools.length,
+      canMakeChanges,
+    });
+  }
+
+  if (updated > 0) {
+    await client.conversationFlow.update(flowId, { nodes });
+    logger.info("registerToolsForCompany: flow updated", { companyId, flowId, nodesPatched: updated });
+  }
+
+  return { updated };
+}
+
+/**
+ * Register tools for ALL active companies.
+ */
+async function registerToolsForAllCompanies() {
+  const { rows } = await db.query(
+    `SELECT id FROM companies WHERE is_active = true OR is_active IS NULL`
+  );
+  let total = 0;
+  for (const co of rows) {
+    try {
+      const r = await registerToolsForCompany(co.id);
+      total += r?.updated ?? 0;
+    } catch (err) {
+      logger.error("registerToolsForAllCompanies: company failed", { companyId: co.id, error: err.message });
+    }
+  }
+  logger.info("registerToolsForAllCompanies: done", { total });
+  return { total };
+}
+
+module.exports = { registerToolsForCompany, registerToolsForAllCompanies, getBaseUrl };

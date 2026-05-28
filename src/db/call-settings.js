@@ -1,25 +1,46 @@
 const db = require("./index");
 
+const DEFAULT_VOICEMAIL_MESSAGE =
+  "Hi, this is {{representative_name}} calling from {{company_name}}. " +
+  "We were reaching out to confirm your upcoming appointment. " +
+  "Please call us back at your earliest convenience. Thank you!";
+
 const DEFAULTS = {
-  business_hours_start: "09:00",
-  business_hours_end:   "17:00",
-  max_attempts:         3,
-  voicemail_behavior:   "leave",
-  include_weekends:     false,
+  business_hours_start:    "09:00",
+  business_hours_end:      "17:00",
+  max_attempts:            3,
+  voicemail_behavior:      "leave",
+  include_weekends:        false,
+  alert_days_before:       2,
+  voicemail_message:       DEFAULT_VOICEMAIL_MESSAGE,
+  agent_can_make_changes:  true,
 };
+
+function rowToSettings(row) {
+  return {
+    ...row,
+    voicemail_message:      row.voicemail_message ?? DEFAULT_VOICEMAIL_MESSAGE,
+    agent_can_make_changes: row.agent_can_make_changes ?? true,
+  };
+}
 
 async function getByCompanyId(companyId) {
   const result = await db.query(
     `SELECT business_hours_start, business_hours_end, max_attempts,
-            voicemail_behavior, include_weekends
+            voicemail_behavior, include_weekends, alert_days_before,
+            voicemail_message, agent_can_make_changes
      FROM call_settings WHERE company_id = $1`,
     [companyId]
   );
-  return result.rows[0] ?? { ...DEFAULTS };
+  return result.rows[0] ? rowToSettings(result.rows[0]) : { ...DEFAULTS };
 }
 
 async function upsert(companyId, fields) {
-  const allowed = ["business_hours_start", "business_hours_end", "max_attempts", "voicemail_behavior", "include_weekends"];
+  const allowed = [
+    "business_hours_start", "business_hours_end", "max_attempts",
+    "voicemail_behavior", "include_weekends", "alert_days_before",
+    "voicemail_message", "agent_can_make_changes",
+  ];
   const keys = Object.keys(fields).filter((k) => allowed.includes(k));
   if (keys.length === 0) return getByCompanyId(companyId);
   const setClauses = keys.map((k, i) => `${k} = $${i + 2}`).join(", ");
@@ -28,10 +49,12 @@ async function upsert(companyId, fields) {
     `INSERT INTO call_settings (company_id, ${keys.join(", ")})
      VALUES ($1, ${keys.map((_, i) => `$${i + 2}`).join(", ")})
      ON CONFLICT (company_id) DO UPDATE SET ${setClauses}, updated_at = NOW()
-     RETURNING business_hours_start, business_hours_end, max_attempts, voicemail_behavior, include_weekends`,
+     RETURNING business_hours_start, business_hours_end, max_attempts,
+               voicemail_behavior, include_weekends, alert_days_before,
+               voicemail_message, agent_can_make_changes`,
     values
   );
-  return result.rows[0];
+  return rowToSettings(result.rows[0]);
 }
 
 module.exports = { getByCompanyId, upsert, DEFAULTS };

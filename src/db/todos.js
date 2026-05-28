@@ -1,4 +1,5 @@
 const db = require("./index");
+const callAnalysisConfigsDb = require("./call-analysis-configs");
 
 const TODO_TYPES = {
   NOT_PICKED: "NOT_PICKED",
@@ -6,39 +7,49 @@ const TODO_TYPES = {
   ASKED_FOR_RESCHEDULE: "ASKED_FOR_RESCHEDULE",
   ASKED_FOR_CANCELLATION: "ASKED_FOR_CANCELLATION",
   UNCONFIRMED: "UNCONFIRMED",
-};
-
-const PRIORITY_BY_TYPE = {
-  NOT_PICKED: "medium",
-  VOICEMAIL: "medium",
-  ASKED_FOR_RESCHEDULE: "high",
-  ASKED_FOR_CANCELLATION: "high",
-  UNCONFIRMED: "medium",
+  APPOINTMENT_NEEDED: "APPOINTMENT_NEEDED",
 };
 
 /**
  * Derive todo type(s) from post-call analysis outcome.
  * Returns an array — a single call can produce at most one todo.
  */
-function deriveTodoType({ inVoicemail, disconnectionReason, appointmentConfirmed, rescheduleRequested, cancellationRequested }) {
+function deriveTodoType({ inVoicemail, disconnectionReason, appointmentConfirmed, rescheduleRequested, cancellationRequested, customerOutcome }) {
   if (inVoicemail || disconnectionReason === "voicemail_reached") return TODO_TYPES.VOICEMAIL;
 
   const NO_ANSWER = new Set(["dial_no_answer", "dial_busy", "dial_failed", "user_declined", "invalid_destination", "error_no_audio_received"]);
   if (NO_ANSWER.has(disconnectionReason)) return TODO_TYPES.NOT_PICKED;
 
   if (cancellationRequested) return TODO_TYPES.ASKED_FOR_CANCELLATION;
-  if (rescheduleRequested) return TODO_TYPES.ASKED_FOR_RESCHEDULE;
+  if (rescheduleRequested)   return TODO_TYPES.ASKED_FOR_RESCHEDULE;
+
+  // Agent indicated no appointment exists and customer had no time preference
+  if (customerOutcome === "appointment_needed") return TODO_TYPES.APPOINTMENT_NEEDED;
+
   if (appointmentConfirmed === "yes") return null; // happy path — no todo needed
   return TODO_TYPES.UNCONFIRMED;
 }
 
-async function create({ companyId, callId, type, metadata }) {
-  const priority = PRIORITY_BY_TYPE[type] || "medium";
+/**
+ * Create a todo after a call ends.
+ * Looks up the company's call_analysis_configs to get the configured priority
+ * and to check whether this todo type is enabled at all.
+ * Returns null (and creates nothing) if the company has disabled this todo type.
+ */
+async function create({ companyId, callId, type, metadata, isTest = false }) {
+  // Look up company-configured priority + enabled flag
+  const priorityMap = await callAnalysisConfigsDb.getPriorityMap(companyId);
+  const cfg = priorityMap[type];
+  const priority = cfg?.priority ?? "medium";
+  const enabled  = cfg?.enabled ?? true;
+
+  if (!enabled) return null; // company opted out of this todo type
+
   const result = await db.query(
-    `INSERT INTO todos (company_id, call_id, type, priority, metadata)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO todos (company_id, call_id, type, priority, is_test, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING *`,
-    [companyId, callId, type, priority, metadata ? JSON.stringify(metadata) : null]
+    [companyId, callId, type, priority, isTest, metadata ? JSON.stringify(metadata) : null]
   );
   const todo = result.rows[0];
 
@@ -51,10 +62,10 @@ async function create({ companyId, callId, type, metadata }) {
   return todo;
 }
 
-async function list(companyId, { status, type, assignedTo, limit = 50, offset = 0 } = {}) {
-  const conditions = ["t.company_id = $1"];
-  const values = [companyId];
-  let i = 2;
+async function list(companyId, { status, type, assignedTo, limit = 50, offset = 0, isTest = false } = {}) {
+  const conditions = ["t.company_id = $1", "t.is_test = $2"];
+  const values = [companyId, isTest];
+  let i = 3;
 
   if (status) { conditions.push(`t.status = $${i++}`); values.push(status); }
   if (type) { conditions.push(`t.type = $${i++}`); values.push(type); }
@@ -82,8 +93,8 @@ async function list(companyId, { status, type, assignedTo, limit = 50, offset = 
 
 async function updateStatus(todoId, companyId, { status, notes, actorId }) {
   const result = await db.query(
-    `UPDATE todos SET status = $1, notes = COALESCE($2, notes),
-       resolved_at = CASE WHEN $1 IN ('resolved','dismissed') THEN NOW() ELSE resolved_at END,
+    `UPDATE todos SET status = $1::varchar, notes = COALESCE($2, notes),
+       resolved_at = CASE WHEN $1::varchar IN ('resolved','dismissed') THEN NOW() ELSE resolved_at END,
        updated_at = NOW()
      WHERE id = $3 AND company_id = $4
      RETURNING *`,
