@@ -12,7 +12,8 @@ function verifyCronSecret(req, res) {
   return true;
 }
 
-router.post("/run", async (req, res) => {
+// Accept both GET and POST — Vercel cron always sends GET, manual triggers use POST
+router.all("/run", async (req, res) => {
   if (!verifyCronSecret(req, res)) return;
   try {
     const result = await runDispatcher();
@@ -24,7 +25,8 @@ router.post("/run", async (req, res) => {
   }
 });
 
-router.post("/daily", async (req, res) => {
+// Accept both GET and POST — Vercel cron always sends GET, manual triggers use POST
+router.all("/daily", async (req, res) => {
   if (!verifyCronSecret(req, res)) return;
   try {
     const result = await runDailyJob();
