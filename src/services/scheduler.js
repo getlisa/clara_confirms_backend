@@ -282,8 +282,13 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
   targetDate.setDate(targetDate.getDate() + trigger.days_before);
   const targetDateStr = formatDateInTz(targetDate, tz);
 
-  const dateFilter = isDev ? "a.scheduled_start >= NOW()" : "j.scheduled_date = $2::date";
-  const params = isDev ? [companyId] : [companyId, targetDateStr];
+  // Match by the appointment's actual scheduled_start (in the company timezone)
+  // — not the job's planned scheduled_date. The appointment is the real booking
+  // the customer needs to confirm.
+  const dateFilter = isDev
+    ? "a.scheduled_start >= NOW()"
+    : "DATE(a.scheduled_start AT TIME ZONE $2) = $3::date";
+  const params = isDev ? [companyId] : [companyId, tz, targetDateStr];
 
   const { rows } = await db.query(
     `SELECT DISTINCT ON (j.id)
