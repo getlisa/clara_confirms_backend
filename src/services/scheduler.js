@@ -318,7 +318,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
 
     const scheduledAt = isDev
       ? new Date()
-      : snapToWindowStart(callSettings, tz, targetDate);
+      : snapToWindowStart(callSettings, tz, new Date());
 
     const inserted = await scheduleCall({
       companyId, callType: trigger.call_type,
@@ -447,7 +447,7 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
 
     const scheduledAt = isDev
       ? new Date()
-      : snapToWindowStart(callSettings, tz, targetDate);
+      : snapToWindowStart(callSettings, tz, new Date());
 
     const inserted = await scheduleCall({
       companyId, callType: trigger.call_type,
@@ -511,7 +511,7 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
 
     const scheduledAt = isDev
       ? new Date()
-      : snapToWindowStart(callSettings, tz, targetDate);
+      : snapToWindowStart(callSettings, tz, new Date());
 
     const inserted = await scheduleCall({
       companyId, callType: trigger.call_type,
