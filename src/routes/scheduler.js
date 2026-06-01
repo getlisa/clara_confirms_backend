@@ -7,6 +7,7 @@ function verifyCronSecret(req, res) {
   const secret = process.env.CRON_SECRET;
   if (!secret) return true;
   const auth = req.headers.authorization;
+  logger.info("Cron secret", { auth, secret });
   if (!auth || auth !== `Bearer ${secret}`) { res.status(401).json({ error: "Unauthorized" }); return false; }
   return true;
 }
