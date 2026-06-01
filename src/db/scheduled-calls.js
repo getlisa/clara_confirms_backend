@@ -153,6 +153,17 @@ async function claimPending(batchSize = 10) {
 
   if (totalAvailable === 0) return [];
 
+  // Same-person dedup: skip any row whose phone_number is already in_progress.
+  // This prevents two calls being placed to the same person simultaneously —
+  // the second call waits in 'pending' until the first one completes/fails.
+  const busyPhoneFilter = `
+    AND NOT EXISTS (
+      SELECT 1 FROM scheduled_calls busy
+      WHERE busy.status = 'in_progress'
+        AND busy.phone_number = scheduled_calls.phone_number
+    )
+  `;
+
   // Claim priority calls first (retry/callback), then normal — both respect SKIP LOCKED
   const result = await db.query(
     `UPDATE scheduled_calls SET status = 'in_progress', last_attempted_at = NOW(), updated_at = NOW()
@@ -161,6 +172,7 @@ async function claimPending(batchSize = 10) {
        (SELECT id FROM scheduled_calls
         WHERE status = 'pending' AND scheduled_at <= NOW()
           AND call_priority IN ('retry','callback')
+          ${busyPhoneFilter}
         ORDER BY call_priority DESC, scheduled_at ASC  -- callback before retry
         LIMIT $1 FOR UPDATE SKIP LOCKED)
 
@@ -170,6 +182,7 @@ async function claimPending(batchSize = 10) {
        (SELECT id FROM scheduled_calls
         WHERE status = 'pending' AND scheduled_at <= NOW()
           AND call_priority = 'normal'
+          ${busyPhoneFilter}
         ORDER BY scheduled_at ASC
         LIMIT $2 FOR UPDATE SKIP LOCKED)
 
@@ -181,7 +194,36 @@ async function claimPending(batchSize = 10) {
       Math.min(totalAvailable,    batchSize),
     ]
   );
-  return result.rows;
+
+  // Within this batch, also dedup by phone number — keep only the earliest-scheduled
+  // call per phone (priority > normal, then scheduled_at ASC). The rest go back to pending.
+  const claimed = result.rows;
+  const seen = new Set();
+  const winners = [];
+  const losers  = [];
+  // Sort so winners come first: priority first, then earliest scheduled
+  const priorityRank = { callback: 0, retry: 1, normal: 2 };
+  const sorted = [...claimed].sort((a, b) => {
+    const pa = priorityRank[a.call_priority] ?? 2;
+    const pb = priorityRank[b.call_priority] ?? 2;
+    if (pa !== pb) return pa - pb;
+    return new Date(a.scheduled_at) - new Date(b.scheduled_at);
+  });
+  for (const row of sorted) {
+    if (seen.has(row.phone_number)) { losers.push(row); continue; }
+    seen.add(row.phone_number);
+    winners.push(row);
+  }
+
+  if (losers.length > 0) {
+    await db.query(
+      `UPDATE scheduled_calls SET status = 'pending', updated_at = NOW()
+       WHERE id = ANY($1::int[])`,
+      [losers.map(r => r.id)]
+    );
+  }
+
+  return winners;
 }
 
 async function markCompleted(id, retellCallId) {

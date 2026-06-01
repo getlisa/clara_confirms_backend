@@ -19,5 +19,15 @@
   },
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/index" }
+  ],
+  "crons": [
+    {
+      "path": "/scheduler/run",
+      "schedule": "*/2 * * * *"
+    },
+    {
+      "path": "/scheduler/daily",
+      "schedule": "0 8 * * *"
+    }
   ]
 }
