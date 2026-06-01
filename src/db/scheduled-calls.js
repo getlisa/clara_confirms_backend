@@ -164,40 +164,36 @@ async function claimPending(batchSize = 10) {
     )
   `;
 
-  // Claim priority calls first (retry/callback), then normal — both respect SKIP LOCKED
-  const result = await db.query(
-    `UPDATE scheduled_calls SET status = 'in_progress', last_attempted_at = NOW(), updated_at = NOW()
-     WHERE id IN (
-       -- Priority lane: retry + callback calls (5 reserved slots)
-       (SELECT id FROM scheduled_calls
-        WHERE status = 'pending' AND scheduled_at <= NOW()
-          AND call_priority IN ('retry','callback')
-          ${busyPhoneFilter}
-        ORDER BY call_priority DESC, scheduled_at ASC  -- callback before retry
-        LIMIT $1 FOR UPDATE SKIP LOCKED)
+  // Two separate atomic claims — PostgreSQL doesn't allow FOR UPDATE inside UNION.
+  // Priority lane runs first to use its reserved slots; normal lane uses what's left.
+  const claimSql = (extraWhere) => `
+    UPDATE scheduled_calls SET status = 'in_progress', last_attempted_at = NOW(), updated_at = NOW()
+    WHERE id IN (
+      SELECT id FROM scheduled_calls
+      WHERE status = 'pending' AND scheduled_at <= NOW()
+        ${extraWhere}
+        ${busyPhoneFilter}
+      ORDER BY scheduled_at ASC
+      LIMIT $1
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING *
+  `;
 
-       UNION ALL
+  const priorityLimit = Math.min(priorityAvailable, batchSize);
+  const priorityResult = priorityLimit > 0
+    ? await db.query(claimSql("AND call_priority IN ('retry','callback')"), [priorityLimit])
+    : { rows: [] };
 
-       -- Normal lane (limited to non-reserved slots)
-       (SELECT id FROM scheduled_calls
-        WHERE status = 'pending' AND scheduled_at <= NOW()
-          AND call_priority = 'normal'
-          ${busyPhoneFilter}
-        ORDER BY scheduled_at ASC
-        LIMIT $2 FOR UPDATE SKIP LOCKED)
-
-       LIMIT $3
-     ) RETURNING *`,
-    [
-      Math.min(priorityAvailable, batchSize),
-      Math.min(normalAvailable,   batchSize),
-      Math.min(totalAvailable,    batchSize),
-    ]
-  );
+  const remainingBudget = Math.max(0, batchSize - priorityResult.rows.length);
+  const normalLimit = Math.min(normalAvailable, remainingBudget);
+  const normalResult = normalLimit > 0
+    ? await db.query(claimSql("AND call_priority = 'normal'"), [normalLimit])
+    : { rows: [] };
 
   // Within this batch, also dedup by phone number — keep only the earliest-scheduled
   // call per phone (priority > normal, then scheduled_at ASC). The rest go back to pending.
-  const claimed = result.rows;
+  const claimed = [...priorityResult.rows, ...normalResult.rows];
   const seen = new Set();
   const winners = [];
   const losers  = [];
