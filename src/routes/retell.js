@@ -16,15 +16,18 @@ const MAX_NO_ANSWER_RETRIES = 3;
 
 const router = express.Router();
 
-// Raw body capture for webhook signature verification — before express.json()
-// Skip for /tools/* paths which are handled by retellToolsRoutes after body parsers
+// Raw body capture for webhook signature verification.
+// Uses express.raw — works reliably on Vercel/Node serverless (the req.on('data')
+// pattern doesn't always fire because the body may be pre-buffered by the platform).
+// Skip /tools/* paths which are handled separately by retellToolsRoutes with JSON body.
 router.use((req, res, next) => {
   if (req.path.startsWith("/tools")) return next();
-  let data = "";
-  req.on("data", (chunk) => { data += chunk; });
-  req.on("end", () => {
-    req.rawBody = data;
-    try { req.body = JSON.parse(data || "{}"); } catch { req.body = {}; }
+  express.raw({ type: "*/*", limit: "10mb" })(req, res, (err) => {
+    if (err) return next(err);
+    // req.body is a Buffer here
+    const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.from("");
+    req.rawBody = buf.toString("utf8");
+    try { req.body = JSON.parse(req.rawBody || "{}"); } catch { req.body = {}; }
     next();
   });
 });

@@ -18,29 +18,42 @@ function getClient() {
  */
 async function verifyWebhookSignature(rawBody, signature) {
   try {
-    if (!signature) return false;
+    if (!signature) {
+      logger.warn("Webhook: no x-retell-signature header");
+      return false;
+    }
 
     // Try API key first, then webhook secret — Retell dashboard may configure either
     const keysToTry = [
-      config.retell.apiKey,
-      config.retell.webhookSecret,
-    ].filter(Boolean);
+      { name: "apiKey",        value: config.retell.apiKey },
+      { name: "webhookSecret", value: config.retell.webhookSecret },
+    ].filter(k => k.value);
 
-    for (const key of keysToTry) {
+    if (keysToTry.length === 0) {
+      logger.error("Webhook: no signing keys configured — set RETELL_API_KEY and/or RETELL_WEBHOOK_SECRET");
+      return false;
+    }
+
+    const triedNames = [];
+    for (const k of keysToTry) {
+      triedNames.push(k.name);
       try {
-        const valid = await Retell.verify(rawBody, key, signature);
+        const valid = await Retell.verify(rawBody, k.value, signature);
         if (valid) return true;
       } catch {
         // try next key
       }
     }
 
-    // Log signature info to help diagnose mismatches
-    const sigPreview = signature?.slice(0, 30);
-    const bodyLen = rawBody?.length ?? 0;
-    logger.warn("Webhook signature mismatch", { sigPreview, bodyLen });
+    logger.warn("Webhook signature mismatch — all keys tried failed", {
+      sigPreview: signature.slice(0, 30),
+      bodyLen:    rawBody?.length ?? 0,
+      bodyPreview: typeof rawBody === "string" ? rawBody.slice(0, 100) : "(non-string)",
+      triedKeys:  triedNames,
+    });
     return false;
-  } catch {
+  } catch (err) {
+    logger.error("Webhook signature verify threw", { error: err.message });
     return false;
   }
 }
