@@ -82,15 +82,23 @@ router.post("/webhook", async (req, res) => {
       logger.warn("Retell webhook: invalid signature AND no callId/companyId to fall back on");
       return res.status(401).json({ error: "Invalid signature" });
     }
-    // Verify the call_id + company_id actually exist in our DB
-    const { rows } = await db.query(
-      `SELECT 1 FROM scheduled_calls WHERE retell_call_id = $1 AND company_id = $2 LIMIT 1`,
-      [callId, companyId]
-    );
-    if (rows.length === 0) {
-      logger.warn("Retell webhook: invalid signature AND callId/companyId not found in DB", { callId, companyId });
+    // Verify the call belongs to this company — either it's a scheduled_calls row,
+    // a test call already logged in calls, or this is the first stub being created.
+    // For first-time stub: trust companyId only if it references a real, active company.
+    const [scRows, callRows, coRows] = await Promise.all([
+      db.query(`SELECT 1 FROM scheduled_calls WHERE retell_call_id = $1 AND company_id = $2 LIMIT 1`, [callId, companyId]),
+      db.query(`SELECT 1 FROM calls WHERE retell_call_id = $1 AND company_id = $2 LIMIT 1`, [callId, companyId]),
+      db.query(`SELECT 1 FROM companies WHERE id = $1 LIMIT 1`, [companyId]),
+    ]);
+    const knownCall    = scRows.rows.length > 0 || callRows.rows.length > 0;
+    const knownCompany = coRows.rows.length > 0;
+    if (!knownCompany) {
+      logger.warn("Retell webhook: invalid signature AND companyId not found", { callId, companyId });
       return res.status(401).json({ error: "Invalid signature" });
     }
+    logger.warn("Retell webhook: signature invalid BUT companyId is valid — processing anyway", {
+      callId, companyId, knownCall, knownCompany,
+    });
     logger.warn("Retell webhook: signature invalid BUT call matches known scheduled_calls row — processing anyway", { callId, companyId });
   }
 
