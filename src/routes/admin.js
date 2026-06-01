@@ -9,6 +9,8 @@ const express = require("express");
 const toolDefsDb = require("../db/tool-definitions");
 const dynamicVarsDb = require("../db/dynamic-variable-definitions");
 const { registerToolsForAllCompanies } = require("../services/retell-tools");
+const { syncFlowForCompany } = require("../services/retell-flow");
+const db = require("../db");
 const {
   resetDefaultPromptsForAllCompanies,
   syncPromptsForAllCompanies,
@@ -39,6 +41,35 @@ router.post("/sync-tools", async (req, res) => {
     return res.json({ ok: true, ...result });
   } catch (err) {
     logger.error("Admin sync-tools failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/sync-flows — re-provision every company's Retell flow + agent.
+// Use after an env change (e.g. webhook URL) to push the current env's webhook_url
+// to every Retell agent. Idempotent.
+router.post("/sync-flows", async (_req, res) => {
+  if (!verifyCronSecret(_req, res)) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT id, name FROM companies
+       WHERE (is_active = true OR is_active IS NULL)
+         AND retell_agent_id IS NOT NULL`
+    );
+    const results = [];
+    for (const co of rows) {
+      try {
+        const r = await syncFlowForCompany(co.id);
+        results.push({ companyId: co.id, ok: true, agentId: r?.agentId });
+      } catch (err) {
+        logger.error("Admin sync-flows: company failed", { companyId: co.id, error: err.message });
+        results.push({ companyId: co.id, ok: false, error: err.message });
+      }
+    }
+    logger.info("Admin: flows synced", { count: results.length });
+    return res.json({ ok: true, results });
+  } catch (err) {
+    logger.error("Admin sync-flows failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });
