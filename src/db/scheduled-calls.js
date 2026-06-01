@@ -143,6 +143,16 @@ const PRIORITY_RESERVED    = 5;   // slots always available for retry/callback
  * Normal calls can only use slots when in_flight < 15.
  */
 async function claimPending(batchSize = 10) {
+  // Reaper: any in_progress row stuck for >5 minutes is orphaned (crashed dispatcher,
+  // function timeout, etc). Reset to pending so it gets retried on this run.
+  // The 5-minute threshold is safely longer than any normal Retell call setup (~few seconds).
+  await db.query(
+    `UPDATE scheduled_calls
+     SET status = 'pending', updated_at = NOW()
+     WHERE status = 'in_progress'
+       AND last_attempted_at < NOW() - INTERVAL '5 minutes'`
+  );
+
   const { rows: [{ in_flight }] } = await db.query(
     `SELECT COUNT(*)::int AS in_flight FROM scheduled_calls WHERE status = 'in_progress'`
   );

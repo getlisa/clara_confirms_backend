@@ -64,6 +64,15 @@ function generateDefaultPrompts(type, name, description) {
         "- Appointment ID: {{appointment_id}}\n" +
         "- Customer address: {{customer_address}}\n\n" +
         "━━━ YOUR MAIN WORKFLOW ━━━\n\n" +
+        "STEP 0 — Handle 'not a good time' first.\n" +
+        "If the customer responds to the opening with something like \"I'm busy\", \"not now\", \"can you call me back\", \"call me in X minutes\", \"call me at [time]\":\n" +
+        "  → Ask if they want a specific time: \"No problem — when would be a better time to call you back?\"\n" +
+        "  → Once they give a time (\"in 20 minutes\", \"at 3 PM\", \"in an hour\"), say:\n" +
+        "       \"Got it — I'll call you back then. Talk to you soon!\"\n" +
+        "  → End the call politely. Do NOT proceed to STEP 1.\n" +
+        "  → The system will automatically schedule a callback at the time they mentioned.\n" +
+        "  → If they decline to give a specific time but want a callback later, treat as 'call back later' — say\n" +
+        "    \"Our team will reach out again at a better time\" and end the call.\n\n" +
         "STEP 1 — Call the get_job tool with job_id={{job_id}} to check the current appointment status.\n\n" +
         "STEP 2 — Based on the result:\n\n" +
         "── CASE A: Job has an active appointment (has_active_appointment = true) ──────────\n" +
