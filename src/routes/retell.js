@@ -2,9 +2,17 @@ const express = require("express");
 const { verifyWebhookSignature } = require("../services/retell");
 const callsDb = require("../db/calls");
 const callLogsDb = require("../db/call-logs");
+const callSettingsDb = require("../db/call-settings");
 const todosDb = require("../db/todos");
+const scheduledCallsDb = require("../db/scheduled-calls");
 const db = require("../db");
+const { getNextWindowStart } = require("../services/scheduler");
 const logger = require("../utils/logger");
+
+const isDev = process.env.NODE_ENV === "development";
+
+// Max 3 no-answer retries per job (not counting the initial call)
+const MAX_NO_ANSWER_RETRIES = 3;
 
 const router = express.Router();
 
@@ -226,6 +234,148 @@ async function handleCallAnalyzed(callData) {
     costCents: call_cost?.combined_cost ?? null,
     ...outcome,
   });
+
+  // ── Retry / Callback scheduling (production only) ─────────────────────────
+  // In dev, is_test=true calls skip this — no retry spam during testing.
+  if (!isDev && !isTest) {
+    await handleRetryOrCallback({
+      companyId,
+      retellCallId: call_id,
+      inVoicemail,
+      isNoAnswer,
+      customerOutcome: custom.customer_outcome ?? null,
+      callbackTime:    custom.callback_time ?? null,
+    }).catch(err => logger.error("retry/callback scheduling failed", { error: err.message, callId: call_id }));
+  }
+}
+
+/**
+ * After a call ends, decide whether to schedule a retry or callback:
+ *
+ * RETRY  — customer didn't pick up (no-answer / voicemail):
+ *   Schedule the same call for next business-hours window, up to MAX_NO_ANSWER_RETRIES times,
+ *   as long as the next attempt would be before the job's due date.
+ *
+ * CALLBACK — customer picked up and requested a specific time:
+ *   Schedule at the requested time. If the parsed time is in the past, skip.
+ *   Must still be before the job's due date.
+ */
+async function handleRetryOrCallback({ companyId, retellCallId, inVoicemail, isNoAnswer, customerOutcome, callbackTime }) {
+  // Find the scheduled_call row that triggered this Retell call
+  const { rows: scRows } = await db.query(
+    `SELECT sc.*, j.scheduled_date AS job_due_date
+     FROM scheduled_calls sc
+     LEFT JOIN jobs j ON j.id::text = sc.job_id AND j.company_id = sc.company_id
+     WHERE sc.retell_call_id = $1 LIMIT 1`,
+    [retellCallId]
+  );
+  if (scRows.length === 0) {
+    logger.warn("retry/callback: no scheduled_call found for retell call", { retellCallId });
+    return;
+  }
+  const sc = scRows[0];
+
+  // Fetch company timezone + call settings for next-window calculation
+  const { rows: coRows } = await db.query(
+    `SELECT default_timezone FROM companies WHERE id = $1`, [companyId]
+  );
+  const tz = coRows[0]?.default_timezone || "America/New_York";
+  const cs = await callSettingsDb.getByCompanyId(companyId);
+
+  // ── CALLBACK: customer asked to be called at a specific time ──────────────
+  if (customerOutcome === "callback_requested" && callbackTime) {
+    const callbackAt = parseCallbackTime(callbackTime, tz);
+    if (callbackAt && callbackAt > new Date()) {
+      const created = await scheduledCallsDb.scheduleCallback(sc, callbackAt.toISOString(), sc.job_due_date);
+      if (created) {
+        logger.info("Callback scheduled", { companyId, parentId: sc.id, callbackAt, jobId: sc.job_id });
+      } else {
+        logger.info("Callback not scheduled (past due date or duplicate)", { companyId, parentId: sc.id });
+      }
+    } else {
+      logger.warn("Callback time could not be parsed or is in the past", { callbackTime, companyId });
+    }
+    return;
+  }
+
+  // ── RETRY: no-answer or voicemail ─────────────────────────────────────────
+  if (inVoicemail || isNoAnswer) {
+    const nextWindow = getNextWindowStart(cs, tz); // next business-hours slot
+    const created = await scheduledCallsDb.scheduleRetry(sc, nextWindow.toISOString(), sc.job_due_date, MAX_NO_ANSWER_RETRIES);
+    if (created) {
+      logger.info("Retry scheduled", {
+        companyId, parentId: sc.id, retryCount: sc.retry_count + 1,
+        nextWindow, jobId: sc.job_id,
+      });
+    } else {
+      const reason = sc.retry_count >= MAX_NO_ANSWER_RETRIES
+        ? `max retries reached (${MAX_NO_ANSWER_RETRIES})`
+        : "next window is past job due date";
+      logger.info("Retry not scheduled", { companyId, parentId: sc.id, reason });
+    }
+  }
+}
+
+/**
+ * Parse a natural-language callback time from the customer into a Date.
+ * Handles:
+ *   - "1pm" / "2:30 PM" / "14:00"          → today at that time in company tz
+ *   - "in 30 minutes" / "in an hour"         → now + duration
+ *   - ISO strings (passed directly by agent) → parsed as-is
+ *
+ * Returns null if the string cannot be interpreted.
+ */
+function parseCallbackTime(callbackTime, tz) {
+  if (!callbackTime) return null;
+  const s = String(callbackTime).trim().toLowerCase();
+
+  // ISO format from agent (most reliable)
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)) {
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  const now = new Date();
+
+  // "in X minutes / hours"
+  const relMatch = s.match(/in\s+(\d+|an?)\s+(minute|hour)/i);
+  if (relMatch) {
+    const qty = relMatch[1] === "a" || relMatch[1] === "an" ? 1 : parseInt(relMatch[1], 10);
+    const unit = relMatch[2].startsWith("hour") ? 60 : 1;
+    return new Date(now.getTime() + qty * unit * 60 * 1000);
+  }
+
+  // "1pm", "2:30 PM", "14:00" — today in company timezone
+  const timeMatch = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (timeMatch) {
+    let hour = parseInt(timeMatch[1], 10);
+    const min = parseInt(timeMatch[2] ?? "0", 10);
+    const meridiem = (timeMatch[3] || "").toLowerCase();
+    if (meridiem === "pm" && hour < 12) hour += 12;
+    if (meridiem === "am" && hour === 12) hour = 0;
+
+    // Build local datetime string in company timezone
+    const todayLocal = new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(now);
+    const localDt = `${todayLocal}T${String(hour).padStart(2,"0")}:${String(min).padStart(2,"0")}:00`;
+
+    // Convert local → UTC using the scheduler helper pattern
+    const naive = new Date(localDt + "Z");
+    const fmt = new Intl.DateTimeFormat("sv-SE", {
+      timeZone: tz,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+    let u = naive;
+    for (let i = 0; i < 3; i++) {
+      const localOfU = new Date(fmt.format(u) + "Z");
+      const diff = naive.getTime() - localOfU.getTime();
+      if (Math.abs(diff) < 1000) break;
+      u = new Date(u.getTime() + diff);
+    }
+    return u;
+  }
+
+  return null;
 }
 
 module.exports = router;

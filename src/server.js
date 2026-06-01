@@ -27,6 +27,8 @@ const schedulerRoutes = require("./routes/scheduler");
 const retellToolsRoutes = require("./routes/retell-tools");
 const callAnalysisConfigsRoutes = require("./routes/call-analysis-configs");
 const dashboardRoutes = require("./routes/dashboard");
+const dynamicVariablesRoutes = require("./routes/dynamic-variables");
+const adminRoutes = require("./routes/admin");
 
 const app = express();
 
@@ -94,6 +96,7 @@ app.get("/health", async (req, res) => {
       status: "healthy",
       database: "connected",
       timestamp: new Date().toISOString(),
+      environment: config.nodeEnv,
     });
   } catch (err) {
     logger.error("Health check failed", { error: err.message });
@@ -154,6 +157,12 @@ app.use("/call-analysis-configs", callAnalysisConfigsRoutes);
 
 // Dashboard stats - requires auth
 app.use("/dashboard", dashboardRoutes);
+
+// Dynamic variables catalog - read-only reference, requires auth
+app.use("/dynamic-variables", dynamicVariablesRoutes);
+
+// Admin one-off actions - protected by CRON_SECRET (no JWT auth)
+app.use("/admin", adminRoutes);
 
 // 404 handler
 app.use((req, res) => {

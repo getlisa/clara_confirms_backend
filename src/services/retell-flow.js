@@ -87,27 +87,90 @@ function buildBranchNode(callTypes) {
   };
 }
 
+// Per-call-type extract variable definitions
+const EXTRACT_VARIABLES = {
+  customer_confirmation: [
+    {
+      type: "enum", name: "customer_outcome", required: true,
+      choices: ["confirmed", "rescheduled", "declined", "no_answer", "callback_requested", "appointment_needed"],
+      description: "What the customer decided. Use 'appointment_needed' when no active appointment exists and customer gave no time preference. Use 'callback_requested' when customer asked to be called back at a specific time.",
+    },
+    {
+      type: "string", name: "preferred_reschedule_date", required: false,
+      description: "Date/time the customer wants to reschedule to.",
+      conditional_prompt: "Only extract if customer_outcome is rescheduled",
+    },
+    {
+      type: "string", name: "callback_time", required: false,
+      description: "The specific time the customer requested for a callback, e.g. '1pm', 'in 30 minutes', '2:30 PM'. Only extract if customer asked to be called back at a particular time.",
+      conditional_prompt: "Only extract if customer_outcome is callback_requested",
+    },
+    {
+      type: "string", name: "customer_notes", required: false,
+      description: "Any specific concerns, questions, or notes the customer mentioned.",
+    },
+  ],
+  technician_confirmation: [
+    {
+      type: "enum", name: "technician_outcome", required: true,
+      choices: ["confirmed", "unavailable", "need_to_check", "no_answer"],
+      description: "Whether the technician confirmed availability for the job.",
+    },
+    {
+      type: "string", name: "unavailability_reason", required: false,
+      description: "Reason the technician gave for being unavailable.",
+      conditional_prompt: "Only extract if technician_outcome is unavailable",
+    },
+    {
+      type: "string", name: "technician_notes", required: false,
+      description: "Any concerns or special notes the technician mentioned about the job.",
+    },
+  ],
+  quotation_followup: [
+    {
+      type: "enum", name: "quote_decision", required: true,
+      choices: ["accepted", "rejected", "needs_more_info", "callback_requested", "no_answer"],
+      description: "What the customer decided about the quotation.",
+    },
+    {
+      type: "string", name: "rejection_reason", required: false,
+      description: "Reason the customer gave for rejecting or not accepting the quote.",
+      conditional_prompt: "Only extract if customer rejected or hesitated on the quote",
+    },
+    {
+      type: "string", name: "callback_time", required: false,
+      description: "The specific time the customer requested for a callback.",
+      conditional_prompt: "Only extract if quote_decision is callback_requested",
+    },
+    {
+      type: "string", name: "customer_questions", required: false,
+      description: "Any questions the customer asked about the quote or the work.",
+    },
+  ],
+};
+
+function extractNodeId(type) { return `extract_${type}`; }
+
 function buildSubagentNode(callType) {
   const parts = [];
-
   if (callType.begin_message) {
     parts.push(`[Opening — say this exactly when the call connects]:\n${callType.begin_message}`);
   }
-  if (callType.general_prompt) {
-    parts.push(callType.general_prompt);
-  }
+  if (callType.general_prompt) parts.push(callType.general_prompt);
+
+  const extractId = extractNodeId(callType.type);
+  const hasExtract = !!EXTRACT_VARIABLES[callType.type];
 
   return {
     id: nodeId(callType.type),
     type: "subagent",
     name: callType.name,
-    // Each subagent uses a capable conversational model
     model_choice: { type: "cascading", model: "claude-4.6-sonnet" },
     instruction: { type: "prompt", text: parts.join("\n\n") || `You are a scheduling assistant for {{company_name}}.` },
     edges: [
       {
-        id: `edge_${callType.type}_to_end`,
-        destination_node_id: NODE_END,
+        id: `edge_${callType.type}_to_${hasExtract ? extractId : NODE_END}`,
+        destination_node_id: hasExtract ? extractId : NODE_END,
         transition_condition: {
           type: "prompt",
           prompt: "The agent has said a clear farewell such as 'goodbye', 'have a great day', 'take care', or 'talk to you soon', AND the customer has also said goodbye OR the customer has explicitly hung up. Do NOT transition if the customer has asked a question, requested a reschedule, expressed concerns, or if the conversation is still actively ongoing.",
@@ -117,30 +180,39 @@ function buildSubagentNode(callType) {
   };
 }
 
+function buildExtractNode(callType) {
+  const variables = EXTRACT_VARIABLES[callType.type];
+  if (!variables) return null;
+  return {
+    id: extractNodeId(callType.type),
+    type: "extract_dynamic_variables",
+    name: `Extract ${callType.name} Outcome`,
+    variables,
+    edges: [{
+      id: `edge_extract_${callType.type}_to_end`,
+      destination_node_id: NODE_END,
+      transition_condition: { type: "prompt", prompt: "Always" },
+    }],
+  };
+}
+
 function buildEndNode() {
   return { id: NODE_END, type: "end", name: "End Call" };
 }
 
 function buildFlowNodes(callTypes) {
+  const extractNodes = callTypes.map(buildExtractNode).filter(Boolean);
   return [
     buildBranchNode(callTypes),
     ...callTypes.map(buildSubagentNode),
+    ...extractNodes,
     buildEndNode(),
   ];
 }
 
-const DEFAULT_DYNAMIC_VARIABLES = {
-  call_type:           "",
-  customer_name:       "",
-  technician_name:     "",
-  job_date:            "",
-  job_id:              "",
-  company_name:        "",
-  representative_name: "",
-  customer_address:    "",
-  current_date:        "",
-  current_time:        "",
-};
+// Dynamic variable catalog is now loaded from the `dynamic_variable_definitions` DB table.
+// See src/db/dynamic-variable-definitions.js — buildDefaultsForCompany().
+const dynamicVarsDb = require("../db/dynamic-variable-definitions");
 
 // ── Phone number purchase ──────────────────────────────────────────────────────
 
@@ -220,11 +292,11 @@ async function syncFlowForCompany(companyId) {
 
   const isFirstProvision = !company.retell_conversation_flow_id;
   const nodes = buildFlowNodes(callTypes);
-  const defaultDynVars = {
-    ...DEFAULT_DYNAMIC_VARIABLES,
-    company_name:        companyName,
-    representative_name: repName,
-  };
+  // Load full catalog from DB, then layer company-specific values on top
+  const defaultDynVars = await dynamicVarsDb.buildDefaultsForCompany({
+    companyName,
+    representativeName: repName,
+  });
 
   // ── Step 1: ConversationFlow ────────────────────────────────────────────────
   let flowId = company.retell_conversation_flow_id;

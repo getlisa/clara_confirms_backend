@@ -15,7 +15,8 @@ const toolDefsDb = require("../db/tool-definitions");
 const logger = require("../utils/logger");
 
 function getBaseUrl() {
-  const webhookUrl = process.env.RETELL_WEBHOOK_URL || "";
+  const config = require("../config");
+  const webhookUrl = config.retell.webhookUrl || "";
   return webhookUrl.replace(/\/retell\/webhook\/?$/, "").replace(/\/$/, "");
 }
 

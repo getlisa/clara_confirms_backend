@@ -2621,6 +2621,279 @@ Post-Call Analysis
 
 ---
 
+## 16. Environment-Aware UI — Development vs Production
+
+> The backend behaves differently based on `NODE_ENV`. The frontend must detect the environment and adapt its UI, labels, and defaults so that developers get a fast feedback loop while production shows correct real-world behaviour.
+
+---
+
+### 16.1 How to Detect the Environment
+
+#### `GET /health` — no auth required
+
+```json
+{
+  "status": "healthy",
+  "database": "connected",
+  "timestamp": "2026-05-28T14:00:00Z",
+  "environment": "development"
+}
+```
+
+`environment` is either `"development"` or `"production"`.
+
+**Recommended:** call this once on app startup and store `environment` in a global context/store. Do not rely on `VITE_NODE_ENV` — the backend is the source of truth.
+
+```typescript
+// src/lib/auth-api.ts
+export async function getHealthStatus():
+  Promise<{ status: string; environment: 'development' | 'production' } | null>
+```
+
+---
+
+### 16.2 Behaviour Differences Per Environment
+
+| Feature | Development | Production |
+|---|---|---|
+| `POST /scheduler/daily` — date matching | Matches **any upcoming** job (no date restriction) | Exact `today + days_before` date match only |
+| `POST /scheduler/daily` — `scheduled_at` | `NOW()` — calls are due immediately | Business-hours window (e.g. tomorrow 9:00 AM) |
+| `POST /scheduler/daily` — `is_test` on rows | `true` | `false` |
+| `POST /scheduler/daily` — dedup | Blocks only `pending`/`in_progress` — allows re-test after completion | Blocks `pending`/`in_progress`/`completed` — one real call per job |
+| `POST /scheduler/run` — office hours | **Skipped** — fires any time of day | Enforced — reschedules if outside 09:00–17:00 |
+| Scheduled calls `is_test` default filter | `true` | `false` |
+
+---
+
+### 16.3 TypeScript Type
+
+Add to `src/types/app.ts` (new file):
+
+```typescript
+export type AppEnvironment = 'development' | 'production';
+
+export interface HealthStatus {
+  status: 'healthy' | 'unhealthy';
+  database: 'connected' | 'disconnected';
+  timestamp: string;
+  environment: AppEnvironment;
+}
+```
+
+---
+
+### 16.4 Environment Context
+
+Create `src/contexts/EnvironmentContext.tsx`:
+
+```typescript
+import { createContext, useContext, useEffect, useState } from 'react';
+import type { AppEnvironment } from '@/types/app';
+import { getHealthStatus } from '@/lib/auth-api';
+
+interface EnvironmentContextValue {
+  environment: AppEnvironment;
+  isDev: boolean;
+}
+
+const EnvironmentContext = createContext<EnvironmentContextValue>({
+  environment: 'production',
+  isDev: false,
+});
+
+export function EnvironmentProvider({ children }: { children: React.ReactNode }) {
+  const [environment, setEnvironment] = useState<AppEnvironment>('production');
+
+  useEffect(() => {
+    getHealthStatus().then(h => {
+      if (h?.environment) setEnvironment(h.environment);
+    });
+  }, []);
+
+  return (
+    <EnvironmentContext.Provider value={{ environment, isDev: environment === 'development' }}>
+      {children}
+    </EnvironmentContext.Provider>
+  );
+}
+
+export const useEnvironment = () => useContext(EnvironmentContext);
+```
+
+Wrap `App.tsx` with `<EnvironmentProvider>` outside `AuthGuard`.
+
+---
+
+### 16.5 Component Changes
+
+#### Development Mode Banner
+
+Show a non-dismissable banner at the top of every page when `isDev = true`:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  ⚠️  Development mode — calls fire immediately, marked as test  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```tsx
+// src/components/layout/DevModeBanner.tsx
+import { useEnvironment } from '@/contexts/EnvironmentContext';
+
+export function DevModeBanner() {
+  const { isDev } = useEnvironment();
+  if (!isDev) return null;
+  return (
+    <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 text-sm text-amber-800 flex items-center gap-2">
+      <span>⚠️</span>
+      <span>Development mode — calls fire immediately and are marked as test calls</span>
+    </div>
+  );
+}
+```
+
+Add `<DevModeBanner />` at the top of `DashboardLayout` (inside the layout, above page content).
+
+---
+
+#### Scheduled Calls Page — default `is_test` filter
+
+```typescript
+const { isDev } = useEnvironment();
+
+// Default the is_test toggle to match the environment
+const [showTestCalls, setShowTestCalls] = useState(isDev);
+```
+
+In dev, the page opens on test calls by default (since all dev-scheduled calls are `is_test=true`). In prod, it defaults to production calls.
+
+---
+
+#### "Schedule Calls" Button — label and description
+
+```tsx
+const { isDev } = useEnvironment();
+
+<Button onClick={handleScheduleDaily}>
+  Schedule Calls
+</Button>
+<p className="text-xs text-muted-foreground mt-1">
+  {isDev
+    ? 'Dev mode: queues calls immediately for all upcoming jobs (is_test=true)'
+    : 'Schedules calls at next business-hours window for jobs due in the configured days'}
+</p>
+```
+
+---
+
+#### Scheduler Section in Testing Panel
+
+```
+Testing Panel
+─────────────────────────────────────────────────────────────────
+  Scheduler
+  ─────────────────────────────────────────────────────────────────
+  [Schedule Calls]    [Run Dispatcher]
+
+  Development mode:
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Schedule Calls → queues ALL upcoming jobs immediately        │
+  │ Run Dispatcher → fires immediately (no office-hours check)   │
+  └──────────────────────────────────────────────────────────────┘
+
+  Production mode:
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Schedule Calls → queues jobs at next business-hours window   │
+  │ Run Dispatcher → fires only during business hours            │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Placeholder Reference Update — Section 5.6
+
+Add `{{current_date}}` and `{{current_time}}` to the placeholder reference table:
+
+| Placeholder | Available in | Resolved to |
+|---|---|---|
+| `{{current_date}}` | All types | e.g. `"Wednesday, May 28, 2026"` in company timezone |
+| `{{current_time}}` | All types | e.g. `"02:45 PM"` in company timezone |
+| `{{company_name}}` `{{representative_name}}` `{{job_date}}` `{{job_id}}` | All types | — |
+| `{{customer_name}}` | `customer_confirmation` + custom | — |
+| `{{technician_name}}` `{{customer_address}}` | `technician_confirmation`, `technician_reschedule` | — |
+| `{{job_name}}` `{{job_description}}` `{{job_type}}` | All types | From jobs table |
+| `{{appointment_id}}` | `customer_confirmation`, `technician_confirmation` | From scheduled_calls |
+| `{{total_amount}}` | `quotation_followup` | Quote total |
+
+These are injected by the dispatcher when the call fires — not at scheduling time.
+
+---
+
+#### Todo Types — Section 5.8 Update
+
+`APPOINTMENT_NEEDED` is now a valid todo type (added alongside the existing 5):
+
+```typescript
+export type TodoType =
+  | 'NOT_PICKED'
+  | 'VOICEMAIL'
+  | 'ASKED_FOR_RESCHEDULE'
+  | 'ASKED_FOR_CANCELLATION'
+  | 'UNCONFIRMED'
+  | 'APPOINTMENT_NEEDED';    // ← NEW: no active appointment, customer had no time preference
+```
+
+| Type | Trigger | Default priority |
+|---|---|---|
+| `APPOINTMENT_NEEDED` | Customer confirmation call: no active appointment and customer gave no preferred time | `high` |
+
+Badge colour: `APPOINTMENT_NEEDED` = **indigo**
+
+Also add to the `GET /todos` type filter param and the `call_analysis_configs` priority/enable settings (Section 15).
+
+---
+
+### 16.6 `GET /health` — New Endpoint
+
+#### `GET /health` — no auth
+
+```json
+{
+  "status": "healthy",
+  "database": "connected",
+  "timestamp": "2026-05-28T14:00:00Z",
+  "environment": "development"
+}
+```
+
+```typescript
+export async function getHealthStatus(): Promise<HealthStatus | null> {
+  const res = await fetch(`${API_BASE}/health`);
+  if (!res.ok) return null;
+  return res.json().catch(() => null);
+}
+```
+
+---
+
+### 16.7 Checklist
+
+- [ ] Add `HealthStatus`, `AppEnvironment` to `src/types/app.ts`
+- [ ] Add `getHealthStatus()` to `src/lib/auth-api.ts`
+- [ ] Create `src/contexts/EnvironmentContext.tsx` — `EnvironmentProvider`, `useEnvironment`
+- [ ] Wrap `App.tsx` with `<EnvironmentProvider>`
+- [ ] Create `src/components/layout/DevModeBanner.tsx` — amber banner shown in dev only
+- [ ] Add `<DevModeBanner />` to `DashboardLayout`
+- [ ] `ScheduledCallsPage` — default `is_test` toggle to `isDev`
+- [ ] "Schedule Calls" button — show dev/prod description text below button
+- [ ] Testing panel — show scheduler behaviour description based on `isDev`
+- [ ] Update placeholder reference table — add `{{current_date}}`, `{{current_time}}`, `{{job_name}}`, `{{appointment_id}}`, `{{total_amount}}`
+- [ ] Update `TodoType` — add `APPOINTMENT_NEEDED`
+- [ ] Update `CallAnalysisConfig` type — add `APPOINTMENT_NEEDED` to the 5 outcome types
+- [ ] Add `APPOINTMENT_NEEDED` todo type badge (indigo) to Todos page
+
+---
+
 ## Implementation Status
 
 | Section | Status |

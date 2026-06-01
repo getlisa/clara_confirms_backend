@@ -27,32 +27,159 @@ async function create({ companyId, callType, phoneNumber, jobId, jobDate, appoin
   }
 }
 
-async function insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, scheduledAt, isTest = false, maxAttempts = 3 }) {
+async function insertScheduledCall({
+  companyId, callType, phoneNumber, jobId, jobDate, appointmentId,
+  customerName, technicianName, customerAddress,
+  jobName, jobDescription, jobType, totalAmount,
+  scheduledAt, isTest = false, maxAttempts = 3,
+  callPriority = "normal", parentCallId = null, retryCount = 0,
+}) {
   const result = await db.query(
     `INSERT INTO scheduled_calls
        (company_id, call_type, phone_number, job_id, job_date, appointment_id,
         customer_name, technician_name, customer_address,
         job_name, job_description, job_type, total_amount,
-        scheduled_at, is_test, max_attempts)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        scheduled_at, is_test, max_attempts,
+        call_priority, parent_call_id, retry_count)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
      RETURNING *`,
     [companyId, callType, phoneNumber, jobId ?? null, jobDate ?? null, appointmentId ?? null,
      customerName ?? null, technicianName ?? null, customerAddress ?? null,
      jobName ?? null, jobDescription ?? null, jobType ?? null, totalAmount ?? null,
-     scheduledAt, isTest, maxAttempts]
+     scheduledAt, isTest, maxAttempts,
+     callPriority, parentCallId ?? null, retryCount]
   );
   return result.rows[0];
 }
 
-async function claimPending(limit = 10) {
+/**
+ * Schedule a retry call for the next business day.
+ * Only creates the retry if:
+ *  - retry_count < MAX_RETRIES (3)
+ *  - next retry date is before the job's due date
+ *
+ * Returns the new scheduled_call row, or null if retry not allowed.
+ */
+async function scheduleRetry(originalRow, nextWindowAt, jobDueDate, maxRetries = 3) {
+  if (originalRow.retry_count >= maxRetries) return null;
+  if (jobDueDate && new Date(nextWindowAt) >= new Date(jobDueDate)) return null;
+
+  try {
+    return await insertScheduledCall({
+      companyId:       originalRow.company_id,
+      callType:        originalRow.call_type,
+      phoneNumber:     originalRow.phone_number,
+      jobId:           originalRow.job_id,
+      jobDate:         originalRow.job_date,
+      appointmentId:   originalRow.appointment_id,
+      customerName:    originalRow.customer_name,
+      technicianName:  originalRow.technician_name,
+      customerAddress: originalRow.customer_address,
+      jobName:         originalRow.job_name,
+      jobDescription:  originalRow.job_description,
+      jobType:         originalRow.job_type,
+      totalAmount:     originalRow.total_amount,
+      scheduledAt:     nextWindowAt,
+      isTest:          originalRow.is_test,
+      maxAttempts:     originalRow.max_attempts,
+      callPriority:    "retry",
+      parentCallId:    originalRow.id,
+      retryCount:      originalRow.retry_count + 1,
+    });
+  } catch (err) {
+    if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return null;
+    throw err;
+  }
+}
+
+/**
+ * Schedule a callback at the time requested by the customer during the call.
+ * callbackAt must be before jobDueDate.
+ */
+async function scheduleCallback(originalRow, callbackAt, jobDueDate) {
+  if (jobDueDate && new Date(callbackAt) >= new Date(jobDueDate)) return null;
+
+  try {
+    return await insertScheduledCall({
+      companyId:       originalRow.company_id,
+      callType:        originalRow.call_type,
+      phoneNumber:     originalRow.phone_number,
+      jobId:           originalRow.job_id,
+      jobDate:         originalRow.job_date,
+      appointmentId:   originalRow.appointment_id,
+      customerName:    originalRow.customer_name,
+      technicianName:  originalRow.technician_name,
+      customerAddress: originalRow.customer_address,
+      jobName:         originalRow.job_name,
+      jobDescription:  originalRow.job_description,
+      jobType:         originalRow.job_type,
+      totalAmount:     originalRow.total_amount,
+      scheduledAt:     callbackAt,
+      isTest:          originalRow.is_test,
+      maxAttempts:     originalRow.max_attempts,
+      callPriority:    "callback",
+      parentCallId:    originalRow.id,
+      retryCount:      0,
+    });
+  } catch (err) {
+    if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return null;
+    throw err;
+  }
+}
+
+// ── Concurrency configuration ─────────────────────────────────────────────────
+const MAX_CONCURRENT_CALLS = 20;  // total in-flight cap
+const PRIORITY_RESERVED    = 5;   // slots always available for retry/callback
+
+/**
+ * Claim due pending calls respecting priority lanes and concurrency limits.
+ *
+ * Slots:
+ *   - Total cap: MAX_CONCURRENT_CALLS (20)
+ *   - PRIORITY_RESERVED (5) are always reserved for retry/callback calls
+ *   - Normal calls can only use the remaining (20 - 5 = 15) slots
+ *
+ * Priority (retry/callback) calls can use any available slot up to the full cap.
+ * Normal calls can only use slots when in_flight < 15.
+ */
+async function claimPending(batchSize = 10) {
+  const { rows: [{ in_flight }] } = await db.query(
+    `SELECT COUNT(*)::int AS in_flight FROM scheduled_calls WHERE status = 'in_progress'`
+  );
+
+  const totalAvailable    = Math.max(0, MAX_CONCURRENT_CALLS - in_flight);
+  const normalAvailable   = Math.max(0, (MAX_CONCURRENT_CALLS - PRIORITY_RESERVED) - in_flight);
+  const priorityAvailable = totalAvailable; // priority can use any free slot
+
+  if (totalAvailable === 0) return [];
+
+  // Claim priority calls first (retry/callback), then normal — both respect SKIP LOCKED
   const result = await db.query(
     `UPDATE scheduled_calls SET status = 'in_progress', last_attempted_at = NOW(), updated_at = NOW()
      WHERE id IN (
-       SELECT id FROM scheduled_calls
-       WHERE status = 'pending' AND scheduled_at <= NOW()
-       ORDER BY scheduled_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED
+       -- Priority lane: retry + callback calls (5 reserved slots)
+       (SELECT id FROM scheduled_calls
+        WHERE status = 'pending' AND scheduled_at <= NOW()
+          AND call_priority IN ('retry','callback')
+        ORDER BY call_priority DESC, scheduled_at ASC  -- callback before retry
+        LIMIT $1 FOR UPDATE SKIP LOCKED)
+
+       UNION ALL
+
+       -- Normal lane (limited to non-reserved slots)
+       (SELECT id FROM scheduled_calls
+        WHERE status = 'pending' AND scheduled_at <= NOW()
+          AND call_priority = 'normal'
+        ORDER BY scheduled_at ASC
+        LIMIT $2 FOR UPDATE SKIP LOCKED)
+
+       LIMIT $3
      ) RETURNING *`,
-    [limit]
+    [
+      Math.min(priorityAvailable, batchSize),
+      Math.min(normalAvailable,   batchSize),
+      Math.min(totalAvailable,    batchSize),
+    ]
   );
   return result.rows;
 }
@@ -125,12 +252,16 @@ async function existsForCustomerJob(companyId, jobId, callType, isPreview = fals
 
 module.exports = {
   CUSTOMER_CALL_TYPES,
+  MAX_CONCURRENT_CALLS,
+  PRIORITY_RESERVED,
   quotationJobId,
   create,
   claimPending,
   markCompleted,
   markFailedOrRetry,
   advanceToNextWindow,
+  scheduleRetry,
+  scheduleCallback,
   existsForJob,
   existsForQuotation,
   existsForCustomerJob,

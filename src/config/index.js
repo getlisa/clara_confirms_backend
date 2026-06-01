@@ -1,8 +1,28 @@
 require("dotenv").config();
 
+const nodeEnv = process.env.NODE_ENV || "development";
+const isProd = nodeEnv === "production";
+
+/**
+ * Resolve the Retell webhook base URL for the current environment.
+ * Production: RETELL_WEBHOOK_URL_PROD (e.g. https://api.justclara.ai)
+ * Development: RETELL_WEBHOOK_URL_DEV (e.g. https://xxx.ngrok-free.dev)
+ * Fallback: RETELL_WEBHOOK_URL (legacy single-env config)
+ *
+ * Stored as the full webhook path (.../retell/webhook). Tool URLs strip the
+ * /retell/webhook suffix to derive the base.
+ */
+function resolveRetellWebhookUrl() {
+  const envSpecific = isProd
+    ? process.env.RETELL_WEBHOOK_URL_PROD
+    : process.env.RETELL_WEBHOOK_URL_DEV;
+  return envSpecific || process.env.RETELL_WEBHOOK_URL || "";
+}
+
 module.exports = {
   port: parseInt(process.env.PORT || "3000", 10),
-  nodeEnv: process.env.NODE_ENV || "development",
+  nodeEnv,
+  isProd,
   database: {
     url:
       process.env.DATABASE_URL ||
@@ -36,7 +56,9 @@ module.exports = {
     apiKey: process.env.RETELL_API_KEY || "",
     webhookSecret: process.env.RETELL_WEBHOOK_SECRET || "",
     defaultVoiceId: process.env.RETELL_DEFAULT_VOICE_ID || "11labs-Adrian",
-    webhookUrl: process.env.RETELL_WEBHOOK_URL || "",
+    // Environment-aware: picks _PROD or _DEV variant based on NODE_ENV, falls back to legacy single var
+    webhookUrl: resolveRetellWebhookUrl(),
+    toolSecret: process.env.RETELL_TOOL_SECRET || "",
     // Phone number auto-purchase settings
     phoneAreaCode: process.env.RETELL_PHONE_AREA_CODE
       ? parseInt(process.env.RETELL_PHONE_AREA_CODE, 10)
