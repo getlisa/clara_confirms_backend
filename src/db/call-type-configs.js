@@ -13,28 +13,24 @@ const BUILTIN_SEEDS = [
     name: "Customer Confirmation",
     description: "Call the end customer to confirm their upcoming appointment.",
     enabled: true,
-    days_before: 2,
   },
   {
     type: "technician_confirmation",
     name: "Technician Confirmation",
     description: "Call the assigned technician to confirm availability for the job.",
     enabled: true,
-    days_before: 1,
   },
   {
     type: "technician_reschedule",
     name: "Technician Reschedule Notice",
     description: "Notify the technician that their job needs to be rescheduled.",
     enabled: false,
-    days_before: 1,
   },
   {
     type: "quotation_followup",
     name: "Quotation Follow-up",
     description: "Follow up with the customer on a sent or viewed quotation that hasn't been accepted yet.",
     enabled: false,
-    days_before: 3,
   },
 ];
 
@@ -278,7 +274,6 @@ function rowToObject(row) {
     description:       row.description ?? "",
     is_custom:         row.is_custom,
     enabled:           row.enabled,
-    days_before:       Number(row.days_before),
     begin_message:     row.begin_message ?? null,
     general_prompt:    row.general_prompt ?? null,
     voicemail_message: row.voicemail_message ?? generateDefaultVoicemailMessage(row.type),
@@ -296,10 +291,10 @@ async function seedBuiltins(companyId, client) {
     const voicemail_message = generateDefaultVoicemailMessage(seed.type);
     await run.query(
       `INSERT INTO call_type_configs
-         (company_id, type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, voicemail_message)
-       VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8, $9)
+         (company_id, type, name, description, is_custom, enabled, begin_message, general_prompt, voicemail_message)
+       VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8)
        ON CONFLICT (company_id, type) DO NOTHING`,
-      [companyId, seed.type, seed.name, seed.description, seed.enabled, seed.days_before, begin_message, general_prompt, voicemail_message]
+      [companyId, seed.type, seed.name, seed.description, seed.enabled, begin_message, general_prompt, voicemail_message]
     );
   }
 }
@@ -309,7 +304,7 @@ async function seedBuiltins(companyId, client) {
  */
 async function getAllByCompanyId(companyId) {
   const result = await db.query(
-    `SELECT type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id
+    `SELECT type, name, description, is_custom, enabled, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id
      FROM call_type_configs
      WHERE company_id = $1
      ORDER BY is_custom ASC, created_at ASC`,
@@ -321,7 +316,7 @@ async function getAllByCompanyId(companyId) {
 /**
  * Create a custom call type. Generates a unique slug from name.
  */
-async function create(companyId, { name, description, days_before }) {
+async function create(companyId, { name, description }) {
   const baseSlug = slugify(name);
   // Ensure uniqueness by appending suffix if slug already taken
   let slug = baseSlug;
@@ -337,10 +332,10 @@ async function create(companyId, { name, description, days_before }) {
 
   const result = await db.query(
     `INSERT INTO call_type_configs
-       (company_id, type, name, description, is_custom, enabled, days_before, begin_message, general_prompt)
-     VALUES ($1, $2, $3, $4, true, false, $5, $6, $7)
-     RETURNING type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id`,
-    [companyId, slug, name, description ?? "", days_before ?? 2, begin_message, general_prompt]
+       (company_id, type, name, description, is_custom, enabled, begin_message, general_prompt)
+     VALUES ($1, $2, $3, $4, true, false, $5, $6)
+     RETURNING type, name, description, is_custom, enabled, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id`,
+    [companyId, slug, name, description ?? "", begin_message, general_prompt]
   );
   return rowToObject(result.rows[0]);
 }
@@ -350,7 +345,7 @@ async function create(companyId, { name, description, days_before }) {
  */
 async function getByType(companyId, type) {
   const result = await db.query(
-    `SELECT type, name, description, is_custom, enabled, days_before, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id
+    `SELECT type, name, description, is_custom, enabled, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id
      FROM call_type_configs WHERE company_id = $1 AND type = $2`,
     [companyId, type]
   );
@@ -365,7 +360,7 @@ async function upsert(companyId, type, fields) {
   const isBuiltin = BUILTIN_TYPES.includes(type);
 
   // For built-ins, always upsert (create if missing). For custom, only update existing.
-  const allowed = ["enabled", "days_before", "begin_message", "general_prompt", "voicemail_message"];
+  const allowed = ["enabled", "begin_message", "general_prompt", "voicemail_message"];
   if (!isBuiltin) allowed.push("name", "description");
 
   const provided = allowed.filter((k) => k in fields);
@@ -377,10 +372,10 @@ async function upsert(companyId, type, fields) {
     const { begin_message: defMsg, general_prompt: defPrompt } = generateDefaultPrompts(seed.type, seed.name, seed.description);
     await db.query(
       `INSERT INTO call_type_configs
-         (company_id, type, name, description, is_custom, enabled, days_before, begin_message, general_prompt)
-       VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8)
+         (company_id, type, name, description, is_custom, enabled, begin_message, general_prompt)
+       VALUES ($1, $2, $3, $4, false, $5, $6, $7)
        ON CONFLICT (company_id, type) DO NOTHING`,
-      [companyId, type, seed.name, seed.description, seed.enabled, seed.days_before, defMsg, defPrompt]
+      [companyId, type, seed.name, seed.description, seed.enabled, defMsg, defPrompt]
     );
   }
 
@@ -390,7 +385,7 @@ async function upsert(companyId, type, fields) {
   const result = await db.query(
     `UPDATE call_type_configs SET ${setClauses}, updated_at = NOW()
      WHERE company_id = $1 AND type = $2
-     RETURNING type, name, description, is_custom, enabled, days_before, begin_message, general_prompt`,
+     RETURNING type, name, description, is_custom, enabled, begin_message, general_prompt`,
     values
   );
   return result.rows[0] ? rowToObject(result.rows[0]) : null;

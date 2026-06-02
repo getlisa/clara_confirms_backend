@@ -174,6 +174,8 @@ export interface CallSettings {
   include_weekends: boolean;
   voicemail_message: string;          // spoken when voicemail detected; supports {{representative_name}}, {{company_name}}
   agent_can_make_changes: boolean;    // when false, agent collects info only — no confirmations or reschedules
+  auto_schedule_enabled: boolean;     // when true, system cron runs the daily schedule job for this company
+  auto_dispatch_enabled: boolean;     // when true, system cron fires due scheduled calls for this company
 }
 
 export interface FlowStatus {
@@ -460,6 +462,8 @@ All optional. Validation: `max_attempts` 1–10, `voicemail_behavior` `"leave"` 
 | `voicemail_behavior` | `"leave"` \| `"skip"` | `leave` = speak message then hang up; `skip` = hang up silently |
 | `voicemail_message` | string | Message spoken when voicemail is detected. Supports `{{representative_name}}` and `{{company_name}}` placeholders. Synced to Retell automatically. |
 | `agent_can_make_changes` | boolean | `true` (default) = agent can confirm/reschedule appointments in real time. `false` = agent collects info only, no DB writes — triggers tool re-registration on Retell automatically. |
+| `auto_schedule_enabled` | boolean | `true` (default) = system cron creates `scheduled_calls` rows daily. `false` = user clicks "Schedule Calls" manually. |
+| `auto_dispatch_enabled` | boolean | `true` (default) = system cron fires due calls every few minutes. `false` = user clicks "Run Dispatcher" manually. |
 
 > **Auto-sync:** When `voicemail_behavior`, `voicemail_message`, or `agent_can_make_changes` is updated, the backend immediately syncs to Retell. No manual sync needed.
 
@@ -2891,6 +2895,141 @@ export async function getHealthStatus(): Promise<HealthStatus | null> {
 - [ ] Update `TodoType` — add `APPOINTMENT_NEEDED`
 - [ ] Update `CallAnalysisConfig` type — add `APPOINTMENT_NEEDED` to the 5 outcome types
 - [ ] Add `APPOINTMENT_NEEDED` todo type badge (indigo) to Todos page
+
+---
+
+## 17. Scheduler Automation Modes — Per-Company Toggles + Manual Triggers
+
+> Each company can independently enable/disable the system cron for scheduling and dispatching. Manual UI triggers always work, scoped to the user's company. This gives every tenant full control over how automated their pipeline is.
+
+---
+
+### 17.1 The Four Modes
+
+The combination of two booleans (`auto_schedule_enabled`, `auto_dispatch_enabled`) covers every workflow a tenant might want:
+
+| Mode | `auto_schedule` | `auto_dispatch` | Behavior |
+|---|---|---|---|
+| **Full automation** | `true` | `true` | Cron schedules daily, cron fires calls — hands-off |
+| **Auto schedule only** | `true` | `false` | Cron creates rows; user reviews then clicks "Run Dispatcher" |
+| **Auto dispatch only** | `false` | `true` | User schedules manually (or via API); cron fires due rows |
+| **Fully manual** | `false` | `false` | User clicks both buttons; cron does nothing for this company |
+
+Both toggles default to `true` (full automation) for newly provisioned companies.
+
+---
+
+### 17.2 New Endpoints
+
+#### `POST /scheduler/daily/manual` 🔒 (JWT)
+
+User-initiated daily-job for the **logged-in user's company only**. Bypasses `auto_schedule_enabled` — always runs.
+
+```json
+// Response 200
+{ "ok": true, "created": 3, "skipped": 1 }
+```
+
+#### `POST /scheduler/run/manual` 🔒 (JWT)
+
+User-initiated dispatcher run for the **logged-in user's company only**. Bypasses `auto_dispatch_enabled` — always fires due calls.
+
+```json
+// Response 200
+{ "ok": true, "fired": 2, "skipped": 0, "failed": 0 }
+```
+
+> Note: the existing `POST /scheduler/daily` and `POST /scheduler/run` are still cron-only (auth via `CRON_SECRET`) and iterate all companies, honoring each company's toggles.
+
+---
+
+### 17.3 New API Functions
+
+Add to `src/lib/auth-api.ts`:
+
+```typescript
+// Manual triggers — scoped to user's company, ignore the auto_* toggles
+export async function runDailyJobManual(token: string):
+  Promise<{ ok: boolean; created: number; skipped: number } | null>
+
+export async function runDispatcherManual(token: string):
+  Promise<{ ok: boolean; fired: number; skipped: number; failed: number } | null>
+```
+
+---
+
+### 17.4 Settings Page — Automation Section
+
+Add a new **"Automation"** card to Settings → Call Settings (or as its own section):
+
+```
+Automation
+──────────────────────────────────────────────────────────────────
+  Control how much of the call pipeline runs automatically.
+
+  ┌────────────────────────────────────────────────────────────┐
+  │ [● Enabled]  Auto-schedule daily                            │
+  │ System cron creates scheduled calls every day based on      │
+  │ your call triggers. Turn off to schedule manually.          │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────┐
+  │ [● Enabled]  Auto-dispatch                                  │
+  │ System cron fires due scheduled calls every 2 minutes.      │
+  │ Turn off to dispatch manually after reviewing the queue.    │
+  └────────────────────────────────────────────────────────────┘
+
+  Current mode: Full automation
+──────────────────────────────────────────────────────────────────
+```
+
+**UX behavior:**
+- Toggle either flag → immediate `PATCH /call-settings { auto_schedule_enabled: false }` (no Save needed)
+- Show the **current mode** label dynamically:
+  - both `true` → "Full automation"
+  - schedule `true`, dispatch `false` → "Schedule only (review before dispatch)"
+  - schedule `false`, dispatch `true` → "Dispatch only (manual scheduling)"
+  - both `false` → "Fully manual"
+
+```typescript
+function getModeLabel(s: CallSettings): string {
+  if (s.auto_schedule_enabled && s.auto_dispatch_enabled)  return 'Full automation';
+  if (s.auto_schedule_enabled && !s.auto_dispatch_enabled) return 'Schedule only (review before dispatch)';
+  if (!s.auto_schedule_enabled && s.auto_dispatch_enabled) return 'Dispatch only (manual scheduling)';
+  return 'Fully manual';
+}
+```
+
+---
+
+### 17.5 Scheduled Calls Page — Update Manual Buttons
+
+The existing "Schedule Calls" and "Run Dispatcher" buttons should now hit the **manual** endpoints:
+
+```typescript
+// Before — hits cron endpoint with CRON_SECRET (won't work from browser)
+fetch('/scheduler/daily', { method: 'POST', headers: { Authorization: `Bearer ${CRON_SECRET}` } });
+
+// After — hits manual endpoint with user JWT
+runDailyJobManual(token);
+```
+
+Same for the dispatcher button → `runDispatcherManual(token)`.
+
+The buttons work **regardless** of the company's automation toggles, so the user can always force a run on demand.
+
+---
+
+### 17.6 Checklist
+
+- [ ] Add `auto_schedule_enabled`, `auto_dispatch_enabled` to `CallSettings` type
+- [ ] Add `runDailyJobManual()`, `runDispatcherManual()` to `src/lib/auth-api.ts`
+- [ ] Create automation toggles card in `CallSettings.tsx` — two switches with dynamic mode label
+- [ ] Toggle → immediate `PATCH /call-settings`
+- [ ] Update `ScheduledCallsPage` — "Schedule Calls" button → `runDailyJobManual()`
+- [ ] Update `ScheduledCallsPage` — "Run Dispatcher" button → `runDispatcherManual()`
+- [ ] Show toast with returned counts (`created`, `fired`) after manual triggers
+- [ ] Refetch scheduled-calls list after a manual trigger
 
 ---
 

@@ -56,15 +56,39 @@ function formatDateInTz(date, tz) {
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
-async function runDispatcher(batchSize = 10) {
+/**
+ * Run the dispatcher to fire due scheduled_calls.
+ *
+ * @param {number} batchSize
+ * @param {object} opts
+ * @param {number} [opts.companyId]     — scope to one company (manual UI trigger)
+ * @param {boolean} [opts.respectAutoFlag=true]
+ *                                       — when true (system cron), skip rows belonging
+ *                                         to companies with auto_dispatch_enabled=false.
+ *                                         when false (manual UI), fire regardless.
+ */
+async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag = true } = {}) {
+  const scopeFilter = companyId ? "AND sc.company_id = $1" : "";
+  const autoFilter  = respectAutoFlag
+    ? `AND EXISTS (
+         SELECT 1 FROM call_settings cs
+         WHERE cs.company_id = sc.company_id AND cs.auto_dispatch_enabled = true
+       )`
+    : "";
+  const params = companyId ? [companyId] : [];
+
   // Log every pending call and why it is/isn't being picked up this run
   const { rows: allPending } = await db.query(
-    `SELECT id, call_type, job_id, job_name, customer_name, phone_number,
-            scheduled_at, is_test, status, attempt_number, max_attempts,
-            scheduled_at <= NOW() AS due
-     FROM scheduled_calls
-     WHERE status = 'pending'
-     ORDER BY scheduled_at ASC`
+    `SELECT sc.id, sc.call_type, sc.job_id, sc.job_name, sc.customer_name, sc.phone_number,
+            sc.scheduled_at, sc.is_test, sc.status, sc.attempt_number, sc.max_attempts,
+            sc.company_id,
+            sc.scheduled_at <= NOW() AS due
+     FROM scheduled_calls sc
+     WHERE sc.status = 'pending'
+       ${scopeFilter}
+       ${autoFilter}
+     ORDER BY sc.scheduled_at ASC`,
+    params
   );
 
   if (allPending.length === 0) {
@@ -89,7 +113,7 @@ async function runDispatcher(batchSize = 10) {
     }
   }
 
-  const rows = await scheduledCallsDb.claimPending(batchSize);
+  const rows = await scheduledCallsDb.claimPending(batchSize, { companyId, respectAutoFlag });
   if (rows.length === 0) {
     logger.info("Dispatcher: no due calls to process");
     return { fired: 0, skipped: 0, failed: 0 };
@@ -195,12 +219,26 @@ async function runDispatcher(batchSize = 10) {
 
 // ── Daily job ─────────────────────────────────────────────────────────────────
 
-async function runDailyJob() {
+/**
+ * Run the daily scheduling job.
+ *
+ * @param {object} opts
+ * @param {number} [opts.companyId]      — scope to one company (manual trigger from UI)
+ * @param {boolean} [opts.respectAutoFlag=true]
+ *                                       — when true (system cron), skip companies where
+ *                                         call_settings.auto_schedule_enabled = false.
+ *                                         when false (manual trigger), ignore the flag.
+ */
+async function runDailyJob({ companyId = null, respectAutoFlag = true } = {}) {
   const env = isDev ? "development" : "production";
-  logger.info(`Daily job: started (${env} mode)`);
+  const mode = companyId ? `manual (company ${companyId})` : "cron";
+  logger.info(`Daily job: started (${env} mode, ${mode})`);
 
   const { rows: companies } = await db.query(
-    `SELECT id, default_timezone FROM companies WHERE is_active = true OR is_active IS NULL`
+    companyId
+      ? `SELECT id, default_timezone FROM companies WHERE id = $1 AND (is_active = true OR is_active IS NULL)`
+      : `SELECT id, default_timezone FROM companies WHERE is_active = true OR is_active IS NULL`,
+    companyId ? [companyId] : []
   );
   logger.info(`Daily job: processing ${companies.length} company(ies)`);
 
@@ -208,13 +246,20 @@ async function runDailyJob() {
 
   for (const co of companies) {
     try {
+      const cs = await callSettingsDb.getByCompanyId(co.id);
+
+      // System cron respects the per-company auto-schedule toggle.
+      // Manual triggers bypass it.
+      if (respectAutoFlag && cs.auto_schedule_enabled === false) {
+        logger.info("Daily job: skipped company — auto_schedule_enabled=false", { companyId: co.id });
+        continue;
+      }
+
       const triggers = await callTriggerConfigsDb.getEnabledByCompanyId(co.id);
       if (triggers.length === 0) {
         logger.info("Daily job: skipped company — no enabled triggers", { companyId: co.id });
         continue;
       }
-
-      const cs = await callSettingsDb.getByCompanyId(co.id);
       const tz = co.default_timezone || "America/New_York";
       logger.info(`Daily job: company has ${triggers.length} enabled trigger(s)`, {
         companyId: co.id, tz, triggers: triggers.map(t => t.trigger_type),
@@ -278,29 +323,34 @@ async function processTrigger(companyId, trigger, callSettings, tz) {
  * Prod: schedule at business-hours window N days from now, is_test=false
  */
 async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz) {
-  const targetDate = new Date();
-  targetDate.setDate(targetDate.getDate() + trigger.days_before);
-  const targetDateStr = formatDateInTz(targetDate, tz);
+  // Window match: any appointment whose date (in company tz) is within
+  // [today, today + days_before]. Catches jobs created late and any day the cron missed.
+  const todayStr = formatDateInTz(new Date(), tz);
+  const endDate = new Date();
+  endDate.setDate(endDate.getDate() + trigger.days_before);
+  const endDateStr = formatDateInTz(endDate, tz);
+  const targetDate = new Date(endDateStr);
 
-  // Match by the appointment's actual scheduled_start (in the company timezone)
-  // — not the job's planned scheduled_date. The appointment is the real booking
-  // the customer needs to confirm.
   const dateFilter = isDev
     ? "a.scheduled_start >= NOW()"
-    : "DATE(a.scheduled_start AT TIME ZONE $2) = $3::date";
-  const params = isDev ? [companyId] : [companyId, tz, targetDateStr];
+    : "DATE(a.scheduled_start AT TIME ZONE $2) BETWEEN $3::date AND $4::date";
+  const params = isDev ? [companyId] : [companyId, tz, todayStr, endDateStr];
 
+  // Include both scheduled and rescheduled jobs/appointments — both still need
+  // customer confirmation. A rescheduled appointment is the new time the customer
+  // must confirm.
   const { rows } = await db.query(
     `SELECT DISTINCT ON (j.id)
-            j.id AS job_id, j.scheduled_date,
+            j.id AS job_id, j.scheduled_date, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
+            a.status AS appointment_status,
             c.phone AS customer_phone, c.full_name AS customer_name,
             c.address_line1, c.city, c.state
      FROM jobs j
-     JOIN appointments a ON a.job_id = j.id AND a.status = 'scheduled'
+     JOIN appointments a ON a.job_id = j.id AND a.status IN ('scheduled','rescheduled')
      JOIN customers c ON c.id = j.customer_id
      WHERE j.company_id = $1
-       AND j.status = 'scheduled'
+       AND j.status IN ('scheduled','rescheduled')
        AND (a.customer_confirmed IS NULL OR a.customer_confirmed = false)
        AND ${dateFilter}
        AND c.phone IS NOT NULL
@@ -308,7 +358,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
     params
   );
 
-  logger.info(`Scheduler [scheduled_unconfirmed]: found ${rows.length} unconfirmed appointment(s)`, { companyId, targetDate: targetDateStr });
+  logger.info(`Scheduler [scheduled_unconfirmed]: found ${rows.length} unconfirmed appointment(s)`, { companyId, window: `${todayStr} to ${endDateStr}` });
 
   let c = 0, s = 0;
   for (const row of rows) {
@@ -410,12 +460,17 @@ async function processQuotationPending(companyId, trigger, callSettings, tz) {
 }
 
 async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
-  const targetDate = new Date();
-  targetDate.setDate(targetDate.getDate() + trigger.days_before);
-  const targetDateStr = formatDateInTz(targetDate, tz);
+  const todayStr = formatDateInTz(new Date(), tz);
+  const endDate = new Date();
+  endDate.setDate(endDate.getDate() + trigger.days_before);
+  const endDateStr = formatDateInTz(endDate, tz);
   const cfg = trigger.trigger_config;
+  const targetDate = new Date(endDateStr);
 
-  const dateClause = isDev ? "j.scheduled_date >= CURRENT_DATE" : "j.scheduled_date = $2::date";
+  // Window: today through today + days_before (inclusive)
+  const dateClause = isDev
+    ? "j.scheduled_date >= CURRENT_DATE"
+    : "j.scheduled_date BETWEEN $2::date AND $3::date";
 
   let query = `
     SELECT j.id AS job_id, j.scheduled_date,
@@ -435,9 +490,9 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
 
   if (cfg.only_if_technician_assigned) query += " AND j.technician_id IS NOT NULL";
 
-  const { rows } = await db.query(query, isDev ? [companyId] : [companyId, targetDateStr]);
+  const { rows } = await db.query(query, isDev ? [companyId] : [companyId, todayStr, endDateStr]);
 
-  logger.info(`Scheduler [open_job_due_soon]: found ${rows.length} open job(s) due soon`, { companyId, targetDate: targetDateStr });
+  logger.info(`Scheduler [open_job_due_soon]: found ${rows.length} open job(s) due soon`, { companyId, window: `${todayStr} to ${endDateStr}` });
 
   let c = 0, s = 0;
   for (const row of rows) {
@@ -474,12 +529,16 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
 }
 
 async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz) {
-  const targetDate = new Date();
-  targetDate.setDate(targetDate.getDate() + trigger.days_before);
-  const targetDateStr = formatDateInTz(targetDate, tz);
+  const todayStr = formatDateInTz(new Date(), tz);
+  const endDate = new Date();
+  endDate.setDate(endDate.getDate() + trigger.days_before);
+  const endDateStr = formatDateInTz(endDate, tz);
+  const targetDate = new Date(endDateStr);
 
-  const dateFilter = isDev ? "a.scheduled_start >= NOW()" : `DATE(a.scheduled_start AT TIME ZONE $2) = $3::date`;
-  const techParams = isDev ? [companyId] : [companyId, tz, targetDateStr];
+  const dateFilter = isDev
+    ? "a.scheduled_start >= NOW()"
+    : "DATE(a.scheduled_start AT TIME ZONE $2) BETWEEN $3::date AND $4::date";
+  const techParams = isDev ? [companyId] : [companyId, tz, todayStr, endDateStr];
 
   const { rows } = await db.query(
     `SELECT a.id AS appointment_id, j.id AS job_id, j.scheduled_date,
@@ -492,7 +551,7 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
      JOIN technicians t ON t.id = a.technician_id
      JOIN customers c   ON c.id = j.customer_id
      WHERE j.company_id = $1
-       AND a.status = 'scheduled'
+       AND a.status IN ('scheduled','rescheduled')
        AND a.technician_id IS NOT NULL
        AND (a.technician_confirmed IS NULL OR a.technician_confirmed = false)
        AND ${dateFilter}
@@ -501,7 +560,7 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
     techParams
   );
 
-  logger.info(`Scheduler [technician_unconfirmed]: found ${rows.length} unconfirmed technician appointment(s)`, { companyId, targetDate: targetDateStr });
+  logger.info(`Scheduler [technician_unconfirmed]: found ${rows.length} unconfirmed technician appointment(s)`, { companyId, window: `${todayStr} to ${endDateStr}` });
 
   let c = 0, s = 0;
   for (const row of rows) {

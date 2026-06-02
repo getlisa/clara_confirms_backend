@@ -14,6 +14,8 @@ const DEFAULTS = {
   alert_days_before:       2,
   voicemail_message:       DEFAULT_VOICEMAIL_MESSAGE,
   agent_can_make_changes:  true,
+  auto_schedule_enabled:   true,
+  auto_dispatch_enabled:   true,
 };
 
 function rowToSettings(row) {
@@ -21,15 +23,21 @@ function rowToSettings(row) {
     ...row,
     voicemail_message:      row.voicemail_message ?? DEFAULT_VOICEMAIL_MESSAGE,
     agent_can_make_changes: row.agent_can_make_changes ?? true,
+    auto_schedule_enabled:  row.auto_schedule_enabled ?? true,
+    auto_dispatch_enabled:  row.auto_dispatch_enabled ?? true,
   };
 }
 
+const SELECT_COLS = `
+  business_hours_start, business_hours_end, max_attempts,
+  voicemail_behavior, include_weekends, alert_days_before,
+  voicemail_message, agent_can_make_changes,
+  auto_schedule_enabled, auto_dispatch_enabled
+`;
+
 async function getByCompanyId(companyId) {
   const result = await db.query(
-    `SELECT business_hours_start, business_hours_end, max_attempts,
-            voicemail_behavior, include_weekends, alert_days_before,
-            voicemail_message, agent_can_make_changes
-     FROM call_settings WHERE company_id = $1`,
+    `SELECT ${SELECT_COLS} FROM call_settings WHERE company_id = $1`,
     [companyId]
   );
   return result.rows[0] ? rowToSettings(result.rows[0]) : { ...DEFAULTS };
@@ -40,6 +48,7 @@ async function upsert(companyId, fields) {
     "business_hours_start", "business_hours_end", "max_attempts",
     "voicemail_behavior", "include_weekends", "alert_days_before",
     "voicemail_message", "agent_can_make_changes",
+    "auto_schedule_enabled", "auto_dispatch_enabled",
   ];
   const keys = Object.keys(fields).filter((k) => allowed.includes(k));
   if (keys.length === 0) return getByCompanyId(companyId);
@@ -49,9 +58,7 @@ async function upsert(companyId, fields) {
     `INSERT INTO call_settings (company_id, ${keys.join(", ")})
      VALUES ($1, ${keys.map((_, i) => `$${i + 2}`).join(", ")})
      ON CONFLICT (company_id) DO UPDATE SET ${setClauses}, updated_at = NOW()
-     RETURNING business_hours_start, business_hours_end, max_attempts,
-               voicemail_behavior, include_weekends, alert_days_before,
-               voicemail_message, agent_can_make_changes`,
+     RETURNING ${SELECT_COLS}`,
     values
   );
   return rowToSettings(result.rows[0]);

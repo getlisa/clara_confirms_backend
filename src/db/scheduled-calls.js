@@ -142,7 +142,18 @@ const PRIORITY_RESERVED    = 5;   // slots always available for retry/callback
  * Priority (retry/callback) calls can use any available slot up to the full cap.
  * Normal calls can only use slots when in_flight < 15.
  */
-async function claimPending(batchSize = 10) {
+/**
+ * Claim due pending rows for dispatch.
+ *
+ * @param {number} batchSize
+ * @param {object} opts
+ * @param {number} [opts.companyId]     — scope to one company (manual UI run)
+ * @param {boolean} [opts.respectAutoFlag=true]
+ *                                       — when true (system cron), claim only from
+ *                                         companies with auto_dispatch_enabled = true.
+ *                                         when false (manual), ignore the flag.
+ */
+async function claimPending(batchSize = 10, { companyId = null, respectAutoFlag = true } = {}) {
   // Reaper: any in_progress row stuck for >5 minutes is orphaned (crashed dispatcher,
   // function timeout, etc). Reset to pending so it gets retried on this run.
   // The 5-minute threshold is safely longer than any normal Retell call setup (~few seconds).
@@ -152,6 +163,15 @@ async function claimPending(batchSize = 10) {
      WHERE status = 'in_progress'
        AND last_attempted_at < NOW() - INTERVAL '5 minutes'`
   );
+
+  // Build scope filters used in the claim SELECT below
+  const scopeClause = companyId ? `AND scheduled_calls.company_id = ${Number(companyId)}` : "";
+  const autoClause  = respectAutoFlag
+    ? `AND EXISTS (
+         SELECT 1 FROM call_settings cs
+         WHERE cs.company_id = scheduled_calls.company_id AND cs.auto_dispatch_enabled = true
+       )`
+    : "";
 
   const { rows: [{ in_flight }] } = await db.query(
     `SELECT COUNT(*)::int AS in_flight FROM scheduled_calls WHERE status = 'in_progress'`
@@ -182,6 +202,8 @@ async function claimPending(batchSize = 10) {
       SELECT id FROM scheduled_calls
       WHERE status = 'pending' AND scheduled_at <= NOW()
         ${extraWhere}
+        ${scopeClause}
+        ${autoClause}
         ${busyPhoneFilter}
       ORDER BY scheduled_at ASC
       LIMIT $1
@@ -267,7 +289,7 @@ async function advanceToNextWindow(id, nextWindowAt) {
 async function existsForJob(companyId, jobId, callType, isPreview = false) {
   const statusClause = isPreview
     ? `AND status IN ('pending','in_progress')`
-    : `AND status NOT IN ('failed','cancelled')`;
+    : `AND status NOT IN ('failed','cancelled', 'completed')`;
   const result = await db.query(
     `SELECT 1 FROM scheduled_calls
      WHERE company_id = $1 AND job_id = $2 AND call_type = $3

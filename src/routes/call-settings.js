@@ -59,7 +59,7 @@ router.patch("/", async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
-    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes } = req.body;
+    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled } = req.body;
     const fields = {};
     if (business_hours_start !== undefined) fields.business_hours_start = business_hours_start;
     if (business_hours_end   !== undefined) fields.business_hours_end   = business_hours_end;
@@ -90,6 +90,16 @@ router.patch("/", async (req, res) => {
       if (typeof agent_can_make_changes !== "boolean")
         return res.status(400).json({ error: "agent_can_make_changes must be a boolean" });
       fields.agent_can_make_changes = agent_can_make_changes;
+    }
+    if (auto_schedule_enabled !== undefined) {
+      if (typeof auto_schedule_enabled !== "boolean")
+        return res.status(400).json({ error: "auto_schedule_enabled must be a boolean" });
+      fields.auto_schedule_enabled = auto_schedule_enabled;
+    }
+    if (auto_dispatch_enabled !== undefined) {
+      if (typeof auto_dispatch_enabled !== "boolean")
+        return res.status(400).json({ error: "auto_dispatch_enabled must be a boolean" });
+      fields.auto_dispatch_enabled = auto_dispatch_enabled;
     }
     if (Object.keys(fields).length === 0)
       return res.status(400).json({ error: "No fields to update" });

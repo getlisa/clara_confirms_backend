@@ -23,7 +23,7 @@ router.get("/", async (req, res) => {
       assignedTo: assigned_to ? Number(assigned_to) : undefined,
       limit: limit ? Math.min(Number(limit), 200) : 50,
       offset: offset ? Number(offset) : 0,
-      isTest: is_test === "false",
+      isTest: is_test === "true",
     });
     return res.json({ todos });
   } catch (err) {

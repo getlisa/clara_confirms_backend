@@ -1,5 +1,6 @@
 const express = require("express");
 const { runDispatcher, runDailyJob } = require("../services/scheduler");
+const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const router = express.Router();
 
@@ -34,6 +35,36 @@ router.all("/daily", async (req, res) => {
     return res.json({ ok: true, ...result });
   } catch (err) {
     logger.error("Daily job failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Manual triggers (authenticated, scoped to user's company) ────────────────
+// These bypass the per-company auto_* toggles so the user can fire on demand
+// even when their company has the system cron disabled for that action.
+
+router.post("/daily/manual", authenticate, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    const result = await runDailyJob({ companyId, respectAutoFlag: false });
+    logger.info("Manual daily job complete", { companyId, ...result });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error("Manual daily job failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/run/manual", authenticate, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    const result = await runDispatcher(10, { companyId, respectAutoFlag: false });
+    logger.info("Manual dispatcher run complete", { companyId, ...result });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error("Manual dispatcher run failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });

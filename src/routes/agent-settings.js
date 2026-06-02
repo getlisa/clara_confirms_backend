@@ -124,7 +124,7 @@ router.post("/call-types", async (req, res) => {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
-    const { name, description, days_before } = req.body;
+    const { name, description } = req.body;
 
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: "name is required" });
@@ -135,17 +135,10 @@ router.post("/call-types", async (req, res) => {
     if (await callTypeConfigsDb.nameExists(companyId, name)) {
       return res.status(409).json({ error: "A call type with this name already exists" });
     }
-    if (days_before !== undefined) {
-      const val = Number(days_before);
-      if (!Number.isInteger(val) || val < 1) {
-        return res.status(400).json({ error: "days_before must be an integer >= 1" });
-      }
-    }
 
     const call_type = await callTypeConfigsDb.create(companyId, {
       name: String(name).trim(),
       description: String(description).trim(),
-      days_before: days_before !== undefined ? Number(days_before) : 2,
     });
 
     // New node added to the flow
@@ -166,7 +159,7 @@ router.patch("/call-types/:type", async (req, res) => {
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
     const { type } = req.params;
-    const { enabled, days_before, begin_message, general_prompt, name, description } = req.body;
+    const { enabled, begin_message, general_prompt, name, description } = req.body;
     const fields = {};
 
     if (enabled !== undefined) fields.enabled = Boolean(enabled);
@@ -174,14 +167,6 @@ router.patch("/call-types/:type", async (req, res) => {
     if (general_prompt !== undefined) fields.general_prompt = general_prompt;
     if (name !== undefined) fields.name = String(name).trim();
     if (description !== undefined) fields.description = String(description).trim();
-
-    if (days_before !== undefined) {
-      const val = Number(days_before);
-      if (!Number.isInteger(val) || val < 1) {
-        return res.status(400).json({ error: "days_before must be an integer >= 1" });
-      }
-      fields.days_before = val;
-    }
 
     if (Object.keys(fields).length === 0) {
       return res.status(400).json({ error: "No fields to update" });

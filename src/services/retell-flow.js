@@ -266,7 +266,7 @@ async function syncFlowForCompany(companyId) {
     ),
     db.query(
       // Only include enabled call types — disabled ones get no subagent node
-      `SELECT type, name, description, enabled, days_before, begin_message, general_prompt
+      `SELECT type, name, description, enabled, begin_message, general_prompt
        FROM call_type_configs
        WHERE company_id = $1 AND enabled = true
        ORDER BY is_custom ASC, created_at ASC`,
