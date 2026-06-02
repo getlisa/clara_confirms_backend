@@ -77,10 +77,17 @@ async function list(companyId, { status, type, assignedTo, limit = 50, offset = 
     `SELECT t.*,
             u.first_name || ' ' || u.last_name AS assigned_to_name,
             c.retell_call_id, c.to_number, c.duration_ms, c.appointment_confirmed,
-            c.reschedule_requested, c.cancellation_requested, c.call_summary
+            c.reschedule_requested, c.cancellation_requested, c.call_summary,
+            cu.id          AS customer_id,
+            cu.full_name   AS customer_name,
+            cu.email       AS customer_email,
+            cu.address_line1, cu.city, cu.state, cu.zipcode,
+            sc.call_type, sc.job_id, sc.job_name, sc.appointment_id
      FROM todos t
      LEFT JOIN users u ON u.id = t.assigned_to
      LEFT JOIN calls c ON c.id = t.call_id
+     LEFT JOIN customers cu ON cu.company_id = t.company_id AND cu.phone = c.to_number
+     LEFT JOIN scheduled_calls sc ON sc.retell_call_id = c.retell_call_id
      WHERE ${conditions.join(" AND ")}
      ORDER BY
        CASE t.priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
@@ -88,7 +95,33 @@ async function list(companyId, { status, type, assignedTo, limit = 50, offset = 
      LIMIT $${i++} OFFSET $${i}`,
     values
   );
-  return result.rows;
+  return result.rows.map(rowToTodo);
+}
+
+function rowToTodo(row) {
+  const customerAddress = [row.address_line1, row.city, row.state, row.zipcode].filter(Boolean).join(", ") || null;
+  // Pull joined fields out so the base `todo` object stays clean
+  const {
+    customer_id, customer_name, customer_email,
+    address_line1, city, state, zipcode,
+    call_type, job_id, job_name, appointment_id,
+    ...todoBase
+  } = row;
+
+  return {
+    ...todoBase,
+    customer: customer_id ? {
+      id:      customer_id,
+      name:    customer_name,
+      phone:   row.to_number,
+      email:   customer_email,
+      address: customerAddress,
+    } : null,
+    call_type:      call_type ?? null,
+    job_id:         job_id ?? null,
+    job_name:       job_name ?? null,
+    appointment_id: appointment_id ?? null,
+  };
 }
 
 async function updateStatus(todoId, companyId, { status, notes, actorId }) {
