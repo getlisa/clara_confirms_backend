@@ -8,7 +8,46 @@ const TODO_TYPES = {
   ASKED_FOR_CANCELLATION: "ASKED_FOR_CANCELLATION",
   UNCONFIRMED: "UNCONFIRMED",
   APPOINTMENT_NEEDED: "APPOINTMENT_NEEDED",
+  MISSING_PHONE: "MISSING_PHONE",
 };
+
+/**
+ * Create a MISSING_PHONE todo when the scheduler can't place a call because the
+ * customer or technician has no phone number. Idempotent: re-uses any existing
+ * open todo for the same (company, type, job_id, subject_kind).
+ */
+async function createMissingPhone({ companyId, jobId, subjectKind, subjectName, callType, reason, metadata = {}, isTest = false }) {
+  const existing = await db.query(
+    `SELECT id FROM todos
+     WHERE company_id = $1 AND type = 'MISSING_PHONE' AND status = 'open' AND is_test = $2
+       AND metadata->>'job_id' = $3
+       AND metadata->>'subject_kind' = $4
+     LIMIT 1`,
+    [companyId, isTest, String(jobId), subjectKind]
+  );
+  if (existing.rows.length > 0) return existing.rows[0];
+
+  const fullMeta = {
+    job_id: String(jobId),
+    subject_kind: subjectKind,         // 'customer' | 'technician'
+    subject_name: subjectName || null,
+    call_type: callType || null,
+    reason: reason || "Phone number not provided",
+    ...metadata,
+  };
+  const r = await db.query(
+    `INSERT INTO todos (company_id, type, priority, is_test, metadata, notes)
+     VALUES ($1, 'MISSING_PHONE', 'high', $2, $3, $4) RETURNING *`,
+    [companyId, isTest, JSON.stringify(fullMeta), fullMeta.reason]
+  );
+  const todo = r.rows[0];
+  await db.query(
+    `INSERT INTO todo_logs (todo_id, company_id, actor_type, event_type, change)
+     VALUES ($1, $2, 'system', 'created', $3)`,
+    [todo.id, companyId, JSON.stringify({ type: "MISSING_PHONE", priority: "high", subjectKind, jobId })]
+  );
+  return todo;
+}
 
 /**
  * Derive todo type(s) from post-call analysis outcome.
@@ -182,4 +221,4 @@ async function getLogs(todoId, companyId) {
   return result.rows;
 }
 
-module.exports = { TODO_TYPES, deriveTodoType, create, list, updateStatus, assign, getLogs };
+module.exports = { TODO_TYPES, deriveTodoType, create, createMissingPhone, list, updateStatus, assign, getLogs };

@@ -15,6 +15,7 @@ const {
   resetDefaultPromptsForAllCompanies,
   syncPromptsForAllCompanies,
 } = require("../services/prompt-sync");
+const crmRegistry = require("../services/crm");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -86,6 +87,73 @@ router.post("/sync-prompts", async (req, res) => {
     return res.json({ ok: true, reset: !!reset, ...syncResult, resetUpdated: resetResult?.total ?? null });
   } catch (err) {
     logger.error("Admin sync-prompts failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/crm-sync — iterate every active company with a CRM integration,
+// run each provider's syncAll. Used by the daily Vercel cron and as a manual
+// trigger. Optional ?provider=servicetrade to scope to one CRM.
+//
+// Iterates per (company × provider) pair so future BuildOps/ServiceTitan plug in
+// automatically as long as they register a provider and have credentials.
+// `router.all` so Vercel cron's GET requests match (manual triggers use POST).
+router.all("/crm-sync", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const requestedProvider = req.query.provider ? String(req.query.provider) : null;
+    const slugs = requestedProvider
+      ? [requestedProvider]
+      : crmRegistry.listProviders();
+
+    if (slugs.length === 0) {
+      logger.info("Admin crm-sync: no providers registered");
+      return res.json({ ok: true, byProvider: {} });
+    }
+
+    const byProvider = {};
+    for (const slug of slugs) {
+      let provider;
+      try { provider = crmRegistry.getProvider(slug); }
+      catch (err) {
+        byProvider[slug] = { error: err.message };
+        continue;
+      }
+
+      // Find companies that have a credential row for this provider.
+      // ServiceTrade uses `servicetrade_integration` — future CRMs will follow
+      // the `<slug>_integration` convention. Generalize when we add another.
+      const credTable = `${slug}_integration`;
+      let companies = [];
+      try {
+        const { rows } = await db.query(
+          `SELECT company_id FROM ${credTable}
+           WHERE is_active = true AND auth_code IS NOT NULL AND auth_code <> ''`
+        );
+        companies = rows.map(r => Number(r.company_id));
+      } catch (err) {
+        logger.warn(`Admin crm-sync: ${credTable} not queryable — skipping ${slug}`, { error: err.message });
+        byProvider[slug] = { error: `credential table missing: ${credTable}` };
+        continue;
+      }
+
+      const perCompany = [];
+      for (const companyId of companies) {
+        try {
+          const r = await provider.syncAll(companyId);
+          perCompany.push({ companyId, ok: r.ok, counts: r.counts, error: r.error });
+        } catch (err) {
+          logger.error("Admin crm-sync: company failed", { provider: slug, companyId, error: err.message });
+          perCompany.push({ companyId, ok: false, error: err.message });
+        }
+      }
+      byProvider[slug] = { companies: perCompany.length, results: perCompany };
+    }
+
+    logger.info("Admin: CRM sync complete", { providers: slugs, byProvider });
+    return res.json({ ok: true, byProvider });
+  } catch (err) {
+    logger.error("Admin crm-sync failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });

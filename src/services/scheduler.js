@@ -3,6 +3,7 @@ const callSettingsDb = require("../db/call-settings");
 const callTriggerConfigsDb = require("../db/call-trigger-configs");
 const callTypeConfigsDb = require("../db/call-type-configs");
 const scheduledCallsDb = require("../db/scheduled-calls");
+const todosDb = require("../db/todos");
 const retell = require("./retell");
 const logger = require("../utils/logger");
 
@@ -353,7 +354,6 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
        AND j.status IN ('scheduled','rescheduled')
        AND (a.customer_confirmed IS NULL OR a.customer_confirmed = false)
        AND ${dateFilter}
-       AND c.phone IS NOT NULL
      ORDER BY j.id, a.scheduled_start ASC`,
     params
   );
@@ -363,6 +363,16 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
   let c = 0, s = 0;
   for (const row of rows) {
     const jobId = String(row.job_id);
+    if (!row.customer_phone) {
+      await todosDb.createMissingPhone({
+        companyId, jobId, subjectKind: "customer",
+        subjectName: row.customer_name, callType: trigger.call_type,
+        reason: "Customer phone number not provided — confirmation call could not be placed.",
+        isTest: isDev,
+      });
+      logger.info("Scheduler [scheduled_unconfirmed]: todo created — customer missing phone", { companyId, jobId, customer: row.customer_name });
+      s++; continue;
+    }
     if (await scheduledCallsDb.existsForCustomerJob(companyId, jobId, trigger.call_type, isDev)) {
       logger.info("Scheduler [scheduled_unconfirmed]: skipped — call already exists", {
         companyId, jobId, jobName: row.job_name, customer: row.customer_name,
@@ -411,7 +421,6 @@ async function processQuotationPending(companyId, trigger, callSettings, tz) {
      WHERE q.company_id = $1
        AND q.status = ANY($2::varchar[])
        AND q.created_at <= $3
-       AND c.phone IS NOT NULL
        AND NOT EXISTS (
          SELECT 1 FROM jobs j
          WHERE j.id = q.job_id AND j.status = 'completed'
@@ -429,6 +438,17 @@ async function processQuotationPending(companyId, trigger, callSettings, tz) {
   let c = 0, s = 0;
   for (const row of rows) {
     const jobId = scheduledCallsDb.quotationJobId(row.quotation_id);
+    if (!row.customer_phone) {
+      await todosDb.createMissingPhone({
+        companyId, jobId: row.job_id || jobId, subjectKind: "customer",
+        subjectName: row.customer_name, callType: trigger.call_type,
+        reason: "Customer phone number not provided — quotation follow-up call could not be placed.",
+        metadata: { quotation_id: row.quotation_id },
+        isTest: isDev,
+      });
+      logger.info("Scheduler [quotation_pending]: todo created — customer missing phone", { companyId, quotationId: row.quotation_id, customer: row.customer_name });
+      s++; continue;
+    }
     if (await scheduledCallsDb.existsForQuotation(companyId, row.quotation_id, row.job_id, trigger.call_type, isDev)) {
       logger.info("Scheduler [quotation_pending]: skipped — call already exists", {
         companyId, quotationId: row.quotation_id, jobName: row.quote_title, customer: row.customer_name,
@@ -482,7 +502,6 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
     WHERE j.company_id = $1
       AND j.status = 'open'
       AND ${dateClause}
-      AND c.phone IS NOT NULL
       AND NOT EXISTS (
         SELECT 1 FROM appointments ap
         WHERE ap.job_id = j.id AND ap.status NOT IN ('cancelled')
@@ -497,6 +516,16 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
   let c = 0, s = 0;
   for (const row of rows) {
     const jobId = String(row.job_id);
+    if (!row.customer_phone) {
+      await todosDb.createMissingPhone({
+        companyId, jobId, subjectKind: "customer",
+        subjectName: row.customer_name, callType: trigger.call_type,
+        reason: "Customer phone number not provided — due-soon job confirmation could not be placed.",
+        isTest: isDev,
+      });
+      logger.info("Scheduler [open_job_due_soon]: todo created — customer missing phone", { companyId, jobId, customer: row.customer_name });
+      s++; continue;
+    }
     if (await scheduledCallsDb.existsForCustomerJob(companyId, jobId, trigger.call_type, isDev)) {
       logger.info("Scheduler [open_job_due_soon]: skipped — call already exists", {
         companyId, jobId, jobName: row.job_name, customer: row.customer_name,
@@ -555,7 +584,6 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
        AND a.technician_id IS NOT NULL
        AND (a.technician_confirmed IS NULL OR a.technician_confirmed = false)
        AND ${dateFilter}
-       AND t.phone IS NOT NULL
        AND t.is_active = true`,
     techParams
   );
@@ -565,6 +593,17 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
   let c = 0, s = 0;
   for (const row of rows) {
     const jobId = String(row.job_id);
+    if (!row.technician_phone) {
+      await todosDb.createMissingPhone({
+        companyId, jobId, subjectKind: "technician",
+        subjectName: row.technician_name, callType: trigger.call_type,
+        reason: "Technician phone number not provided — confirmation call could not be placed.",
+        metadata: { appointment_id: row.appointment_id || null, customer_name: row.customer_name || null },
+        isTest: isDev,
+      });
+      logger.info("Scheduler [technician_unconfirmed]: todo created — technician missing phone", { companyId, jobId, technician: row.technician_name });
+      s++; continue;
+    }
     if (await scheduledCallsDb.existsForJob(companyId, jobId, trigger.call_type, isDev)) {
       logger.info("Scheduler [technician_unconfirmed]: skipped — call already exists", {
         companyId, jobId, jobName: row.job_name, technician: row.technician_name,

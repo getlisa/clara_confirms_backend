@@ -8,7 +8,7 @@ const express = require("express");
 const config = require("../config");
 const { authenticate } = require("../auth/auth.middleware");
 const servicetrade = require("../services/servicetrade");
-const servicetradeSync = require("../services/servicetrade-sync");
+const crm = require("../services/crm");
 const credentialsDb = require("../db/servicetrade-credentials");
 const syncDb = require("../db/servicetrade-sync");
 const logger = require("../utils/logger");
@@ -40,7 +40,9 @@ router.post("/credentials", async (req, res) => {
         error: "Invalid ServiceTrade credentials",
       });
     }
-    await credentialsDb.upsert(companyId, username.trim(), result.authToken, metadata);
+    // Store the full Cookie header value (e.g. "PHPSESSID=abc") in auth_code.
+    // This survives indefinitely until ServiceTrade invalidates the session.
+    await credentialsDb.upsert(companyId, username.trim(), result.cookie, metadata);
     return res.json({
       connected: true,
       user: result.user,
@@ -137,9 +139,10 @@ router.post("/sync", async (req, res) => {
   const full = req.query.full === "true" || req.query.full === true;
 
   try {
-    const result = await servicetradeSync.runSync(companyId, { full });
-    if (!result.success) {
-      return res.status(400).json({ error: result.error });
+    const provider = crm.getProvider("servicetrade");
+    const result = await provider.syncAll(companyId, { full });
+    if (!result.ok) {
+      return res.status(400).json({ error: result.error, counts: result.counts });
     }
     return res.json({ success: true, counts: result.counts });
   } catch (err) {
@@ -153,30 +156,20 @@ router.post("/sync", async (req, res) => {
 
 /**
  * GET /integrations/servicetrade/customers
- * List ST companies (customers). Query: includeInactive=true to include inactive.
+ * List synced ServiceTrade customers (raw rows from servicetrade_customers).
+ * Query: includeInactive=true|false (default false), page, perPage (max 200).
  */
 router.get("/customers", async (req, res) => {
   const companyId = req.user.companyId;
   const includeInactive = req.query.includeInactive === "true";
-  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const page    = Math.max(parseInt(req.query.page, 10)    || 1, 1);
   const perPage = Math.min(Math.max(parseInt(req.query.perPage, 10) || 50, 1), 200);
 
   try {
-    const { rows, total } = await syncDb.listCompanies(companyId, includeInactive, page, perPage);
-    const stCompanyIds = rows.map((r) => Number(r.servicetrade_id));
-    const locationCounts = await syncDb.countLocationsByStCompanyBulk(companyId, stCompanyIds);
-    const withCounts = rows.map((r) => ({
-      ...r,
-      location_count: locationCounts.get(Number(r.servicetrade_id)) || 0,
-    }));
+    const { rows, total } = await syncDb.listCustomers(companyId, { includeInactive, page, perPage });
     return res.json({
-      customers: withCounts,
-      pagination: {
-        page,
-        perPage,
-        total,
-        totalPages: Math.max(Math.ceil(total / perPage), 1),
-      },
+      customers: rows,
+      pagination: { page, perPage, total, totalPages: Math.max(Math.ceil(total / perPage), 1) },
     });
   } catch (err) {
     logger.error("ServiceTrade customers list error", { error: err.message });
@@ -185,99 +178,57 @@ router.get("/customers", async (req, res) => {
 });
 
 /**
- * GET /integrations/servicetrade/customers/:servicetradeCompanyId/locations
- * List locations for one ST company. Query: includeInactive=true.
+ * GET /integrations/servicetrade/jobs
+ * List synced ServiceTrade jobs. Query: customerId (ServiceTrade customer id), page, perPage.
  */
-router.get("/customers/:servicetradeCompanyId/locations", async (req, res) => {
+router.get("/jobs", async (req, res) => {
   const companyId = req.user.companyId;
-  const servicetradeCompanyId = parseInt(req.params.servicetradeCompanyId, 10);
-  const includeInactive = req.query.includeInactive === "true";
-
-  if (Number.isNaN(servicetradeCompanyId)) {
-    return res.status(400).json({ error: "Invalid company id" });
-  }
+  const customerId = req.query.customerId ? Number(req.query.customerId) : null;
+  const page    = Math.max(parseInt(req.query.page, 10)    || 1, 1);
+  const perPage = Math.min(Math.max(parseInt(req.query.perPage, 10) || 50, 1), 200);
 
   try {
-    const locations = await syncDb.listLocationsByStCompany(companyId, servicetradeCompanyId, includeInactive);
-    const locationIds = locations.map((loc) => Number(loc.id));
-    const srCounts = await syncDb.countServiceRequestsByLocationBulk(locationIds);
-    const withCounts = locations.map((loc) => ({
-      ...loc,
-      service_request_count: srCounts.get(Number(loc.id)) || 0,
-    }));
-    return res.json({ locations: withCounts });
+    const jobs = await syncDb.listJobs(companyId, { customerId, page, perPage });
+    return res.json({ jobs });
   } catch (err) {
-    logger.error("ServiceTrade locations list error", { error: err.message });
-    return res.status(500).json({ error: "Failed to list locations" });
+    logger.error("ServiceTrade jobs list error", { error: err.message });
+    return res.status(500).json({ error: "Failed to list jobs" });
   }
 });
 
 /**
- * GET /integrations/servicetrade/customers/:servicetradeCompanyId/detail
- * Company detail: company info + locations each with address, contacts, service_requests.
+ * GET /integrations/servicetrade/appointments
+ * List synced ServiceTrade appointments. Query: jobId (ServiceTrade job id), page, perPage.
  */
-router.get("/customers/:servicetradeCompanyId/detail", async (req, res) => {
+router.get("/appointments", async (req, res) => {
   const companyId = req.user.companyId;
-  const servicetradeCompanyId = parseInt(req.params.servicetradeCompanyId, 10);
-  const includeInactive = req.query.includeInactive === "true";
-
-  if (Number.isNaN(servicetradeCompanyId)) {
-    return res.status(400).json({ error: "Invalid company id" });
-  }
+  const jobId = req.query.jobId ? Number(req.query.jobId) : null;
+  const page    = Math.max(parseInt(req.query.page, 10)    || 1, 1);
+  const perPage = Math.min(Math.max(parseInt(req.query.perPage, 10) || 50, 1), 200);
 
   try {
-    const company = await syncDb.getStCompanyById(companyId, servicetradeCompanyId);
-    if (!company) {
-      return res.status(404).json({ error: "Company not found" });
-    }
-    const locations = await syncDb.listLocationsByStCompany(companyId, servicetradeCompanyId, includeInactive);
-    const locationsWithDetail = await Promise.all(
-      locations.map(async (loc) => {
-        const [contacts, service_requests] = await Promise.all([
-          syncDb.listContactsByLocation(companyId, loc.id),
-          syncDb.listServiceRequestsByLocation(companyId, loc.id),
-        ]);
-        return { ...loc, contacts, service_requests };
-      })
-    );
-    return res.json({ company, locations: locationsWithDetail });
+    const appointments = await syncDb.listAppointments(companyId, { jobId, page, perPage });
+    return res.json({ appointments });
   } catch (err) {
-    logger.error("ServiceTrade company detail error", { error: err.message });
-    return res.status(500).json({ error: "Failed to load company detail" });
+    logger.error("ServiceTrade appointments list error", { error: err.message });
+    return res.status(500).json({ error: "Failed to list appointments" });
   }
 });
 
 /**
- * GET /integrations/servicetrade/locations/:locationId
- * Location detail with service requests, contacts, assets.
+ * GET /integrations/servicetrade/technicians
+ * List synced ServiceTrade technicians. Query: includeInactive=true|false.
  */
-router.get("/locations/:locationId", async (req, res) => {
+router.get("/technicians", async (req, res) => {
   const companyId = req.user.companyId;
-  const locationId = parseInt(req.params.locationId, 10);
-
-  if (Number.isNaN(locationId)) {
-    return res.status(400).json({ error: "Invalid location id" });
-  }
+  const includeInactive = req.query.includeInactive === "true";
 
   try {
-    const location = await syncDb.getLocationById(companyId, locationId);
-    if (!location) {
-      return res.status(404).json({ error: "Location not found" });
-    }
-    const [serviceRequests, contacts, assets] = await Promise.all([
-      syncDb.listServiceRequestsByLocation(companyId, locationId),
-      syncDb.listContactsByLocation(companyId, locationId),
-      syncDb.listAssetsByLocation(companyId, locationId),
-    ]);
-    return res.json({
-      location,
-      service_requests: serviceRequests,
-      contacts,
-      assets,
-    });
+    const technicians = await syncDb.listTechnicians(companyId, { includeInactive });
+    return res.json({ technicians });
   } catch (err) {
-    logger.error("ServiceTrade location detail error", { error: err.message });
-    return res.status(500).json({ error: "Failed to load location" });
+    logger.error("ServiceTrade technicians list error", { error: err.message });
+    return res.status(500).json({ error: "Failed to list technicians" });
   }
 });
 
