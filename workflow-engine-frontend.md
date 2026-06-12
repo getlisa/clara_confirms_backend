@@ -495,7 +495,18 @@ null` — the next 2-minute cron tick will pick it up.
 | 400 | `{ok:false, status:400, error:"trigger_type 'open_job_due_soon' requires job_id"}` | missing/invalid trigger_type, missing target_id, or trigger not configured for company |
 | 404 | `{ok:false, status:404, error:"Appointment not found"}` | target_id doesn't exist for caller's company |
 | 409 | `{ok:false, status:409, error:"A scheduled call already exists for this target. Pass force:true to override."}` | dedup hit; retry with `force:true` |
-| 422 | `{ok:false, status:422, error:"Customer phone number not provided", subject:"customer"}` | found but cannot dial. `subject` is `"customer"` or `"technician"` so the UI can deep-link to the right edit screen |
+| 422 | `{ok:false, status:422, code:"...", error:"..."}` | found but cannot dial — see codes below |
+
+### 422 codes
+
+| code | When | UI suggestion |
+|---|---|---|
+| `appointment_cancelled` | appointment.status = 'cancelled' | Show "This appointment was cancelled" with link to reschedule |
+| `appointment_in_past` | appointment.scheduled_start < now | Show "This appointment has already passed"; offer to reschedule |
+| `job_closed` | job.status ∈ ('cancelled', 'completed') | Disable Call button on closed jobs |
+| `job_in_past` | job.scheduled_date < today | Disable Call button on overdue jobs |
+| `no_technician` | appointment.technician_id is null | Prompt user to assign a technician first |
+| `missing_phone` | customer/technician phone is null. Includes `subject:"customer"\|"technician"` so the UI can deep-link to the right edit screen | Toast with "Edit customer/technician" action |
 
 ## UI patterns
 

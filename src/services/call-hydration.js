@@ -22,7 +22,7 @@ function joinAddress(row) {
 // ── scheduled_unconfirmed (customer) — by appointment_id ────────────────────
 async function hydrateScheduledUnconfirmed(companyId, appointmentId) {
   const { rows } = await db.query(
-    `SELECT a.id AS appointment_id, a.scheduled_start,
+    `SELECT a.id AS appointment_id, a.scheduled_start, a.status AS appointment_status,
             j.id AS job_id, j.scheduled_date, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
             c.phone AS customer_phone, c.full_name AS customer_name,
@@ -36,8 +36,14 @@ async function hydrateScheduledUnconfirmed(companyId, appointmentId) {
   );
   const row = rows[0];
   if (!row) return { ok: false, status: 404, error: "Appointment not found" };
+  if (row.appointment_status === "cancelled") {
+    return { ok: false, status: 422, code: "appointment_cancelled", error: "Appointment is cancelled" };
+  }
+  if (row.scheduled_start && new Date(row.scheduled_start) < new Date()) {
+    return { ok: false, status: 422, code: "appointment_in_past", error: "Appointment scheduled time has already passed" };
+  }
   if (!row.customer_phone) {
-    return { ok: false, status: 422, error: "Customer phone number not provided", subject: "customer" };
+    return { ok: false, status: 422, code: "missing_phone", error: "Customer phone number not provided", subject: "customer" };
   }
   const jobId = String(row.job_id);
   return {
@@ -62,7 +68,7 @@ async function hydrateScheduledUnconfirmed(companyId, appointmentId) {
 // ── technician_unconfirmed (technician) — by appointment_id ─────────────────
 async function hydrateTechnicianUnconfirmed(companyId, appointmentId) {
   const { rows } = await db.query(
-    `SELECT a.id AS appointment_id, a.scheduled_start, a.technician_id,
+    `SELECT a.id AS appointment_id, a.scheduled_start, a.status AS appointment_status, a.technician_id,
             j.id AS job_id, j.scheduled_date,
             j.title AS job_name, j.description AS job_description, j.job_type,
             t.phone AS technician_phone, t.first_name || ' ' || t.last_name AS technician_name,
@@ -79,11 +85,17 @@ async function hydrateTechnicianUnconfirmed(companyId, appointmentId) {
   );
   const row = rows[0];
   if (!row) return { ok: false, status: 404, error: "Appointment not found" };
+  if (row.appointment_status === "cancelled") {
+    return { ok: false, status: 422, code: "appointment_cancelled", error: "Appointment is cancelled" };
+  }
+  if (row.scheduled_start && new Date(row.scheduled_start) < new Date()) {
+    return { ok: false, status: 422, code: "appointment_in_past", error: "Appointment scheduled time has already passed" };
+  }
   if (!row.technician_id) {
-    return { ok: false, status: 422, error: "No technician assigned to this appointment", subject: "technician" };
+    return { ok: false, status: 422, code: "no_technician", error: "No technician assigned to this appointment", subject: "technician" };
   }
   if (!row.technician_phone) {
-    return { ok: false, status: 422, error: "Technician phone number not provided", subject: "technician" };
+    return { ok: false, status: 422, code: "missing_phone", error: "Technician phone number not provided", subject: "technician" };
   }
   const jobId = String(row.job_id);
   return {
@@ -109,7 +121,7 @@ async function hydrateTechnicianUnconfirmed(companyId, appointmentId) {
 // ── open_job_due_soon (customer) — by job_id ────────────────────────────────
 async function hydrateOpenJobDueSoon(companyId, jobIdInput) {
   const { rows } = await db.query(
-    `SELECT j.id AS job_id, j.scheduled_date,
+    `SELECT j.id AS job_id, j.scheduled_date, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
             c.phone AS customer_phone, c.full_name AS customer_name,
             c.address_line1, c.city, c.state
@@ -121,8 +133,20 @@ async function hydrateOpenJobDueSoon(companyId, jobIdInput) {
   );
   const row = rows[0];
   if (!row) return { ok: false, status: 404, error: "Job not found" };
+  if (row.job_status === "cancelled" || row.job_status === "completed") {
+    return { ok: false, status: 422, code: "job_closed", error: `Job is ${row.job_status}` };
+  }
+  // job.scheduled_date is a DATE (no time/tz). "Past" means strictly before
+  // today — a job due today is still callable.
+  if (row.scheduled_date) {
+    const dueDate = new Date(row.scheduled_date);
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    if (dueDate < today) {
+      return { ok: false, status: 422, code: "job_in_past", error: "Job scheduled date has already passed" };
+    }
+  }
   if (!row.customer_phone) {
-    return { ok: false, status: 422, error: "Customer phone number not provided", subject: "customer" };
+    return { ok: false, status: 422, code: "missing_phone", error: "Customer phone number not provided", subject: "customer" };
   }
   const jobId = String(row.job_id);
   return {
