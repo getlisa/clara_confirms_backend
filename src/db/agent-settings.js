@@ -1,25 +1,26 @@
 const db = require("./index");
 
 // Fields updatable by the user (representative_name only — prompts live on call_type_configs)
-const USER_FIELDS = ["representative_name"];
+const USER_FIELDS = ["representative_name", "voice_id"];
 
 
 function rowToObject(row) {
   return {
     representative_name: row.representative_name ?? null,
+    voice_id:            row.voice_id ?? null,
     subagent_count:      Number(row.subagent_count ?? 0),
   };
 }
 
 async function getByCompanyId(companyId) {
   const result = await db.query(
-    `SELECT representative_name, subagent_count
+    `SELECT representative_name, voice_id, subagent_count
      FROM agent_settings WHERE company_id = $1`,
     [companyId]
   );
   return result.rows[0]
     ? rowToObject(result.rows[0])
-    : { representative_name: null, subagent_count: 0 };
+    : { representative_name: null, voice_id: null, subagent_count: 0 };
 }
 
 /**
@@ -40,7 +41,7 @@ async function upsert(companyId, fields) {
      ON CONFLICT (company_id) DO UPDATE SET
        ${setClauses},
        updated_at = NOW()
-     RETURNING representative_name, retell_agent_id, retell_conversation_flow_id, subagent_count`,
+     RETURNING representative_name, voice_id, retell_agent_id, retell_conversation_flow_id, subagent_count`,
     values
   );
   return rowToObject(result.rows[0]);

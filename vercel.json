@@ -32,6 +32,10 @@
     {
       "path": "/admin/crm-sync",
       "schedule": "0 */6 * * *"
+    },
+    {
+      "path": "/admin/engines/gc",
+      "schedule": "0 3 * * *"
     }
   ]
 }

@@ -1,5 +1,7 @@
 const express = require("express");
 const { runDispatcher, runDailyJob } = require("../services/scheduler");
+const schedulerEngine = require("../engines/scheduler-run");
+const engineToken = require("../engines/core/token");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const router = express.Router();
@@ -47,6 +49,23 @@ router.post("/daily/manual", authenticate, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    // Streaming mode: start an engine and return runId+token so the FE can subscribe.
+    if (req.query.stream === "true" || req.query.stream === true) {
+      const engine = await schedulerEngine.start({
+        companyId, respectAutoFlag: false, startedBy: req.user?.id ?? null,
+      });
+      const streamToken = engineToken.sign({ runId: engine.id, companyId });
+      return res.status(202).json({
+        runId:       String(engine.id),
+        kind:        engine.kind,
+        streamToken,
+        streamUrl:   `/engines/${engine.id}/stream?token=${encodeURIComponent(streamToken)}`,
+        snapshotUrl: `/engines/${engine.id}`,
+      });
+    }
+
+    // Legacy blocking mode — keep old contract.
     const result = await runDailyJob({ companyId, respectAutoFlag: false });
     logger.info("Manual daily job complete", { companyId, ...result });
     return res.json({ ok: true, ...result });

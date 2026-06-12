@@ -8,7 +8,9 @@ const express = require("express");
 const config = require("../config");
 const { authenticate } = require("../auth/auth.middleware");
 const servicetrade = require("../services/servicetrade");
-const crm = require("../services/crm");
+const crmSyncEngine = require("../engines/crm-sync");
+const engineToken = require("../engines/core/token");
+const enginesDb = require("../engines/core/db");
 const credentialsDb = require("../db/servicetrade-credentials");
 const syncDb = require("../db/servicetrade-sync");
 const logger = require("../utils/logger");
@@ -137,14 +139,33 @@ router.delete("/session", async (req, res) => {
 router.post("/sync", async (req, res) => {
   const companyId = req.user.companyId;
   const full = req.query.full === "true" || req.query.full === true;
+  const stream = req.query.stream === "true" || req.query.stream === true;
 
   try {
-    const provider = crm.getProvider("servicetrade");
-    const result = await provider.syncAll(companyId, { full });
-    if (!result.ok) {
-      return res.status(400).json({ error: result.error, counts: result.counts });
+    const engine = await crmSyncEngine.start({
+      companyId, provider: "servicetrade", full, startedBy: req.user.id,
+    });
+
+    // Streaming mode: return runId + token immediately so the FE can subscribe
+    // to the SSE feed. Used by the new workflow-engine UI.
+    if (stream) {
+      const streamToken = engineToken.sign({ runId: engine.id, companyId });
+      return res.status(202).json({
+        runId:       String(engine.id),
+        kind:        engine.kind,
+        streamToken,
+        streamUrl:   `/engines/${engine.id}/stream?token=${encodeURIComponent(streamToken)}`,
+        snapshotUrl: `/engines/${engine.id}`,
+      });
     }
-    return res.json({ success: true, counts: result.counts });
+
+    // Blocking mode (legacy contract): wait for the run to terminate and
+    // return the final counts. Old clients keep working unchanged.
+    const finalRun = await waitForRun(engine.id);
+    if (finalRun.status === "failed") {
+      return res.status(400).json({ error: finalRun.error || "Sync failed" });
+    }
+    return res.json({ success: true, runId: String(engine.id), counts: finalRun.result || {} });
   } catch (err) {
     logger.error("ServiceTrade sync route error", { error: err.message });
     return res.status(500).json({
@@ -153,6 +174,21 @@ router.post("/sync", async (req, res) => {
     });
   }
 });
+
+/**
+ * Poll engine_runs until the run is terminal. Backwards-compat helper for the
+ * blocking sync contract — the engine itself runs async in the background.
+ */
+async function waitForRun(runId, { timeoutMs = 4 * 60_000, intervalMs = 500 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const run = await enginesDb.getRun(runId);
+    if (!run) throw new Error(`Engine run ${runId} not found`);
+    if (run.status !== "running") return run;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`Engine run ${runId} did not finish within ${timeoutMs}ms`);
+}
 
 /**
  * GET /integrations/servicetrade/customers

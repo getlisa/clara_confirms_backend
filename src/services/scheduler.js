@@ -230,7 +230,7 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
  *                                         call_settings.auto_schedule_enabled = false.
  *                                         when false (manual trigger), ignore the flag.
  */
-async function runDailyJob({ companyId = null, respectAutoFlag = true } = {}) {
+async function runDailyJob({ companyId = null, respectAutoFlag = true, engine = null } = {}) {
   const env = isDev ? "development" : "production";
   const mode = companyId ? `manual (company ${companyId})` : "cron";
   logger.info(`Daily job: started (${env} mode, ${mode})`);
@@ -268,12 +268,15 @@ async function runDailyJob({ companyId = null, respectAutoFlag = true } = {}) {
 
       for (const trigger of triggers) {
         try {
+          if (engine) await engine.transition("running_trigger", { trigger_type: trigger.trigger_type, company_id: co.id });
           const { c, s } = await processTrigger(co.id, trigger, cs, tz);
           created += c; skipped += s;
+          if (engine) await engine.emit("trigger_done", { trigger_type: trigger.trigger_type, company_id: co.id, scheduled: c, skipped: s });
           logger.info(`Daily job: trigger processed`, {
             companyId: co.id, trigger: trigger.trigger_type, created: c, skipped: s,
           });
         } catch (err) {
+          if (engine) await engine.emit("trigger_error", { trigger_type: trigger.trigger_type, company_id: co.id, error: err.message });
           logger.error("Daily job: trigger error", { companyId: co.id, trigger: trigger.trigger_type, error: err.message });
         }
       }

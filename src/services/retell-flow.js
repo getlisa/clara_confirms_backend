@@ -273,7 +273,7 @@ async function syncFlowForCompany(companyId) {
       [companyId]
     ),
     db.query(
-      `SELECT representative_name FROM agent_settings WHERE company_id = $1`,
+      `SELECT representative_name, voice_id FROM agent_settings WHERE company_id = $1`,
       [companyId]
     ),
   ]);
@@ -283,6 +283,7 @@ async function syncFlowForCompany(companyId) {
 
   const callTypes   = callTypesResult.rows;
   const repName     = agentSettingsResult.rows[0]?.representative_name || "Clara";
+  const voiceId     = agentSettingsResult.rows[0]?.voice_id || config.retell.defaultVoiceId;
   const companyName = company.name;
 
   if (callTypes.length === 0) {
@@ -328,7 +329,7 @@ async function syncFlowForCompany(companyId) {
   const agentParams = {
     response_engine: { type: "conversation-flow", conversation_flow_id: flowId },
     agent_name: `CLARA_${companyName.toUpperCase().replace(/[^A-Z0-9]+/g, "_").substring(0, 40)}`,
-    voice_id:                    config.retell.defaultVoiceId,
+    voice_id:                    voiceId,
     language:                    "en-US",
     enable_backchannel:          true,
     responsiveness:              1,

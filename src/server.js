@@ -29,6 +29,8 @@ const callAnalysisConfigsRoutes = require("./routes/call-analysis-configs");
 const dashboardRoutes = require("./routes/dashboard");
 const dynamicVariablesRoutes = require("./routes/dynamic-variables");
 const adminRoutes = require("./routes/admin");
+const enginesRoutes = require("./routes/engines");
+const manualCallsRoutes = require("./routes/manual-calls");
 
 const app = express();
 
@@ -163,6 +165,13 @@ app.use("/dynamic-variables", dynamicVariablesRoutes);
 
 // Admin one-off actions - protected by CRON_SECRET (no JWT auth)
 app.use("/admin", adminRoutes);
+
+// Workflow-engine runs (CRM sync, scheduler-run, ...) — JWT for control,
+// signed query-string token for SSE stream.
+app.use("/engines", enginesRoutes);
+
+// Manual call trigger — UI "Call now" button for any call_type.
+app.use("/calls/manual", manualCallsRoutes);
 
 // 404 handler
 app.use((req, res) => {

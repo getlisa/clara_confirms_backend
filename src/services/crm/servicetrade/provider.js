@@ -44,17 +44,18 @@ class ServiceTradeProvider extends CrmProvider {
 
   /**
    * Pull from ServiceTrade, populate raw tables, then normalize into platform.
+   * Optional `engine` (workflow-engine instance) receives state transitions
+   * and progress events. When omitted (cron path), sync runs silently.
    */
-  async syncAll(companyId, { full = false } = {}) {
+  async syncAll(companyId, { full = false, engine = null } = {}) {
     try {
-      // Step 1: raw sync
-      const rawResult = await stEngine.runSync(companyId, { full });
+      const rawResult = await stEngine.runSync(companyId, { full, engine });
       if (!rawResult.success) {
         return { ok: false, counts: rawResult.counts || {}, error: rawResult.error };
       }
 
-      // Step 2: normalize into platform tables
-      const normResult = await this.normalizeAll(companyId);
+      if (engine) await engine.transition("normalizing", {});
+      const normResult = await this.normalizeAll(companyId, { engine });
 
       const counts = { ...rawResult.counts, normalized: normResult };
       logger.info("ServiceTradeProvider.syncAll done", { companyId, counts });
@@ -70,18 +71,25 @@ class ServiceTradeProvider extends CrmProvider {
    * Order matters: customers first (jobs depend on them), then technicians,
    * then jobs, then appointments (depend on both).
    */
-  async normalizeAll(companyId) {
+  async normalizeAll(companyId, { engine = null } = {}) {
     const counts = { customers: 0, technicians: 0, jobs: 0, appointments: 0 };
 
-    counts.customers   = await this._normalizeCustomers(companyId);
-    counts.technicians = await this._normalizeTechnicians(companyId);
-    counts.jobs        = await this._normalizeJobs(companyId);
-    counts.appointments = await this._normalizeAppointments(companyId);
+    counts.customers   = await this._normalizeCustomers(companyId, engine);
+    if (engine) await engine.emit("entity_done", { entity: "customers", count: counts.customers });
+
+    counts.technicians = await this._normalizeTechnicians(companyId, engine);
+    if (engine) await engine.emit("entity_done", { entity: "technicians", count: counts.technicians });
+
+    counts.jobs        = await this._normalizeJobs(companyId, engine);
+    if (engine) await engine.emit("entity_done", { entity: "jobs", count: counts.jobs });
+
+    counts.appointments = await this._normalizeAppointments(companyId, engine);
+    if (engine) await engine.emit("entity_done", { entity: "appointments", count: counts.appointments });
 
     return counts;
   }
 
-  async _normalizeCustomers(companyId) {
+  async _normalizeCustomers(companyId, engine = null) {
     const { rows: raw } = await db.query(
       "SELECT * FROM servicetrade_customers WHERE company_id = $1",
       [companyId]
@@ -92,12 +100,13 @@ class ServiceTradeProvider extends CrmProvider {
       if (!args) continue;
       await upsertCustomer(args);
       n++;
+      await emitWarnings(engine, "customer", args);
     }
     logger.info("ServiceTradeProvider: normalized customers", { companyId, count: n });
     return n;
   }
 
-  async _normalizeTechnicians(companyId) {
+  async _normalizeTechnicians(companyId, engine = null) {
     const { rows: raw } = await db.query(
       "SELECT * FROM servicetrade_technicians WHERE company_id = $1",
       [companyId]
@@ -108,12 +117,13 @@ class ServiceTradeProvider extends CrmProvider {
       if (!args) continue;
       const r = await techDb.upsertByExternalRef(args);
       if (r) n++;
+      await emitWarnings(engine, "technician", args);
     }
     logger.info("ServiceTradeProvider: normalized technicians", { companyId, count: n });
     return n;
   }
 
-  async _normalizeJobs(companyId) {
+  async _normalizeJobs(companyId, engine = null) {
     const { rows: raw } = await db.query(
       "SELECT * FROM servicetrade_jobs WHERE company_id = $1",
       [companyId]
@@ -135,12 +145,13 @@ class ServiceTradeProvider extends CrmProvider {
       if (!args) continue;
       await upsertJob(args);
       n++;
+      await emitWarnings(engine, "job", args);
     }
     logger.info("ServiceTradeProvider: normalized jobs", { companyId, count: n });
     return n;
   }
 
-  async _normalizeAppointments(companyId) {
+  async _normalizeAppointments(companyId, engine = null) {
     const { rows: raw } = await db.query(
       "SELECT * FROM servicetrade_appointments WHERE company_id = $1",
       [companyId]
@@ -170,6 +181,7 @@ class ServiceTradeProvider extends CrmProvider {
       if (!args) continue;
       await upsertAppointment(args);
       n++;
+      await emitWarnings(engine, "appointment", args);
     }
     logger.info("ServiceTradeProvider: normalized appointments", { companyId, count: n });
     return n;
@@ -297,6 +309,21 @@ async function upsertAppointment(a) {
      JSON.stringify(a.additionalInformation || {})]
   );
   return r.rows[0];
+}
+
+async function emitWarnings(engine, entity, args) {
+  if (!engine) return;
+  const warnings = args?.additionalInformation?.warnings;
+  if (!Array.isArray(warnings) || warnings.length === 0) return;
+  for (const w of warnings) {
+    await engine.emit("warning", {
+      entity,
+      external_ref: args.externalRef,
+      subject_name: args.fullName || `${args.firstName || ""} ${args.lastName || ""}`.trim() || null,
+      code: w.code,
+      message: w.message,
+    });
+  }
 }
 
 module.exports = new ServiceTradeProvider();

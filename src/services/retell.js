@@ -76,4 +76,35 @@ async function createCall({ fromNumber, toNumber, companyId, callType, dynamicVa
   return call;
 }
 
-module.exports = { verifyWebhookSignature, createCall, getClient };
+// ── Voices catalog ──────────────────────────────────────────────────────────
+// Retell's voice catalog changes rarely. Cache the list in-process for 5 min
+// so the Settings page can paginate/filter without round-tripping every render.
+let _voicesCache = { at: 0, list: null };
+const VOICES_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * List all voices available to this Retell account.
+ * @param {object} [opts]
+ * @param {boolean} [opts.refresh=false] — bypass cache and re-fetch.
+ * @returns {Promise<Array<{voice_id:string, voice_name:string, provider:string, gender:string, accent?:string, age?:string, preview_audio_url?:string}>>}
+ */
+async function listVoices({ refresh = false } = {}) {
+  const now = Date.now();
+  if (!refresh && _voicesCache.list && now - _voicesCache.at < VOICES_TTL_MS) {
+    return _voicesCache.list;
+  }
+  const list = await getClient().voice.list();
+  _voicesCache = { at: now, list };
+  return list;
+}
+
+/**
+ * Confirm a voice id exists in the Retell catalog. Cheap because listVoices is cached.
+ */
+async function isVoiceIdValid(voiceId) {
+  if (!voiceId) return false;
+  const list = await listVoices();
+  return list.some((v) => v.voice_id === voiceId);
+}
+
+module.exports = { verifyWebhookSignature, createCall, getClient, listVoices, isVoiceIdValid };

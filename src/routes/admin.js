@@ -16,6 +16,7 @@ const {
   syncPromptsForAllCompanies,
 } = require("../services/prompt-sync");
 const crmRegistry = require("../services/crm");
+const enginesDb = require("../engines/core/db");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -154,6 +155,21 @@ router.all("/crm-sync", async (req, res) => {
     return res.json({ ok: true, byProvider });
   } catch (err) {
     logger.error("Admin crm-sync failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/engines/gc — delete engine_runs older than ?days=30 (default).
+// Wired to a Vercel cron so the table doesn't grow forever.
+router.all("/engines/gc", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const days = Math.max(parseInt(req.query.days, 10) || 30, 1);
+    const deleted = await enginesDb.gcOldRuns(days);
+    logger.info("Admin: engine_runs GC", { days, deleted });
+    return res.json({ ok: true, days, deleted });
+  } catch (err) {
+    logger.error("Admin engines/gc failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });

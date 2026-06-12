@@ -137,6 +137,7 @@ function mapTechnicianRow(u) {
  */
 async function runSync(companyId, options = {}) {
   const full = !!options.full;
+  const engine = options.engine || null;
   const credentials = await credentialsDb.getByCompanyId(companyId);
   if (!credentials) return { success: false, error: "ServiceTrade not connected" };
 
@@ -145,21 +146,26 @@ async function runSync(companyId, options = {}) {
 
   try {
     // --- Customers (/company) ----------------------------------------------
+    if (engine) await engine.transition("fetching_customers", { full });
     const customers = await fetchAllPages(companyId, "/company", "companies", credentials,
       full ? {} : cursorParams(state?.last_customers_updated_at));
     if (customers.length) {
       await syncDb.upsertCustomersBatch(companyId, customers.map(mapCustomerRow));
       counts.customers = customers.length;
     }
+    if (engine) await engine.emit("fetched", { entity: "customers", count: counts.customers });
 
     // --- Technicians (/user?isTech=true) -----------------------------------
+    if (engine) await engine.transition("fetching_technicians", {});
     const techs = await fetchAllPages(companyId, "/user", "users", credentials, { isTech: "true" });
     if (techs.length) {
       await syncDb.upsertTechniciansBatch(companyId, techs.map(mapTechnicianRow));
       counts.technicians = techs.length;
     }
+    if (engine) await engine.emit("fetched", { entity: "technicians", count: counts.technicians });
 
     // --- Jobs + embedded appointments (/job) ------------------------------
+    if (engine) await engine.transition("fetching_jobs", { full });
     const jobs = await fetchAllPages(companyId, "/job", "jobs", credentials,
       full ? {} : cursorParams(state?.last_jobs_updated_at));
     if (jobs.length) {
@@ -178,6 +184,10 @@ async function runSync(companyId, options = {}) {
         await syncDb.upsertAppointmentsBatch(companyId, apptRows);
         counts.appointments = apptRows.length;
       }
+    }
+    if (engine) {
+      await engine.emit("fetched", { entity: "jobs", count: counts.jobs });
+      await engine.emit("fetched", { entity: "appointments", count: counts.appointments });
     }
 
     // Update cursors (bump all to "now"; cursor refinement can be added later)
