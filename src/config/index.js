@@ -52,6 +52,15 @@ module.exports = {
     username: process.env.SERVICETRADE_USERNAME || "",
     password: process.env.SERVICETRADE_PASSWORD || "",
   },
+  copilot: {
+    // LLM providers — failover order is openai → groq (see src/copilot/graph/model.js)
+    openaiApiKey: process.env.OPENAI_API_KEY || "",
+    openaiModel:  process.env.COPILOT_OPENAI_MODEL || "gpt-4.1",
+    groqApiKey:   process.env.GROQ_API_KEY || "",
+    groqModel:    process.env.COPILOT_GROQ_MODEL || "llama-3.3-70b-versatile",
+    // LangSmith tracing is enabled purely via env (LANGCHAIN_TRACING_V2, LANGCHAIN_API_KEY,
+    // LANGCHAIN_PROJECT) which the LangChain SDK reads directly — no wiring needed here.
+  },
   retell: {
     apiKey: process.env.RETELL_API_KEY || "",
     webhookSecret: process.env.RETELL_WEBHOOK_SECRET || "",

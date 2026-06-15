@@ -31,6 +31,7 @@ const dynamicVariablesRoutes = require("./routes/dynamic-variables");
 const adminRoutes = require("./routes/admin");
 const enginesRoutes = require("./routes/engines");
 const manualCallsRoutes = require("./routes/manual-calls");
+const copilotRoutes = require("./routes/copilot");
 
 const app = express();
 
@@ -172,6 +173,10 @@ app.use("/engines", enginesRoutes);
 
 // Manual call trigger — UI "Call now" button for any call_type.
 app.use("/calls/manual", manualCallsRoutes);
+
+// AI Copilot — embedded assistant. JWT for control endpoints, signed
+// query-string token for the SSE turn stream.
+app.use("/copilot", copilotRoutes);
 
 // 404 handler
 app.use((req, res) => {
