@@ -113,13 +113,18 @@ const EXTRACT_VARIABLES = {
   technician_confirmation: [
     {
       type: "enum", name: "technician_outcome", required: true,
-      choices: ["confirmed", "unavailable", "need_to_check", "no_answer"],
-      description: "Whether the technician confirmed availability for the job.",
+      choices: ["confirmed", "unavailable", "need_to_check", "no_answer", "callback_requested"],
+      description: "Whether the technician confirmed availability for the job. Use 'callback_requested' when the technician asked to be called back at a specific time.",
     },
     {
       type: "string", name: "unavailability_reason", required: false,
       description: "Reason the technician gave for being unavailable.",
       conditional_prompt: "Only extract if technician_outcome is unavailable",
+    },
+    {
+      type: "string", name: "callback_time", required: false,
+      description: "The specific time the technician requested for a callback, e.g. '1pm', 'in 30 minutes', '2:30 PM'.",
+      conditional_prompt: "Only extract if technician_outcome is callback_requested",
     },
     {
       type: "string", name: "technician_notes", required: false,

@@ -4,56 +4,16 @@ const callTriggerConfigsDb = require("../db/call-trigger-configs");
 const callTypeConfigsDb = require("../db/call-type-configs");
 const scheduledCallsDb = require("../db/scheduled-calls");
 const todosDb = require("../db/todos");
+const { computeInitialPriority } = require("./call-priority");
 const retell = require("./retell");
 const logger = require("../utils/logger");
 
 const isDev = process.env.NODE_ENV === "development";
 
-// ── Time helpers ──────────────────────────────────────────────────────────────
-
-function toLocalHHMM(date, tz) {
-  try {
-    const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(date);
-    return `${(p.find(x => x.type === "hour")?.value ?? "00").padStart(2,"0")}:${(p.find(x => x.type === "minute")?.value ?? "00").padStart(2,"0")}`;
-  } catch { return "12:00"; }
-}
-
-function toLocalDayOfWeek(date, tz) {
-  try {
-    const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).formatToParts(date);
-    return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].indexOf(p.find(x => x.type === "weekday")?.value);
-  } catch { return date.getDay(); }
-}
-
-function isWithinActiveHours(s, tz, date = new Date()) {
-  const day = toLocalDayOfWeek(date, tz);
-  if (!s.include_weekends && (day === 0 || day === 6)) return false;
-  const now = toLocalHHMM(date, tz);
-  return now >= s.business_hours_start && now < s.business_hours_end;
-}
-
-function getNextWindowStart(s, tz, from = new Date()) {
-  const c = new Date(from); c.setSeconds(0, 0); c.setMinutes(c.getMinutes() + 1);
-  for (let i = 0; i < 60*24*7; i++) { if (isWithinActiveHours(s, tz, c)) return c; c.setMinutes(c.getMinutes() + 1); }
-  return new Date(from.getTime() + 86400000);
-}
-
-function snapToWindowStart(s, tz, targetDate) {
-  const [h, m] = s.business_hours_start.split(":").map(Number);
-  const c = new Date(new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(targetDate) + `T${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:00`);
-  if (c <= new Date()) return getNextWindowStart(s, tz, new Date());
-  const day = toLocalDayOfWeek(c, tz);
-  if (!s.include_weekends && (day === 0 || day === 6)) return getNextWindowStart(s, tz, c);
-  return c;
-}
-
-function formatDateInTz(date, tz) {
-  try {
-    return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(date);
-  } catch {
-    return date.toISOString().split("T")[0];
-  }
-}
+// ── Time helpers (re-exported from ./office-hours for back-compat) ───────────
+const officeHours = require("./office-hours");
+const { toLocalHHMM, toLocalDayOfWeek, isWithinActiveHours, getNextWindowStart,
+        snapToWindowStart, formatDateInTz } = officeHours;
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
@@ -399,6 +359,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
       jobDescription: row.job_description || null,
       jobType: row.job_type || null,
       scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
+      callPriority: computeInitialPriority({ triggerType: "scheduled_unconfirmed", jobDate: targetDate, tz }),
     });
     if (inserted) c++; else {
       logger.info("Scheduler [scheduled_unconfirmed]: skipped — duplicate on insert", { companyId, jobId });
@@ -473,6 +434,7 @@ async function processQuotationPending(companyId, trigger, callSettings, tz) {
       jobDescription: row.quote_description || null,
       totalAmount: row.total_amount ?? null,
       scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
+      callPriority: computeInitialPriority({ triggerType: "quotation_pending", jobDate: null, tz }),
     });
     if (inserted) c++; else {
       logger.info("Scheduler [quotation_pending]: skipped — duplicate on insert", { companyId, quotationId: row.quotation_id });
@@ -551,6 +513,7 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
       jobDescription: row.job_description || null,
       jobType: row.job_type || null,
       scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
+      callPriority: computeInitialPriority({ triggerType: "open_job_due_soon", jobDate: targetDate, tz }),
     });
     if (inserted) c++; else {
       logger.info("Scheduler [open_job_due_soon]: skipped — duplicate on insert", { companyId, jobId });
@@ -631,6 +594,7 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
       jobDescription: row.job_description || null,
       jobType: row.job_type || null,
       scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
+      callPriority: computeInitialPriority({ triggerType: "technician_unconfirmed", jobDate: targetDate, tz }),
     });
     if (inserted) c++; else {
       logger.info("Scheduler [technician_unconfirmed]: skipped — duplicate on insert", { companyId, jobId });

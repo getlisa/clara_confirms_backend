@@ -111,14 +111,21 @@ async function triggerManualCall({
   }
 
   // ── 5. Insert ──────────────────────────────────────────────────────────────
+  // Manual = user clicked Call Now. Priority is HIGH regardless of due date so
+  // it claims a slot ahead of cron-scheduled NORMAL/LOW work for the same tenant.
+  // immediate=true also bypasses business hours — the Service Manager explicitly
+  // chose to dial now; the cron's office-hours gate doesn't apply to them.
+  // immediate=false rows queue for the next office window like cron-scheduled rows.
   let row;
   try {
     row = await scheduledCallsDb.create({
       companyId,
       ...hydrated.params,
-      scheduledAt: fireAt,
-      isTest:      false,
-      maxAttempts: callSettings.max_attempts ?? 3,
+      scheduledAt:       fireAt,
+      isTest:            false,
+      maxAttempts:       callSettings.max_attempts ?? 3,
+      callPriority:      "high",
+      bypassOfficeHours: immediate === true,
     });
   } catch (err) {
     if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") {

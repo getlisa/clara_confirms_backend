@@ -8,8 +8,10 @@
 const express = require("express");
 const db = require("../db");
 const jobsDb = require("../db/jobs");
+const scheduledCallsDb = require("../db/scheduled-calls");
 const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
+const { parseCallbackTime } = require("../services/callback-time");
 const { authenticate, getCompanyId: getCompanyIdFromToken } = require("../auth");
 
 const router = express.Router();
@@ -368,6 +370,101 @@ router.post("/get_quotation", async (req, res) => {
     return res.json({ quotation: rows[0] });
   } catch (err) {
     logger.error("Tool get_quotation failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── SCHEDULE CALLBACK ─────────────────────────────────────────────────────────
+// Live mid-call tool. Agent invokes this when the customer (or technician) asks
+// to be called back at a specific time. Reuses scheduledCallsDb.scheduleCallback
+// (same DB helper as the post-call analysis path) so the new row gets
+// call_priority='callback' and inherits all parent context (phone, job_id, etc).
+//
+// Lookup: the in-flight scheduled_calls row by retell_call_id from call.call_id.
+// The dispatcher writes retell_call_id at dial time (markCompleted), so by the
+// time the agent calls a tool the row already has it populated.
+
+router.post("/schedule_callback", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(400).json({ error: "company_id is required" });
+
+    const { callback_time, reason } = getArgs(req);
+    if (!callback_time) {
+      return res.status(400).json({ error: "callback_time is required" });
+    }
+
+    const retellCallId = req.body?.call?.call_id;
+    if (!retellCallId) {
+      return res.status(400).json({ error: "call.call_id missing from request" });
+    }
+
+    // Find the in-flight scheduled_call row that triggered this Retell call.
+    const { rows: scRows } = await db.query(
+      `SELECT sc.*, j.scheduled_date AS job_due_date
+       FROM scheduled_calls sc
+       LEFT JOIN jobs j ON j.id::text = sc.job_id AND j.company_id = sc.company_id
+       WHERE sc.retell_call_id = $1 AND sc.company_id = $2 LIMIT 1`,
+      [retellCallId, companyId]
+    );
+    if (scRows.length === 0) {
+      logger.warn("Tool schedule_callback: parent scheduled_call not found", { retellCallId, companyId });
+      return res.status(404).json({ error: "No active call record found for this Retell call" });
+    }
+    const sc = scRows[0];
+
+    const tz = await getCompanyTimezone(companyId);
+    const callbackAt = parseCallbackTime(callback_time, tz);
+    if (!callbackAt) {
+      return res.status(400).json({
+        error: `Could not parse callback_time '${callback_time}'. Use ISO 8601, 12h ('4pm'), 24h ('14:00'), or relative ('in 30 minutes').`,
+      });
+    }
+    if (callbackAt <= new Date()) {
+      return res.status(400).json({ error: "callback_time is in the past — pick a future time." });
+    }
+
+    const created = await scheduledCallsDb.scheduleCallback(sc, callbackAt.toISOString(), sc.job_due_date);
+    if (!created) {
+      return res.status(409).json({
+        error: "Callback could not be scheduled. The requested time is after the job's due date, or a callback is already queued for this job.",
+      });
+    }
+
+    if (reason) {
+      await db.query(
+        `UPDATE scheduled_calls SET job_description = COALESCE(NULLIF(job_description, ''), '') ||
+            CASE WHEN job_description IS NULL OR job_description = '' THEN '' ELSE E'\\n' END ||
+            'Callback reason: ' || $2,
+            updated_at = NOW()
+         WHERE id = $1`,
+        [created.id, String(reason).slice(0, 500)]
+      );
+    }
+
+    // Speakable confirmation in the customer's local time.
+    const speakable = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      weekday: "short", hour: "numeric", minute: "2-digit", hour12: true,
+    }).format(callbackAt);
+
+    logger.info("Tool: schedule_callback", {
+      companyId, parentId: sc.id, scheduledCallId: created.id,
+      callbackAt: callbackAt.toISOString(), tz, jobId: sc.job_id, reason: reason || null,
+    });
+
+    return res.json({
+      success: true,
+      scheduled_callback: {
+        scheduled_call_id: created.id,
+        callback_time_utc: callbackAt.toISOString(),
+        callback_time_local: speakable,
+        timezone: tz,
+      },
+    });
+  } catch (err) {
+    logger.error("Tool schedule_callback failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });

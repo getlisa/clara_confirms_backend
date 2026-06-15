@@ -7,6 +7,7 @@ const todosDb = require("../db/todos");
 const scheduledCallsDb = require("../db/scheduled-calls");
 const db = require("../db");
 const { getNextWindowStart } = require("../services/scheduler");
+const { parseCallbackTime } = require("../services/callback-time");
 const logger = require("../utils/logger");
 
 const isDev = process.env.NODE_ENV === "development";
@@ -277,13 +278,18 @@ async function handleCallAnalyzed(callData) {
 
   // ── Retry / Callback scheduling (production only) ─────────────────────────
   // In dev, is_test=true calls skip this — no retry spam during testing.
+  // `outcome` is sourced from whichever extract variable the call_type emits —
+  // customer_outcome (customer_confirmation), technician_outcome (technician_confirmation),
+  // quote_decision (quotation_followup). All of them use 'callback_requested' as the
+  // sentinel value, so we normalize them into a single field for handleRetryOrCallback.
   if (!isDev && !isTest) {
+    const outcomeStr = custom.customer_outcome ?? custom.technician_outcome ?? custom.quote_decision ?? null;
     await handleRetryOrCallback({
       companyId,
       retellCallId: call_id,
       inVoicemail,
       isNoAnswer,
-      customerOutcome: custom.customer_outcome ?? null,
+      customerOutcome: outcomeStr,
       callbackTime:    custom.callback_time ?? null,
     }).catch(err => logger.error("retry/callback scheduling failed", { error: err.message, callId: call_id }));
   }
@@ -341,7 +347,7 @@ async function handleRetryOrCallback({ companyId, retellCallId, inVoicemail, isN
   // ── RETRY: no-answer or voicemail ─────────────────────────────────────────
   if (inVoicemail || isNoAnswer) {
     const nextWindow = getNextWindowStart(cs, tz); // next business-hours slot
-    const created = await scheduledCallsDb.scheduleRetry(sc, nextWindow.toISOString(), sc.job_due_date, MAX_NO_ANSWER_RETRIES);
+    const created = await scheduledCallsDb.scheduleRetry(sc, nextWindow.toISOString(), sc.job_due_date, MAX_NO_ANSWER_RETRIES, tz);
     if (created) {
       logger.info("Retry scheduled", {
         companyId, parentId: sc.id, retryCount: sc.retry_count + 1,
@@ -356,66 +362,7 @@ async function handleRetryOrCallback({ companyId, retellCallId, inVoicemail, isN
   }
 }
 
-/**
- * Parse a natural-language callback time from the customer into a Date.
- * Handles:
- *   - "1pm" / "2:30 PM" / "14:00"          → today at that time in company tz
- *   - "in 30 minutes" / "in an hour"         → now + duration
- *   - ISO strings (passed directly by agent) → parsed as-is
- *
- * Returns null if the string cannot be interpreted.
- */
-function parseCallbackTime(callbackTime, tz) {
-  if (!callbackTime) return null;
-  const s = String(callbackTime).trim().toLowerCase();
-
-  // ISO format from agent (most reliable)
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)) {
-    const d = new Date(s);
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  const now = new Date();
-
-  // "in X minutes / hours"
-  const relMatch = s.match(/in\s+(\d+|an?)\s+(minute|hour)/i);
-  if (relMatch) {
-    const qty = relMatch[1] === "a" || relMatch[1] === "an" ? 1 : parseInt(relMatch[1], 10);
-    const unit = relMatch[2].startsWith("hour") ? 60 : 1;
-    return new Date(now.getTime() + qty * unit * 60 * 1000);
-  }
-
-  // "1pm", "2:30 PM", "14:00" — today in company timezone
-  const timeMatch = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
-  if (timeMatch) {
-    let hour = parseInt(timeMatch[1], 10);
-    const min = parseInt(timeMatch[2] ?? "0", 10);
-    const meridiem = (timeMatch[3] || "").toLowerCase();
-    if (meridiem === "pm" && hour < 12) hour += 12;
-    if (meridiem === "am" && hour === 12) hour = 0;
-
-    // Build local datetime string in company timezone
-    const todayLocal = new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(now);
-    const localDt = `${todayLocal}T${String(hour).padStart(2,"0")}:${String(min).padStart(2,"0")}:00`;
-
-    // Convert local → UTC using the scheduler helper pattern
-    const naive = new Date(localDt + "Z");
-    const fmt = new Intl.DateTimeFormat("sv-SE", {
-      timeZone: tz,
-      year: "numeric", month: "2-digit", day: "2-digit",
-      hour: "2-digit", minute: "2-digit", second: "2-digit",
-    });
-    let u = naive;
-    for (let i = 0; i < 3; i++) {
-      const localOfU = new Date(fmt.format(u) + "Z");
-      const diff = naive.getTime() - localOfU.getTime();
-      if (Math.abs(diff) < 1000) break;
-      u = new Date(u.getTime() + diff);
-    }
-    return u;
-  }
-
-  return null;
-}
+// parseCallbackTime moved to src/services/callback-time.js (shared with the
+// live schedule_callback Retell tool in routes/retell-tools.js).
 
 module.exports = router;

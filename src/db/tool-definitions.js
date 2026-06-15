@@ -118,7 +118,6 @@ const TOOL_SEEDS = [
       required: ["job_id", "scheduled_start"],
     },
   },
-
   // ── technician_confirmation ─────────────────────────────────────────────────
   {
     call_type: "technician_confirmation",
@@ -155,7 +154,6 @@ const TOOL_SEEDS = [
       required: ["appointment_id"],
     },
   },
-
   // ── quotation_followup ──────────────────────────────────────────────────────
   {
     call_type: "quotation_followup",
@@ -173,6 +171,33 @@ const TOOL_SEEDS = [
         job_id: { type: "string", description: "The job ID for this call. You were given this value at the start of the call — use that exact numeric ID." },
       },
       required: ["job_id"],
+    },
+  },
+
+  // ── Universal tools (attached to every call_type's subagent node) ───────────
+  // Sentinel call_type '_universal' — `registerToolsForCompany` merges these
+  // into every node's tool list so the agent always has them available
+  // regardless of the call's type (built-in or custom).
+  {
+    call_type: "_universal",
+    name: "schedule_callback",
+    description: "Use when the customer or technician asks to be called back at a specific time. Confirm the time with them first, then call this tool. After it returns, tell them the confirmed callback time. Works for any call type — confirmations, quote follow-ups, technician calls, custom call types.",
+    endpoint: "/retell/tools/schedule_callback",
+    speak_during_execution: false,
+    speak_after_execution: true,
+    // Not marked as a write tool — queuing a follow-up call doesn't mutate
+    // customer-facing records (the parent call exists, the callback just creates
+    // a new pending call). Available even when agent_can_make_changes=false so
+    // read-only agents can still honor a "call me back" request.
+    is_write_tool: false,
+    sort_order: 99,
+    parameters: {
+      type: "object",
+      properties: {
+        callback_time: { type: "string", description: "When to call back. Accepts: ISO 8601 (e.g. '2026-06-15T16:00:00'), 12-hour clock ('4pm', '2:30 PM'), 24-hour clock ('14:00'), or a relative duration ('in 30 minutes', 'in an hour'). Times without a date refer to today in the caller's local time." },
+        reason:        { type: "string", description: "Optional. A short note about what they want to discuss when called back." },
+      },
+      required: ["callback_time"],
     },
   },
 ];

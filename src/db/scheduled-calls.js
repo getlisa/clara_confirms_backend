@@ -14,9 +14,9 @@ function quotationDedupeKeys(quotationId, linkedJobId) {
   return [...new Set(keys)];
 }
 
-async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, scheduledAt, isTest = false, maxAttempts = 3 }) {
+async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, scheduledAt, isTest = false, maxAttempts = 3, callPriority, bypassOfficeHours }) {
   try {
-    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, scheduledAt, isTest, maxAttempts });
+    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, scheduledAt, isTest, maxAttempts, callPriority, bypassOfficeHours });
   } catch (err) {
     if (err.code === "23505") {
       const dup = new Error("Duplicate active scheduled call");
@@ -33,6 +33,7 @@ async function insertScheduledCall({
   jobName, jobDescription, jobType, totalAmount,
   scheduledAt, isTest = false, maxAttempts = 3,
   callPriority = "normal", parentCallId = null, retryCount = 0,
+  bypassOfficeHours = false,
 }) {
   const result = await db.query(
     `INSERT INTO scheduled_calls
@@ -40,14 +41,14 @@ async function insertScheduledCall({
         customer_name, technician_name, customer_address,
         job_name, job_description, job_type, total_amount,
         scheduled_at, is_test, max_attempts,
-        call_priority, parent_call_id, retry_count)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        call_priority, parent_call_id, retry_count, bypass_office_hours)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
      RETURNING *`,
     [companyId, callType, phoneNumber, jobId ?? null, jobDate ?? null, appointmentId ?? null,
      customerName ?? null, technicianName ?? null, customerAddress ?? null,
      jobName ?? null, jobDescription ?? null, jobType ?? null, totalAmount ?? null,
      scheduledAt, isTest, maxAttempts,
-     callPriority, parentCallId ?? null, retryCount]
+     callPriority, parentCallId ?? null, retryCount, !!bypassOfficeHours]
   );
   return result.rows[0];
 }
@@ -60,9 +61,12 @@ async function insertScheduledCall({
  *
  * Returns the new scheduled_call row, or null if retry not allowed.
  */
-async function scheduleRetry(originalRow, nextWindowAt, jobDueDate, maxRetries = 3) {
+async function scheduleRetry(originalRow, nextWindowAt, jobDueDate, maxRetries = 3, tz = null) {
   if (originalRow.retry_count >= maxRetries) return null;
   if (jobDueDate && new Date(nextWindowAt) >= new Date(jobDueDate)) return null;
+
+  const { computeRetryPriority } = require("../services/call-priority");
+  const callPriority = computeRetryPriority(originalRow, tz);
 
   try {
     return await insertScheduledCall({
@@ -82,7 +86,7 @@ async function scheduleRetry(originalRow, nextWindowAt, jobDueDate, maxRetries =
       scheduledAt:     nextWindowAt,
       isTest:          originalRow.is_test,
       maxAttempts:     originalRow.max_attempts,
-      callPriority:    "retry",
+      callPriority,
       parentCallId:    originalRow.id,
       retryCount:      originalRow.retry_count + 1,
     });
@@ -128,22 +132,24 @@ async function scheduleCallback(originalRow, callbackAt, jobDueDate) {
 }
 
 // ── Concurrency configuration ─────────────────────────────────────────────────
-const MAX_CONCURRENT_CALLS = 20;  // total in-flight cap
-const PRIORITY_RESERVED    = 5;   // slots always available for retry/callback
+const MAX_CONCURRENT_CALLS    = 20;  // Retell standard-tier system-wide cap
+const PER_TENANT_MIN_CONCURRENT = 2; // minimum guarantee, enforced as a floor on call_settings.max_concurrent_calls
+
+const { priorityRank, PRIORITY_RANK_SQL_CASE } = require("../services/call-priority");
+const { isWithinActiveHours, getNextWindowStart } = require("../services/office-hours");
+const logger = require("../utils/logger");
 
 /**
- * Claim due pending calls respecting priority lanes and concurrency limits.
- *
- * Slots:
- *   - Total cap: MAX_CONCURRENT_CALLS (20)
- *   - PRIORITY_RESERVED (5) are always reserved for retry/callback calls
- *   - Normal calls can only use the remaining (20 - 5 = 15) slots
- *
- * Priority (retry/callback) calls can use any available slot up to the full cap.
- * Normal calls can only use slots when in_flight < 15.
- */
-/**
  * Claim due pending rows for dispatch.
+ *
+ * Concurrency model (replaces the old PRIORITY_RESERVED two-lane approach):
+ *   - System-wide cap: MAX_CONCURRENT_CALLS (20). Hard ceiling.
+ *   - Per-tenant cap:  GREATEST(call_settings.max_concurrent_calls, PER_TENANT_MIN_CONCURRENT).
+ *     Each tenant can hold up to its cap in 'in_progress' simultaneously.
+ *   - Priority ordering: callback < high < retry (legacy) < normal < low,
+ *     ranked inside each tenant's allowed slice AND globally across the batch.
+ *   - Dynamic boost: a tenant with spare cap absorbs system budget unused by
+ *     idle tenants. When the system is saturated, the per-tenant cap shares fairly.
  *
  * @param {number} batchSize
  * @param {object} opts
@@ -156,7 +162,6 @@ const PRIORITY_RESERVED    = 5;   // slots always available for retry/callback
 async function claimPending(batchSize = 10, { companyId = null, respectAutoFlag = true } = {}) {
   // Reaper: any in_progress row stuck for >5 minutes is orphaned (crashed dispatcher,
   // function timeout, etc). Reset to pending so it gets retried on this run.
-  // The 5-minute threshold is safely longer than any normal Retell call setup (~few seconds).
   await db.query(
     `UPDATE scheduled_calls
      SET status = 'pending', updated_at = NOW()
@@ -164,77 +169,141 @@ async function claimPending(batchSize = 10, { companyId = null, respectAutoFlag 
        AND last_attempted_at < NOW() - INTERVAL '5 minutes'`
   );
 
-  // Build scope filters used in the claim SELECT below
-  const scopeClause = companyId ? `AND scheduled_calls.company_id = ${Number(companyId)}` : "";
-  const autoClause  = respectAutoFlag
+  const scopeClause = companyId
+    ? `AND sc.company_id = ${Number(companyId)}`
+    : "";
+  const autoClause = respectAutoFlag
     ? `AND EXISTS (
-         SELECT 1 FROM call_settings cs
-         WHERE cs.company_id = scheduled_calls.company_id AND cs.auto_dispatch_enabled = true
+         SELECT 1 FROM call_settings cs2
+         WHERE cs2.company_id = sc.company_id AND cs2.auto_dispatch_enabled = true
        )`
     : "";
 
-  const { rows: [{ in_flight }] } = await db.query(
-    `SELECT COUNT(*)::int AS in_flight FROM scheduled_calls WHERE status = 'in_progress'`
+  // ── Step A: which tenants have due rows, and are they in their office window?
+  const { rows: candidates } = await db.query(
+    `SELECT DISTINCT sc.company_id,
+            c.default_timezone AS tz,
+            cs.business_hours_start,
+            cs.business_hours_end,
+            COALESCE(cs.include_weekends, false) AS include_weekends
+       FROM scheduled_calls sc
+       JOIN companies c ON c.id = sc.company_id
+       LEFT JOIN call_settings cs ON cs.company_id = sc.company_id
+      WHERE sc.status = 'pending' AND sc.scheduled_at <= NOW()
+        AND sc.bypass_office_hours = false
+        ${scopeClause}`
   );
 
-  const totalAvailable    = Math.max(0, MAX_CONCURRENT_CALLS - in_flight);
-  const normalAvailable   = Math.max(0, (MAX_CONCURRENT_CALLS - PRIORITY_RESERVED) - in_flight);
-  const priorityAvailable = totalAvailable; // priority can use any free slot
+  const now = new Date();
+  const inWindow    = [];
+  const outOfWindow = [];
+  for (const co of candidates) {
+    if (co.business_hours_start && isWithinActiveHours(co, co.tz || "UTC", now)) {
+      inWindow.push(co.company_id);
+    } else {
+      outOfWindow.push(co);
+    }
+  }
 
-  if (totalAvailable === 0) return [];
+  // ── Step B: bulk-reschedule out-of-window rows to that tenant's next window.
+  // Skip rows with bypass_office_hours=true (they must dial regardless).
+  // Skip tenants with no business_hours configured (we don't know when to dial).
+  for (const co of outOfWindow) {
+    if (!co.business_hours_start) {
+      logger.info("Dispatcher: tenant has no business_hours — pending rows will not dispatch", { companyId: co.company_id });
+      continue;
+    }
+    const nextAt = getNextWindowStart(co, co.tz || "UTC", now);
+    const updRes = await db.query(
+      `UPDATE scheduled_calls
+          SET scheduled_at = $2, updated_at = NOW()
+        WHERE company_id = $1
+          AND status = 'pending'
+          AND scheduled_at <= NOW()
+          AND bypass_office_hours = false
+        RETURNING id`,
+      [co.company_id, nextAt]
+    );
+    if (updRes.rowCount > 0) {
+      logger.info("Dispatcher: rescheduled out-of-window rows", {
+        companyId: co.company_id, count: updRes.rowCount, nextAt: nextAt.toISOString(),
+      });
+    }
+  }
 
-  // Same-person dedup: skip any row whose phone_number is already in_progress.
-  // This prevents two calls being placed to the same person simultaneously —
-  // the second call waits in 'pending' until the first one completes/fails.
-  const busyPhoneFilter = `
-    AND NOT EXISTS (
-      SELECT 1 FROM scheduled_calls busy
-      WHERE busy.status = 'in_progress'
-        AND busy.phone_number = scheduled_calls.phone_number
-    )
-  `;
-
-  // Two separate atomic claims — PostgreSQL doesn't allow FOR UPDATE inside UNION.
-  // Priority lane runs first to use its reserved slots; normal lane uses what's left.
-  const claimSql = (extraWhere) => `
-    UPDATE scheduled_calls SET status = 'in_progress', last_attempted_at = NOW(), updated_at = NOW()
-    WHERE id IN (
-      SELECT id FROM scheduled_calls
-      WHERE status = 'pending' AND scheduled_at <= NOW()
-        ${extraWhere}
+  // ── Step C: claim. Allow rows whose tenant is in-window OR whose bypass flag is true.
+  // Single CTE-based claim:
+  //   per_tenant_inflight — current in-progress count per tenant
+  //   tenant_caps         — per-tenant max with floor PER_TENANT_MIN_CONCURRENT
+  //   system_inflight     — total in-progress across all tenants
+  //   due                 — pending rows due now, ranked within their tenant by priority then scheduled_at
+  //   eligible            — rows whose tenant_rank fits inside (cap - in_flight)
+  // The outer UPDATE applies the system-wide cap and batchSize to the priority-ordered list.
+  const claimSql = `
+    WITH per_tenant_inflight AS (
+      SELECT company_id, COUNT(*)::int AS in_flight
+      FROM scheduled_calls
+      WHERE status = 'in_progress'
+      GROUP BY company_id
+    ),
+    tenant_caps AS (
+      SELECT cs.company_id,
+             GREATEST(COALESCE(cs.max_concurrent_calls, 10), ${PER_TENANT_MIN_CONCURRENT}) AS cap
+      FROM call_settings cs
+    ),
+    system_inflight AS (
+      SELECT COUNT(*)::int AS n FROM scheduled_calls WHERE status = 'in_progress'
+    ),
+    due AS (
+      SELECT sc.id, sc.company_id, sc.call_priority, sc.scheduled_at, sc.phone_number,
+             ROW_NUMBER() OVER (
+               PARTITION BY sc.company_id
+               ORDER BY ${PRIORITY_RANK_SQL_CASE}, sc.scheduled_at ASC
+             ) AS tenant_rank
+      FROM scheduled_calls sc
+      WHERE sc.status = 'pending'
+        AND sc.scheduled_at <= NOW()
+        AND (sc.company_id = ANY($2::int[]) OR sc.bypass_office_hours = true)
         ${scopeClause}
         ${autoClause}
-        ${busyPhoneFilter}
-      ORDER BY scheduled_at ASC
-      LIMIT $1
-      FOR UPDATE SKIP LOCKED
+        AND NOT EXISTS (
+          SELECT 1 FROM scheduled_calls busy
+          WHERE busy.status = 'in_progress'
+            AND busy.phone_number = sc.phone_number
+        )
+    ),
+    eligible AS (
+      SELECT d.id, d.call_priority, d.scheduled_at
+      FROM due d
+      LEFT JOIN per_tenant_inflight i ON i.company_id = d.company_id
+      LEFT JOIN tenant_caps         c ON c.company_id = d.company_id
+      WHERE d.tenant_rank <= GREATEST(0, COALESCE(c.cap, 10) - COALESCE(i.in_flight, 0))
     )
-    RETURNING *
+    UPDATE scheduled_calls
+       SET status = 'in_progress', last_attempted_at = NOW(), updated_at = NOW()
+     WHERE id IN (
+       SELECT id FROM eligible
+       ORDER BY ${PRIORITY_RANK_SQL_CASE}, scheduled_at ASC
+       LIMIT LEAST(
+         $1::int,
+         GREATEST(0, ${MAX_CONCURRENT_CALLS} - (SELECT n FROM system_inflight))
+       )
+       FOR UPDATE SKIP LOCKED
+     )
+     RETURNING *
   `;
 
-  const priorityLimit = Math.min(priorityAvailable, batchSize);
-  const priorityResult = priorityLimit > 0
-    ? await db.query(claimSql("AND call_priority IN ('retry','callback')"), [priorityLimit])
-    : { rows: [] };
+  const { rows: claimed } = await db.query(claimSql, [batchSize, inWindow]);
 
-  const remainingBudget = Math.max(0, batchSize - priorityResult.rows.length);
-  const normalLimit = Math.min(normalAvailable, remainingBudget);
-  const normalResult = normalLimit > 0
-    ? await db.query(claimSql("AND call_priority = 'normal'"), [normalLimit])
-    : { rows: [] };
-
-  // Within this batch, also dedup by phone number — keep only the earliest-scheduled
-  // call per phone (priority > normal, then scheduled_at ASC). The rest go back to pending.
-  const claimed = [...priorityResult.rows, ...normalResult.rows];
+  // Within this batch, dedupe by phone number — keep only the earliest-scheduled,
+  // highest-priority call per phone. The rest go back to pending so the next
+  // dispatcher tick can pick them up after the first one finishes.
   const seen = new Set();
   const winners = [];
   const losers  = [];
-  // Sort so winners come first: priority first, then earliest scheduled
-  const priorityRank = { callback: 0, retry: 1, normal: 2 };
   const sorted = [...claimed].sort((a, b) => {
-    const pa = priorityRank[a.call_priority] ?? 2;
-    const pb = priorityRank[b.call_priority] ?? 2;
-    if (pa !== pb) return pa - pb;
+    const pr = priorityRank(a.call_priority) - priorityRank(b.call_priority);
+    if (pr !== 0) return pr;
     return new Date(a.scheduled_at) - new Date(b.scheduled_at);
   });
   for (const row of sorted) {
@@ -323,7 +392,7 @@ async function existsForCustomerJob(companyId, jobId, callType, isPreview = fals
 module.exports = {
   CUSTOMER_CALL_TYPES,
   MAX_CONCURRENT_CALLS,
-  PRIORITY_RESERVED,
+  PER_TENANT_MIN_CONCURRENT,
   quotationJobId,
   create,
   claimPending,

@@ -86,11 +86,19 @@ async function registerToolsForCompany(companyId) {
   // Load all enabled tools from DB, filtered by write permission
   const allToolRows = await toolDefsDb.getAll({ writeToolsEnabled: canMakeChanges });
 
-  // Group by call_type for fast lookup
+  // Split into universal vs per-call-type. Universal tools (call_type='_universal')
+  // attach to every subagent node regardless of the company's call types — used
+  // for cross-cutting capabilities like schedule_callback that any agent might need.
+  const universalTools = [];
   const toolsByCallType = {};
   for (const t of allToolRows) {
+    const built = dbRowToRetellTool(t, baseUrl, companyId);
+    if (t.call_type === "_universal") {
+      universalTools.push(built);
+      continue;
+    }
     if (!toolsByCallType[t.call_type]) toolsByCallType[t.call_type] = [];
-    toolsByCallType[t.call_type].push(dbRowToRetellTool(t, baseUrl, companyId));
+    toolsByCallType[t.call_type].push(built);
   }
 
   const flowId = callTypeRows[0].retell_llm_id;
@@ -105,8 +113,11 @@ async function registerToolsForCompany(companyId) {
 
   let updated = 0;
   for (const row of callTypeRows) {
-    const tools = toolsByCallType[row.type];
-    if (!tools || tools.length === 0) continue;
+    const perTypeTools = toolsByCallType[row.type] || [];
+    // Universal tools always appended. Sort_order=99 on universal tools keeps
+    // them at the end of the agent's tool list (lower-precedence visually).
+    const tools = [...perTypeTools, ...universalTools];
+    if (tools.length === 0) continue;
 
     const nodeIdx = nodes.findIndex(n => n.id === row.retell_subagent_node_id);
     if (nodeIdx === -1) {
@@ -128,6 +139,8 @@ async function registerToolsForCompany(companyId) {
       type: row.type,
       nodeId: row.retell_subagent_node_id,
       toolCount: tools.length,
+      perTypeCount: perTypeTools.length,
+      universalCount: universalTools.length,
       canMakeChanges,
     });
   }
