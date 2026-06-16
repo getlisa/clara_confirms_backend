@@ -29,10 +29,15 @@ const HANDLERS = [
   require("./handlers/read/list-voices"),
   require("./handlers/read/get-agent-config"),
   require("./handlers/read/get-call-settings"),
+  require("./handlers/read/find-call-targets"),
   // write
   require("./handlers/write/set-todo-status"),
   require("./handlers/write/update-agent-config"),
   require("./handlers/write/update-call-settings"),
+  require("./handlers/write/set-call-trigger-enabled"),
+  require("./handlers/write/make-call"),
+  require("./handlers/write/schedule-call"),
+  require("./handlers/write/run-scheduler"),
 ];
 
 /**
