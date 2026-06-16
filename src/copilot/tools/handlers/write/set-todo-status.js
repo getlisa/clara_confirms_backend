@@ -45,7 +45,7 @@ async function run(args, config) {
   const decision = interrupt({ type: "confirm_action", tool: "set_todo_status", args, preview });
 
   if (!decision || decision.decision !== "confirm") {
-    return JSON.stringify({ status: "cancelled", message: "The user did not confirm the change." });
+    return JSON.stringify({ status: "cancelled", message: "The user declined. No change was made. Briefly acknowledge the cancellation; do not ask to confirm again unless the user brings it up." });
   }
 
   const updated = await todosDb.updateStatus(args.todo_id, ctx.companyId, {

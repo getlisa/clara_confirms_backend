@@ -133,7 +133,8 @@ closes after the terminal `done`/`failed` event.
 
 **`EventSource` requires `addEventListener("<type>", …)` per event type** — because every frame
 sets an `event:` name, the default `onmessage` handler will **not** fire. Always attach listeners
-for the types in §3.3 (at minimum `token`, `propose`, `done`, `failed`).
+for the types in §3.3 (at minimum `token`, `message`, `tool_call`, `tool_result`, `propose`,
+`done`, `failed`). See §3.7 for how `token`/`message`/`tool_*` form the four render channels.
 
 ### 3.2 Event envelope
 All events **emitted by the agent** (everything except `token`) carry an envelope: their `data`
@@ -153,9 +154,10 @@ the event's own fields. `token` frames are lightweight: `data` is just `{ "text"
 | `started` | `{ state, ts, kind, companyId, startedAt }` | Turn began. |
 | `provider` | `{ state, ts, provider: "openai" }` | Which LLM answered (primary). |
 | `provider_switch` | `{ state, ts, from: "openai", to: "groq" }` | Failover occurred. |
-| `token` | `{ text }` | **High frequency.** Append `text` to the streaming assistant bubble. |
-| `tool_call` | `{ state, ts, name, args }` | Agent invoked a tool — optional "looking that up…" affordance. |
-| `tool_result` | `{ state, ts, name, result }` | Tool returned. **`result` is structured JSON you can render as cards/tables/props** (see §3.6). Not truncated. |
+| `token` | `{ text, message_id }` | **High frequency.** A live text delta. Append `text` to the bubble grouped by `message_id`. The bubble's *channel* (reasoning vs answer) arrives on the matching `message` event — see §3.7. |
+| `message` | `{ state, ts, message_id, channel, text }` | A completed assistant generation. `channel` is **`"reasoning"`** (intermediate thinking — this generation also made tool calls) or **`"answer"`** (the final reply). `text` is the authoritative full text for that `message_id`. |
+| `tool_call` | `{ state, ts, tool_call_id, name, args }` | Agent invoked a tool — render as a tool-activity chip ("Looking up…"). Pair with its result via `tool_call_id`. |
+| `tool_result` | `{ state, ts, tool_call_id, name, result }` | That tool's response/data (the "tool/API response"). **`result` is structured JSON you can render as cards/tables/props** (see §3.6). Not truncated. Paired to its `tool_call` by `tool_call_id`. |
 | `propose` | `{ state, ts, pendingActionId, tool_name, preview, args, expires_at }` | A write awaits confirmation — render a Confirm/Reject card from `preview`. |
 | `awaiting_confirmation` | `{ state, ts, pendingActionId }` | Turn parked; stream then closes. |
 | `done` | `{ state: "done", ts, result: { status, text?, pendingActionId? } }` | **Terminal.** `result.status` is `"done"` (final answer in `result.text`) or `"awaiting_confirmation"` (a write was proposed; `result.pendingActionId` set). |
@@ -169,10 +171,20 @@ the event's own fields. `token` frames are lightweight: `data` is just `{ "text"
 ### 3.4 `preview` shapes (render the confirmation card from these)
 - `set_todo_status`:
   `{ "entity": "todo", "todo_id": 33, "todo_type": "ASKED_FOR_RESCHEDULE", "from_status": "open", "to_status": "in_progress", "notes": null }`
-- `update_agent_config`:
-  `{ "entity": "agent_config", "changes": [ { "field": "representative_name", "from": "Alex", "to": "Sam" } ] }`
+- `update_agent_config` / `update_call_settings`:
+  `{ "entity": "agent_config" | "call_settings", "changes": [ { "field": "representative_name", "from": "Alex", "to": "Sam" } ] }`
+- `make_call` (place a call now):
+  `{ "entity": "call", "mode": "now", "trigger_type": "scheduled_unconfirmed", "target_field": "appointment_id", "target_id": 42, "customer": "John Smith", "phone": "+1555…", "job_title": "AC tune-up", "scheduled_start": "…", "force": false }`
+- `schedule_call` (call later):
+  `{ "entity": "call", "mode": "scheduled", "trigger_type": "open_job_due_soon", "scheduled_for": "2026-06-16T14:00:00.000Z", "timezone": "America/New_York", "target_field": "job_id", "target_id": 7, "customer": "John Smith", "phone": "+1555…", "force": false }`
+- `run_scheduler` (queue all eligible calls):
+  `{ "entity": "scheduler_run", "enabled_triggers": [ { "trigger_type": "scheduled_unconfirmed", "call_type": "customer_confirmation", "days_before": 2 } ], "note": "…" }`
+- `set_call_trigger_enabled` (toggle a trigger):
+  `{ "entity": "call_trigger", "trigger_type": "scheduled_unconfirmed", "call_type": "customer_confirmation", "from_enabled": false, "to_enabled": true }`
 
-Render generically off `entity` + the before/after fields so new write tools need no FE change.
+Render generically off `entity` + the before/after fields (config/settings/trigger), the call
+summary (`entity:"call"` → who/when), or the trigger list (`entity:"scheduler_run"`). New write
+tools need no FE change.
 
 ### 3.5 Raw example (a read turn)
 ```
@@ -189,19 +201,23 @@ data: {"state":null,"ts":"…","provider":"openai"}
 
 id: 3
 event: tool_call
-data: {"state":null,"ts":"…","name":"count_unconfirmed_jobs","args":{}}
+data: {"state":null,"ts":"…","tool_call_id":"run-abc","name":"count_unconfirmed_jobs","args":{}}
 
 id: 4
 event: tool_result
-data: {"state":null,"ts":"…","name":"count_unconfirmed_jobs","result":{"unconfirmed_jobs":0,"customers_with_unconfirmed_jobs":0}}
+data: {"state":null,"ts":"…","tool_call_id":"run-abc","name":"count_unconfirmed_jobs","result":{"unconfirmed_jobs":0,"customers_with_unconfirmed_jobs":0}}
 
 event: token
-data: {"text":"0 customers "}
+data: {"text":"0 customers ","message_id":"run-def"}
 
 event: token
-data: {"text":"have unconfirmed jobs."}
+data: {"text":"have unconfirmed jobs.","message_id":"run-def"}
 
 id: 5
+event: message
+data: {"state":null,"ts":"…","message_id":"run-def","channel":"answer","text":"0 customers have unconfirmed jobs."}
+
+id: 6
 event: done
 data: {"state":"done","ts":"…","result":{"status":"done","text":"0 customers have unconfirmed jobs."}}
 ```
@@ -243,6 +259,7 @@ These are the `result` payloads on `tool_result` (and the JSON a `tool` message 
 | `list_jobs` | `{ count, jobs: [ { id, title, status, job_type, scheduled_date, customer, technician } ] }` |
 | `list_open_todos` | `{ count, todos: [ { id, type, status, priority, customer, job_id, notes, created_at } ] }` |
 | `get_customer` | `{ status, customer: { …, jobs: [...], quotations: [...] } }` |
+| `find_call_targets` | `{ status, customer, enabled_triggers: [...], targets: [ { trigger_type, call_type, enabled, reference_field, reference_id, summary } ], disabled_but_matched: [...] }` — **UPCOMING targets only by default** (past-due appointments/jobs and expired quotes are excluded; the agent can pass `include_past:true` on request). Render `targets` as a **pick-one list** (each becomes a "Call this" action → `make_call`/`schedule_call`); an empty `targets` means there are no upcoming calls for this customer. |
 | `get_agent_config` | `{ representative_name, voice_id, subagent_count }` |
 | `get_call_settings` | `{ business_hours_start, business_hours_end, max_attempts, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled, … }` |
 | `find_customer` | `{ status: "resolved"|"ambiguous"|"not_found", candidates: [ { id, name, phone, email, score } ] }` |
@@ -255,12 +272,53 @@ These are the `result` payloads on `tool_result` (and the JSON a `tool` message 
 
 ---
 
+## 3.7 Response channels — render each kind of output differently
+
+A single turn produces **four distinct kinds of output**. They must NOT all be rendered as one
+plain text stream — style them differently:
+
+| Channel | Comes from | Suggested rendering |
+|---|---|---|
+| **Reasoning** (intermediate "thinking") | `token` deltas grouped by `message_id`, then a `message` with `channel:"reasoning"` | A muted / collapsible "Thinking…" block. Optional to show; safe to collapse or hide. |
+| **Tool call** (the agent is doing something) | `tool_call` | A small activity chip: "🔧 Looking up voices…". Pair with its result by `tool_call_id`. |
+| **Tool / API response** (the data) | `tool_result` | A **card / table** built from `result` (see §3.6). Often shown inside/next to the tool chip; can be collapsed. |
+| **Final answer** | `token` deltas grouped by `message_id`, then a `message` with `channel:"answer"` (and echoed in `done.result.text`) | The primary assistant bubble, rendered as **Markdown**. |
+
+### How to drive this from the stream
+1. On each `token`, append `text` to a bubble keyed by `message_id`. You don't yet know its
+   channel — render it provisionally (e.g. as streaming answer text, or a neutral style).
+2. When the `message` event for that `message_id` arrives, you now know the channel:
+   - `channel:"reasoning"` → restyle that bubble as a collapsible "thinking" block (or hide it).
+   - `channel:"answer"` → keep it as the main answer bubble; `message.text` is authoritative.
+3. `tool_call` / `tool_result` interleave between messages — render them as their own
+   activity/card elements, not as text in a bubble. Match a result to its call via `tool_call_id`.
+4. The terminal `done.result.text` always equals the final **answer** text — use it to finalize the
+   answer bubble (and as the fallback if you didn't track messages, e.g. after a reconnect).
+
+Typical event order for a tool-using turn:
+```
+provider
+token(msg=A) …            ← optional preamble ("Let me check…")
+message(msg=A, reasoning) ← A was thinking; collapse it
+tool_call(id=T1, list_voices)
+tool_result(id=T1, {voices:[…]})   ← render as a card
+token(msg=B) …            ← the actual answer, streaming
+message(msg=B, answer)    ← finalize the answer bubble
+done(result.text = answer)
+```
+> Many turns have no reasoning text at all (the model calls a tool immediately, then answers) —
+> in that case you'll just see `tool_call`/`tool_result` then an `answer` message.
+
+---
+
 ## 4. UX flows
 
 ### 4.1 Plain Q&A
 1. `POST …/messages` → get `streamUrl`.
-2. Open `EventSource`; on each `token`, append `data.text` to the in-progress bubble.
-3. On `done`, finalize the bubble with `data.result.text`; close the stream.
+2. Open `EventSource`; on each `token`, append `data.text` to the bubble for its `message_id`.
+3. On the `answer` `message`, finalize that bubble (Markdown); render any `reasoning` message as a
+   collapsed "thinking" block and `tool_call`/`tool_result` as activity/cards (§3.7).
+4. On `done`, the answer bubble is authoritative via `data.result.text`; close the stream.
 
 ### 4.2 Fuzzy customer disambiguation
 No special protocol. The agent streams a normal question — *"Did you mean **John Smith**
@@ -327,10 +385,27 @@ async function sendMessage(apiBase, jwt, conversationId, message) {
 
 function openTurnStream(apiBase, streamUrl) {
   const es = new EventSource(apiBase + streamUrl); // token is already in the URL
-  let buffer = "";
+  const bubbles = new Map(); // message_id → accumulated text
 
-  es.addEventListener("token", (e) => { buffer += JSON.parse(e.data).text; render(buffer); });
-  es.addEventListener("tool_call", (e) => showThinking(JSON.parse(e.data).name));
+  // Live deltas: group by message_id; channel is learned on `message`.
+  es.addEventListener("token", (e) => {
+    const { text, message_id } = JSON.parse(e.data);
+    const prev = bubbles.get(message_id) || "";
+    bubbles.set(message_id, prev + text);
+    renderBubble(message_id, prev + text, /* channel unknown yet */ "pending");
+  });
+
+  // A generation finished — now we know if it was reasoning or the answer.
+  es.addEventListener("message", (e) => {
+    const { message_id, channel, text } = JSON.parse(e.data);
+    if (channel === "reasoning") renderReasoning(message_id, text);   // collapsible "thinking"
+    else renderAnswer(message_id, text);                              // primary Markdown bubble
+  });
+
+  // Tool activity + data (pair by tool_call_id).
+  es.addEventListener("tool_call", (e) => { const t = JSON.parse(e.data); showToolChip(t.tool_call_id, t.name); });
+  es.addEventListener("tool_result", (e) => { const t = JSON.parse(e.data); showToolCard(t.tool_call_id, t.name, t.result); });
+
   es.addEventListener("provider_switch", (e) => console.debug("LLM failover", JSON.parse(e.data)));
 
   es.addEventListener("propose", (e) => {
@@ -340,7 +415,7 @@ function openTurnStream(apiBase, streamUrl) {
 
   es.addEventListener("done", (e) => {
     const { result } = JSON.parse(e.data);
-    if (result.status === "done") finalizeBubble(result.text);
+    if (result.status === "done") finalizeAnswer(result.text); // authoritative final answer
     es.close();
   });
   es.addEventListener("failed", (e) => { showError(JSON.parse(e.data).error); es.close(); });
@@ -365,14 +440,23 @@ async function resolveAction(apiBase, jwt, conversationId, pendingActionId, deci
 
 Read-only (always available): `find_customer`, `get_customer`, `count_unconfirmed_jobs`,
 `count_unconfirmed_appointments_for_customer`, `list_jobs`, `list_open_todos`, `list_calls`,
-`get_call`, `analytics_summary`, `list_voices`, `get_agent_config`, `get_call_settings`.
+`get_call`, `analytics_summary`, `list_voices`, `get_agent_config`, `get_call_settings`,
+`find_call_targets`.
 
 Write (gated by `agent_can_make_changes`, always confirmation-gated): `set_todo_status`,
-`update_agent_config`, `update_call_settings`.
+`update_agent_config`, `update_call_settings`, `set_call_trigger_enabled`, `make_call`,
+`schedule_call`, `run_scheduler`.
+
+**Calling a customer (the smart flow):** `find_call_targets` returns the customer's possible calls
+(appointments to confirm, open jobs, pending quotes), each with the exact reference and whether its
+trigger is enabled. The widget should render these as a **pick-one list**; selecting one (or the
+user telling the agent which) leads to a `make_call`/`schedule_call` propose→confirm. If the
+needed trigger is disabled, the agent may first propose `set_call_trigger_enabled`.
 
 `update_call_settings` and `update_agent_config` previews use `entity: "call_settings"` /
 `entity: "agent_config"` with a `changes: [{ field, from, to }]` array — render the same generic
-before/after card as §3.4.
+before/after card as §3.4. `make_call` / `schedule_call` previews use `entity: "call"` (a "call
+X now / at <time>?" confirmation) — see §3.4 for the shape.
 
 The frontend doesn't call these directly — they surface only via `tool_call`/`tool_result`
 (informational) and, for writes, `propose`. New tools added server-side appear automatically with
