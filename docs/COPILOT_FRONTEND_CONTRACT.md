@@ -7,8 +7,11 @@ backend: `src/routes/copilot.js`, `src/copilot/*`, and the shared SSE transport 
 
 > **v1 capabilities.** LangGraph agent with OpenAI→Groq failover. Answers analytical/data
 > questions, fuzzy-matches customer names ("did you mean …?"), and performs **write actions**
-> (currently: change a to-do's status, update the voice-agent config) that require explicit
-> in-UI confirmation before they are applied. Multi-turn memory is kept server-side.
+> (update to-dos / agent config / call settings / call triggers, place or schedule calls, run the
+> scheduler) — every write requires explicit in-UI confirmation before it is applied. That
+> confirmation is the only gate on copilot actions; the `agent_can_make_changes` call-setting
+> applies to the **voice agent on a live call**, not to the copilot. Multi-turn memory is
+> server-side.
 
 ---
 
@@ -365,8 +368,11 @@ from the most recent `propose`.
 - **Pending action expired (410) / superseded (409).** Show "this action is no longer available"
   and let the user re-ask.
 - **`failed` / no providers configured.** Show a generic error; the turn is done.
-- **Changes disabled (`agent_can_make_changes=false`).** Write tools aren't offered; the agent
-  explains it can't make changes. You will never receive a `propose` in this mode.
+- **Copilot writes are always available.** The copilot can always *propose* write actions; the
+  safety gate is the per-action confirmation (§4.3), not a setting. The `agent_can_make_changes`
+  call-setting governs only the **voice agent during a live call** — it does not disable copilot
+  actions. (The copilot can even read/toggle that setting via `get_call_settings` /
+  `update_call_settings`.)
 
 ---
 
@@ -443,9 +449,9 @@ Read-only (always available): `find_customer`, `get_customer`, `count_unconfirme
 `get_call`, `analytics_summary`, `list_voices`, `get_agent_config`, `get_call_settings`,
 `find_call_targets`.
 
-Write (gated by `agent_can_make_changes`, always confirmation-gated): `set_todo_status`,
-`update_agent_config`, `update_call_settings`, `set_call_trigger_enabled`, `make_call`,
-`schedule_call`, `run_scheduler`.
+Write (always confirmation-gated; NOT restricted by the voice agent's `agent_can_make_changes`
+flag): `set_todo_status`, `update_agent_config`, `update_call_settings`, `set_call_trigger_enabled`,
+`make_call`, `schedule_call`, `run_scheduler`.
 
 **Calling a customer (the smart flow):** `find_call_targets` returns the customer's possible calls
 (appointments to confirm, open jobs, pending quotes), each with the exact reference and whether its

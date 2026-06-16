@@ -37,18 +37,17 @@ async function getGraph() {
 }
 
 async function buildGraph() {
-  const { tools, isWrite } = await registry.build();
+  const { tools } = await registry.build();
   const toolNode = new ToolNode(tools);
 
   async function agentNode(state, config) {
     const ctx = config?.configurable?.ctx;
-    const canMakeChanges = config?.configurable?.canMakeChanges !== false;
-
-    // Hide write tools entirely when the company has changes disabled.
-    const allowed = tools.filter((t) => canMakeChanges || !isWrite(t.name));
-    const sys = new SystemMessage(prompt.build({ canMakeChanges }));
-
-    const message = await invokeWithFailover(allowed, [sys, ...state.messages], config, ctx);
+    // The copilot always offers all its tools (read + write). Write actions are
+    // safe because each one is human-in-the-loop confirmed (interrupt → user
+    // confirms in the UI). This is independent of call_settings.agent_can_make_changes,
+    // which governs the VOICE agent during a live call, not the copilot.
+    const sys = new SystemMessage(prompt.build());
+    const message = await invokeWithFailover(tools, [sys, ...state.messages], config, ctx);
     return { messages: [message] };
   }
 

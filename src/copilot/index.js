@@ -18,7 +18,6 @@ const { Command } = require("@langchain/langgraph");
 
 const { Engine } = require("../engines/core/engine");
 const broker = require("../engines/core/broker");
-const callSettingsDb = require("../db/call-settings");
 const { getGraph } = require("./graph/build");
 const { extractText, pump } = require("./stream");
 const persistence = require("./persistence");
@@ -57,9 +56,6 @@ async function runTurn(engine, { companyId, userId, conversationId, threadId, in
   // (tokens are live-only, not persisted/replayed).
   await waitForSubscriber(String(engine.id), SUBSCRIBER_WAIT_MS);
 
-  const settings = await callSettingsDb.getByCompanyId(companyId);
-  const canMakeChanges = settings.agent_can_make_changes !== false;
-
   const ctx = {
     companyId,
     userId,
@@ -72,7 +68,7 @@ async function runTurn(engine, { companyId, userId, conversationId, threadId, in
   const config = {
     version: "v2",
     recursionLimit: 25,
-    configurable: { thread_id: threadId, ctx, canMakeChanges },
+    configurable: { thread_id: threadId, ctx },
   };
 
   await pump(engine, graph.streamEvents(input, config));
