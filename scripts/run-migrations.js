@@ -5,15 +5,17 @@
  * `schema_migrations` ledger so each file runs exactly once. Re-running is safe:
  * already-applied files are skipped.
  *
- * Bootstrapping an existing (already-migrated) database: a migration whose
- * objects already exist (duplicate table/column/constraint/etc.) is treated as
- * already applied — it is recorded in the ledger and skipped, rather than
- * aborting the run. Any OTHER error still aborts. This lets the ledger adopt a
- * database that was migrated before the ledger existed.
+ * Baseline adoption: this database was provisioned before the ledger existed
+ * (migrations 001..052 were applied out-of-band / directly). On a database that
+ * is already provisioned (the `companies` table exists), every migration at or
+ * before BASELINE is recorded as applied WITHOUT executing it — re-running those
+ * old files would fail (duplicate objects, already-renamed columns, etc.). Only
+ * migrations after BASELINE actually run. On a fresh/unprovisioned database,
+ * nothing is baselined and all migrations run normally.
  *
  * Usage:
  *   node scripts/run-migrations.js                 — apply all pending migrations
- *   node scripts/run-migrations.js 056_foo.sql     — (re-)apply one file
+ *   node scripts/run-migrations.js 056_foo.sql     — (re-)apply one file (forced)
  */
 
 require("dotenv").config();
@@ -26,17 +28,9 @@ const logger = require("../src/utils/logger");
 
 const MIGRATIONS_DIR = path.join(__dirname, "..", "migrations");
 
-// Postgres error codes that mean "this object already exists" — i.e. the
-// migration was already applied out-of-band. Safe to treat as applied.
-const ALREADY_APPLIED_CODES = new Set([
-  "42P07", // duplicate_table
-  "42P06", // duplicate_schema
-  "42701", // duplicate_column
-  "42710", // duplicate_object (constraint, index, etc.)
-  "42723", // duplicate_function
-  "42711", // duplicate_object (index name)
-  "42P16", // invalid_table_definition (re-adding an existing constraint variant)
-]);
+// Last migration that existed before the ledger was introduced. Everything up to
+// and including this is assumed already applied on a provisioned database.
+const BASELINE = "052_copilot.sql";
 
 async function ensureLedger(client) {
   await client.query(`
@@ -47,9 +41,9 @@ async function ensureLedger(client) {
   `);
 }
 
-async function getApplied(client) {
-  const { rows } = await client.query("SELECT filename FROM schema_migrations");
-  return new Set(rows.map((r) => r.filename));
+async function isProvisioned(client) {
+  const { rows } = await client.query("SELECT to_regclass('public.companies') AS t");
+  return !!rows[0].t;
 }
 
 async function record(client, file) {
@@ -73,7 +67,6 @@ async function run() {
 
   try {
     await ensureLedger(client);
-    const applied = await getApplied(client);
 
     let files = fs
       .readdirSync(MIGRATIONS_DIR)
@@ -85,6 +78,18 @@ async function run() {
       return;
     }
 
+    // Baseline adoption (skip on an explicit single-file run).
+    if (!specificFile && (await isProvisioned(client))) {
+      const baseline = files.filter((f) => f <= BASELINE);
+      for (const f of baseline) await record(client, f);
+      if (baseline.length) {
+        logger.info(`Baseline: adopted ${baseline.length} pre-ledger migration(s) as applied (<= ${BASELINE}).`);
+      }
+    }
+
+    const { rows } = await client.query("SELECT filename FROM schema_migrations");
+    const applied = new Set(rows.map((r) => r.filename));
+
     if (specificFile) {
       if (!files.includes(specificFile)) {
         logger.error("Migration file not found:", specificFile);
@@ -93,7 +98,7 @@ async function run() {
       files = [specificFile]; // explicit file: run even if already recorded
     }
 
-    let ran = 0, adopted = 0, skipped = 0;
+    let ran = 0, skipped = 0;
 
     for (const file of files) {
       if (!specificFile && applied.has(file)) {
@@ -116,19 +121,12 @@ async function run() {
         ran++;
       } catch (err) {
         await client.query("ROLLBACK");
-        if (ALREADY_APPLIED_CODES.has(err.code)) {
-          // Objects already exist — adopt this migration into the ledger.
-          await record(client, file);
-          logger.warn("Migration objects already exist — marking as applied:", file, `(${err.code})`);
-          adopted++;
-          continue;
-        }
         logger.error("Failed to apply migration:", file, err.message);
         throw err;
       }
     }
 
-    logger.info(`Migrations complete. applied=${ran} adopted=${adopted} skipped=${skipped}`);
+    logger.info(`Migrations complete. applied=${ran} skipped=${skipped}`);
   } finally {
     client.release();
     await pool.end();
