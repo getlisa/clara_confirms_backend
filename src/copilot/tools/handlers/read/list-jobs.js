@@ -28,7 +28,7 @@ async function run({ status, customer_id, search, due_soon_days, limit }, config
       title: j.title,
       status: j.status,
       job_type: j.job_type,
-      scheduled_date: j.scheduled_date,
+      due_by: j.due_by,
       customer: j.customer_name ?? null,
       technician: j.technician_name ?? null,
     })),

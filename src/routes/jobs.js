@@ -14,6 +14,7 @@
 
 const express = require("express");
 const jobsDb = require("../db/jobs");
+const lifecycle = require("../services/lifecycle");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 
@@ -132,7 +133,8 @@ router.patch("/:id", async (req, res) => {
   }
 });
 
-// PATCH /jobs/:id/reschedule — update job's scheduled_date (from UI or Retell tool)
+// PATCH /jobs/:id/reschedule — move the job's active appointment to a new date
+// (or adjust due_by when the job has no appointment yet). From UI or Retell tool.
 router.patch("/:id/reschedule", async (req, res) => {
   try {
     const companyId = getCompanyId(req);
@@ -142,10 +144,10 @@ router.patch("/:id/reschedule", async (req, res) => {
     if (!scheduled_date) return res.status(400).json({ error: "scheduled_date is required" });
 
     const dateOnly = scheduled_date.split("T")[0];
-    const job = await jobsDb.updateJob(Number(req.params.id), companyId, { scheduled_date: dateOnly });
+    const job = await jobsDb.rescheduleJobToDate(Number(req.params.id), companyId, dateOnly);
     if (!job) return res.status(404).json({ error: "Job not found" });
 
-    logger.info("Job rescheduled", { jobId: req.params.id, companyId, scheduled_date: dateOnly });
+    logger.info("Job rescheduled", { jobId: req.params.id, companyId, date: dateOnly });
     return res.json({ job });
   } catch (err) {
     logger.error("PATCH /jobs/:id/reschedule failed", { error: err.message });
@@ -182,14 +184,8 @@ router.post("/:id/appointments", async (req, res) => {
     const jobId = Number(req.params.id);
     const appointment = await jobsDb.createAppointment(companyId, jobId, req.body);
 
-    // An appointment can't exist without being tied to a scheduled job.
-    // Promote job status open → scheduled only. Never demote a confirmed/completed job.
-    const db = require("../db");
-    await db.query(
-      `UPDATE jobs SET status = 'scheduled', updated_at = NOW()
-       WHERE id = $1 AND company_id = $2 AND status = 'open'`,
-      [jobId, companyId]
-    );
+    // Sync job status (open → scheduled) — see src/services/lifecycle.js.
+    await lifecycle.onAppointmentCreated(companyId, jobId);
 
     return res.status(201).json({ appointment });
   } catch (err) {
@@ -243,42 +239,8 @@ router.patch("/appointments/:id", async (req, res) => {
     );
     if (!appointment) return res.status(404).json({ error: "Appointment not found" });
 
-    // ── Sync job status based on appointment outcome ──────────────────────────
-    // Determine effective values after the update
-    const effectiveCustomerConfirmed = req.body.customer_confirmed ?? current.customer_confirmed;
-    const effectiveStatus            = req.body.status            ?? current.status;
-    const db = require("../db");
-
-    if (effectiveStatus === "rescheduled") {
-      // Customer asked to reschedule — job needs re-confirmation
-      await db.query(
-        `UPDATE jobs SET status = 'scheduled', updated_at = NOW()
-         WHERE id = $1 AND company_id = $2 AND status = 'confirmed'`,
-        [current.job_id, companyId]
-      );
-    } else if (effectiveCustomerConfirmed === true) {
-      // Customer confirmed — promote job to confirmed
-      await db.query(
-        `UPDATE jobs SET status = 'confirmed', updated_at = NOW()
-         WHERE id = $1 AND company_id = $2 AND status = 'scheduled'`,
-        [current.job_id, companyId]
-      );
-    } else if (effectiveStatus === "cancelled") {
-      // Appointment cancelled — if no other active appointments, revert job to open
-      const { rows } = await db.query(
-        `SELECT COUNT(*) AS cnt FROM appointments
-         WHERE job_id = $1 AND status NOT IN ('cancelled','rescheduled')
-           AND id != $2`,
-        [current.job_id, current.id]
-      );
-      if (Number(rows[0].cnt) === 0) {
-        await db.query(
-          `UPDATE jobs SET status = 'open', updated_at = NOW()
-           WHERE id = $1 AND company_id = $2 AND status IN ('scheduled','confirmed')`,
-          [current.job_id, companyId]
-        );
-      }
-    }
+    // Sync job status based on the appointment outcome — see src/services/lifecycle.js.
+    await lifecycle.onAppointmentUpdated(companyId, { current, patch: req.body });
 
     return res.json({ appointment });
   } catch (err) {

@@ -85,11 +85,11 @@ async function run({ customer_id, include_past }, config) {
   // Upcoming only by default: exclude jobs whose expected date has already
   // passed (jobs with no date yet are still upcoming, so they're kept).
   const openJobs = await db.query(
-    `SELECT id AS job_id, title, status, scheduled_date
+    `SELECT id AS job_id, title, status, due_by
      FROM jobs
      WHERE company_id = $1 AND customer_id = $2 AND status = 'open'
-       ${includePast ? "" : "AND (scheduled_date >= CURRENT_DATE OR scheduled_date IS NULL)"}
-     ORDER BY scheduled_date ASC NULLS LAST`,
+       ${includePast ? "" : "AND (due_by >= CURRENT_DATE OR due_by IS NULL)"}
+     ORDER BY due_by ASC NULLS LAST`,
     [companyId, customer_id]
   );
   for (const j of openJobs.rows) {
@@ -99,7 +99,7 @@ async function run({ customer_id, include_past }, config) {
       enabled: isEnabled("open_job_due_soon"),
       reference_field: "job_id",
       reference_id: j.job_id,
-      summary: { job_title: j.title, scheduled_date: j.scheduled_date, job_status: j.status },
+      summary: { job_title: j.title, due_by: j.due_by, job_status: j.status },
     });
   }
 

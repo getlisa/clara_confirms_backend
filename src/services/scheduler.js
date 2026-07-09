@@ -278,6 +278,7 @@ async function processTrigger(companyId, trigger, callSettings, tz) {
     case "quotation_pending":      return processQuotationPending(companyId, trigger, callSettings, tz);
     case "open_job_due_soon":      return processOpenJobDueSoon(companyId, trigger, callSettings, tz);
     case "technician_unconfirmed": return processTechnicianUnconfirmed(companyId, trigger, callSettings, tz);
+    case "post_job_review":        return processPostJobReview(companyId, trigger, callSettings, tz);
     default: return { c: 0, s: 0 };
   }
 }
@@ -305,7 +306,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
   // must confirm.
   const { rows } = await db.query(
     `SELECT DISTINCT ON (j.id)
-            j.id AS job_id, j.scheduled_date, j.status AS job_status,
+            j.id AS job_id, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
             a.status AS appointment_status,
             c.phone AS customer_phone, c.full_name AS customer_name,
@@ -454,11 +455,11 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
 
   // Window: today through today + days_before (inclusive)
   const dateClause = isDev
-    ? "j.scheduled_date >= CURRENT_DATE"
-    : "j.scheduled_date BETWEEN $2::date AND $3::date";
+    ? "j.due_by >= CURRENT_DATE"
+    : "j.due_by BETWEEN $2::date AND $3::date";
 
   let query = `
-    SELECT j.id AS job_id, j.scheduled_date,
+    SELECT j.id AS job_id, j.due_by,
            j.title AS job_name, j.description AS job_description, j.job_type,
            c.phone AS customer_phone, c.full_name AS customer_name,
            c.address_line1, c.city, c.state
@@ -536,7 +537,7 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
   const techParams = isDev ? [companyId] : [companyId, tz, todayStr, endDateStr];
 
   const { rows } = await db.query(
-    `SELECT a.id AS appointment_id, j.id AS job_id, j.scheduled_date,
+    `SELECT a.id AS appointment_id, j.id AS job_id,
             j.title AS job_name, j.description AS job_description, j.job_type,
             t.phone AS technician_phone, t.first_name || ' ' || t.last_name AS technician_name,
             c.full_name AS customer_name,
@@ -600,6 +601,69 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
       logger.info("Scheduler [technician_unconfirmed]: skipped — duplicate on insert", { companyId, jobId });
       s++;
     }
+  }
+  return { c, s };
+}
+
+// ── post_job_review (customer) — after a completed appointment ──────────────
+// Delivery campaign: once a visit is completed, check in with the customer and
+// collect a review. Fires once per job (dedup below includes completed calls).
+async function processPostJobReview(companyId, trigger, callSettings, tz) {
+  const cfg = trigger.trigger_config || {};
+  const daysAfter = cfg.days_after ?? trigger.days_before ?? 1;
+
+  const { rows } = await db.query(
+    `SELECT DISTINCT ON (j.id)
+            a.id AS appointment_id, j.id AS job_id,
+            j.title AS job_name, j.description AS job_description, j.job_type,
+            c.phone AS customer_phone, c.full_name AS customer_name,
+            c.address_line1, c.city, c.state
+     FROM appointments a
+     JOIN jobs j      ON j.id = a.job_id
+     JOIN customers c ON c.id = j.customer_id
+     WHERE j.company_id = $1
+       AND a.status = 'completed'
+       AND a.updated_at >= NOW() - ($2 || ' days')::interval
+     ORDER BY j.id, a.updated_at DESC`,
+    [companyId, daysAfter]
+  );
+
+  logger.info(`Scheduler [post_job_review]: found ${rows.length} recently-completed appointment(s)`, { companyId, daysAfter });
+
+  let c = 0, s = 0;
+  for (const row of rows) {
+    const jobId = String(row.job_id);
+    if (!row.customer_phone) {
+      await todosDb.createMissingPhone({
+        companyId, jobId, subjectKind: "customer",
+        subjectName: row.customer_name, callType: trigger.call_type,
+        reason: "Customer phone number not provided — post-job review call could not be placed.",
+        isTest: isDev,
+      });
+      s++; continue;
+    }
+    // Dedup: at most one review call per job, EVER (includes completed calls).
+    const { rows: dup } = await db.query(
+      `SELECT 1 FROM scheduled_calls
+        WHERE company_id = $1 AND job_id = $2 AND call_type = $3 AND is_test = $4 LIMIT 1`,
+      [companyId, jobId, trigger.call_type, isDev]
+    );
+    if (dup.length) { s++; continue; }
+
+    const scheduledAt = isDev ? new Date() : snapToWindowStart(callSettings, tz, new Date());
+    const inserted = await scheduleCall({
+      companyId, callType: trigger.call_type,
+      phoneNumber: row.customer_phone,
+      jobId, jobDate: null, appointmentId: row.appointment_id,
+      customerName: row.customer_name,
+      customerAddress: [row.address_line1, row.city, row.state].filter(Boolean).join(", ") || null,
+      jobName: row.job_name || null,
+      jobDescription: row.job_description || null,
+      jobType: row.job_type || null,
+      scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
+      callPriority: computeInitialPriority({ triggerType: "post_job_review", jobDate: null, tz }),
+    });
+    if (inserted) c++; else s++;
   }
   return { c, s };
 }

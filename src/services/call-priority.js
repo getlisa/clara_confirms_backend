@@ -85,6 +85,7 @@ function daysUntilInTz(jobDate, tz) {
 function computeInitialPriority({ triggerType, jobDate, tz, isManual = false }) {
   if (isManual) return "high";
   if (triggerType === "quotation_pending") return "low";
+  if (triggerType === "post_job_review") return "low";
 
   const days = daysUntilInTz(jobDate, tz);
   if (days === 0) return "high";

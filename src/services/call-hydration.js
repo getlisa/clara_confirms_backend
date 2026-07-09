@@ -23,7 +23,7 @@ function joinAddress(row) {
 async function hydrateScheduledUnconfirmed(companyId, appointmentId) {
   const { rows } = await db.query(
     `SELECT a.id AS appointment_id, a.scheduled_start, a.status AS appointment_status,
-            j.id AS job_id, j.scheduled_date, j.status AS job_status,
+            j.id AS job_id, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
             c.phone AS customer_phone, c.full_name AS customer_name,
             c.address_line1, c.city, c.state
@@ -54,7 +54,7 @@ async function hydrateScheduledUnconfirmed(companyId, appointmentId) {
       callType:        "scheduled_unconfirmed",
       phoneNumber:     row.customer_phone,
       jobId,
-      jobDate:         row.scheduled_start || row.scheduled_date || null,
+      jobDate:         row.scheduled_start || null,
       appointmentId:   row.appointment_id,
       customerName:    row.customer_name,
       customerAddress: joinAddress(row),
@@ -69,7 +69,7 @@ async function hydrateScheduledUnconfirmed(companyId, appointmentId) {
 async function hydrateTechnicianUnconfirmed(companyId, appointmentId) {
   const { rows } = await db.query(
     `SELECT a.id AS appointment_id, a.scheduled_start, a.status AS appointment_status, a.technician_id,
-            j.id AS job_id, j.scheduled_date,
+            j.id AS job_id,
             j.title AS job_name, j.description AS job_description, j.job_type,
             t.phone AS technician_phone, t.first_name || ' ' || t.last_name AS technician_name,
             t.is_active AS technician_active,
@@ -106,7 +106,7 @@ async function hydrateTechnicianUnconfirmed(companyId, appointmentId) {
       callType:        "technician_unconfirmed",
       phoneNumber:     row.technician_phone,
       jobId,
-      jobDate:         row.scheduled_start || row.scheduled_date || null,
+      jobDate:         row.scheduled_start || null,
       appointmentId:   row.appointment_id,
       technicianName:  row.technician_name,
       customerName:    row.customer_name,
@@ -121,7 +121,7 @@ async function hydrateTechnicianUnconfirmed(companyId, appointmentId) {
 // ── open_job_due_soon (customer) — by job_id ────────────────────────────────
 async function hydrateOpenJobDueSoon(companyId, jobIdInput) {
   const { rows } = await db.query(
-    `SELECT j.id AS job_id, j.scheduled_date, j.status AS job_status,
+    `SELECT j.id AS job_id, j.due_by, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
             c.phone AS customer_phone, c.full_name AS customer_name,
             c.address_line1, c.city, c.state
@@ -136,13 +136,13 @@ async function hydrateOpenJobDueSoon(companyId, jobIdInput) {
   if (row.job_status === "cancelled" || row.job_status === "completed") {
     return { ok: false, status: 422, code: "job_closed", error: `Job is ${row.job_status}` };
   }
-  // job.scheduled_date is a DATE (no time/tz). "Past" means strictly before
-  // today — a job due today is still callable.
-  if (row.scheduled_date) {
-    const dueDate = new Date(row.scheduled_date);
+  // job.due_by is a DATE (no time/tz). "Past" means strictly before today —
+  // a job due today is still callable.
+  if (row.due_by) {
+    const dueDate = new Date(row.due_by);
     const today = new Date(); today.setHours(0, 0, 0, 0);
     if (dueDate < today) {
-      return { ok: false, status: 422, code: "job_in_past", error: "Job scheduled date has already passed" };
+      return { ok: false, status: 422, code: "job_in_past", error: "Job due date has already passed" };
     }
   }
   if (!row.customer_phone) {
@@ -157,7 +157,7 @@ async function hydrateOpenJobDueSoon(companyId, jobIdInput) {
       callType:        "open_job_due_soon",
       phoneNumber:     row.customer_phone,
       jobId,
-      jobDate:         row.scheduled_date || null,
+      jobDate:         row.due_by || null,
       customerName:    row.customer_name,
       customerAddress: joinAddress(row),
       jobName:         row.job_name || null,
@@ -204,11 +204,51 @@ async function hydrateQuotationPending(companyId, quotationId) {
   };
 }
 
+// ── post_job_review (customer) — by appointment_id ──────────────────────────
+async function hydratePostJobReview(companyId, appointmentId) {
+  const { rows } = await db.query(
+    `SELECT a.id AS appointment_id, a.status AS appointment_status,
+            j.id AS job_id, j.title AS job_name, j.description AS job_description, j.job_type,
+            c.phone AS customer_phone, c.full_name AS customer_name,
+            c.address_line1, c.city, c.state
+       FROM appointments a
+       JOIN jobs j      ON j.id = a.job_id
+       JOIN customers c ON c.id = j.customer_id
+      WHERE a.id = $1 AND j.company_id = $2
+      LIMIT 1`,
+    [appointmentId, companyId]
+  );
+  const row = rows[0];
+  if (!row) return { ok: false, status: 404, error: "Appointment not found" };
+  if (!row.customer_phone) {
+    return { ok: false, status: 422, code: "missing_phone", error: "Customer phone number not provided", subject: "customer" };
+  }
+  const jobId = String(row.job_id);
+  return {
+    ok: true,
+    jobId,
+    callType: "post_job_review",
+    params: {
+      callType:        "post_job_review",
+      phoneNumber:     row.customer_phone,
+      jobId,
+      jobDate:         null,
+      appointmentId:   row.appointment_id,
+      customerName:    row.customer_name,
+      customerAddress: joinAddress(row),
+      jobName:         row.job_name || null,
+      jobDescription:  row.job_description || null,
+      jobType:         row.job_type || null,
+    },
+  };
+}
+
 const HYDRATORS = {
   scheduled_unconfirmed:  hydrateScheduledUnconfirmed,
   technician_unconfirmed: hydrateTechnicianUnconfirmed,
   open_job_due_soon:      hydrateOpenJobDueSoon,
   quotation_pending:      hydrateQuotationPending,
+  post_job_review:        hydratePostJobReview,
 };
 
 const TARGET_FIELD = {
@@ -216,6 +256,7 @@ const TARGET_FIELD = {
   technician_unconfirmed: "appointment_id",
   open_job_due_soon:      "job_id",
   quotation_pending:      "quotation_id",
+  post_job_review:        "appointment_id",
 };
 
 module.exports = {
@@ -223,6 +264,7 @@ module.exports = {
   hydrateTechnicianUnconfirmed,
   hydrateOpenJobDueSoon,
   hydrateQuotationPending,
+  hydratePostJobReview,
   HYDRATORS,
   TARGET_FIELD,
 };

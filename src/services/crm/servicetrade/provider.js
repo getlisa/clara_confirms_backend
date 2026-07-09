@@ -262,23 +262,19 @@ async function upsertJob(a) {
   if (existing.length > 0) {
     const r = await db.query(
       `UPDATE jobs SET customer_id=$1, title=$2, description=$3, job_type=$4, status=$5,
-         scheduled_date=$6, scheduled_window_start=$7, scheduled_window_end=$8,
-         additional_information=$9, updated_at=NOW() WHERE id=$10 RETURNING *`,
+         due_by=$6, additional_information=$7, updated_at=NOW() WHERE id=$8 RETURNING *`,
       [a.customerId, a.title, a.description, a.jobType, a.status || "open",
-       a.scheduledDate, a.scheduledWindowStart, a.scheduledWindowEnd,
-       JSON.stringify(a.additionalInformation || {}), existing[0].id]
+       a.dueBy, JSON.stringify(a.additionalInformation || {}), existing[0].id]
     );
     return r.rows[0];
   }
   const r = await db.query(
     `INSERT INTO jobs
        (company_id, customer_id, title, description, job_type, status,
-        scheduled_date, scheduled_window_start, scheduled_window_end,
-        external_ref, source, additional_information)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+        due_by, external_ref, source, additional_information)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
     [a.companyId, a.customerId, a.title, a.description, a.jobType, a.status || "open",
-     a.scheduledDate, a.scheduledWindowStart, a.scheduledWindowEnd,
-     a.externalRef, a.source, JSON.stringify(a.additionalInformation || {})]
+     a.dueBy, a.externalRef, a.source, JSON.stringify(a.additionalInformation || {})]
   );
   return r.rows[0];
 }

@@ -10,9 +10,8 @@ function jobRow(row) {
     description:            row.description ?? null,
     job_type:               row.job_type ?? null,
     status:                 row.status,
-    scheduled_date:         row.scheduled_date ?? null,
-    scheduled_window_start: row.scheduled_window_start ?? null,
-    scheduled_window_end:   row.scheduled_window_end ?? null,
+    due_by:                  row.due_by ?? null,
+    earliest_appointment_at: row.earliest_appointment_at ?? null,
     external_ref:           row.external_ref ?? null,
     source:                 row.source ?? null,
     additional_information: row.additional_information ?? {},
@@ -64,11 +63,11 @@ async function listJobs(companyId, {
   if (jobType)         { conditions.push(`j.job_type = $${i++}`);         values.push(jobType); }
   if (customerId)      { conditions.push(`j.customer_id = $${i++}`);      values.push(customerId); }
   if (technicianId)    { conditions.push(`j.technician_id = $${i++}`);    values.push(technicianId); }
-  if (scheduledDateFrom) { conditions.push(`j.scheduled_date >= $${i++}`); values.push(scheduledDateFrom); }
-  if (scheduledDateTo)   { conditions.push(`j.scheduled_date <= $${i++}`); values.push(scheduledDateTo); }
+  if (scheduledDateFrom) { conditions.push(`j.due_by >= $${i++}`); values.push(scheduledDateFrom); }
+  if (scheduledDateTo)   { conditions.push(`j.due_by <= $${i++}`); values.push(scheduledDateTo); }
   if (dueSoonDays != null) {
-    // Jobs whose scheduled_date falls between today and today + N days (inclusive)
-    conditions.push(`j.scheduled_date >= CURRENT_DATE AND j.scheduled_date <= CURRENT_DATE + ($${i++} || ' days')::interval`);
+    // Jobs whose due_by falls between today and today + N days (inclusive)
+    conditions.push(`j.due_by >= CURRENT_DATE AND j.due_by <= CURRENT_DATE + ($${i++} || ' days')::interval`);
     values.push(dueSoonDays);
   }
   if (search) {
@@ -102,7 +101,7 @@ async function listJobs(companyId, {
        ORDER BY ap.scheduled_start DESC LIMIT 1
      ) a ON true
      WHERE ${conditions.join(" AND ")}
-     ORDER BY j.scheduled_date ASC NULLS LAST, j.created_at DESC
+     ORDER BY j.due_by ASC NULLS LAST, j.created_at DESC
      LIMIT $${i++} OFFSET $${i}`,
     values
   );
@@ -190,22 +189,22 @@ async function getJobById(id, companyId) {
 async function createJob(companyId, fields) {
   const {
     customer_id, technician_id, title, description, job_type, status,
-    scheduled_date, scheduled_window_start, scheduled_window_end,
+    due_by,
     external_ref, source, additional_information,
   } = fields;
 
   const result = await db.query(
     `INSERT INTO jobs
        (company_id, customer_id, technician_id, title, description, job_type, status,
-        scheduled_date, scheduled_window_start, scheduled_window_end,
+        due_by,
         external_ref, source, additional_information)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
      RETURNING *`,
     [
       companyId, customer_id, technician_id ?? null,
       title ?? null, description ?? null, job_type ?? null,
       status ?? "open",
-      scheduled_date ?? null, scheduled_window_start ?? null, scheduled_window_end ?? null,
+      due_by ?? null,
       external_ref ?? null, source ?? "manual",
       JSON.stringify(additional_information ?? {}),
     ]
@@ -216,20 +215,15 @@ async function createJob(companyId, fields) {
 async function updateJob(id, companyId, fields) {
   const allowed = [
     "customer_id", "technician_id", "title", "description", "job_type", "status",
-    "scheduled_date", "scheduled_window_start", "scheduled_window_end",
+    "due_by",
     "external_ref", "additional_information",
   ];
   const provided = Object.keys(fields).filter((k) => allowed.includes(k));
   if (provided.length === 0) return getJobById(id, companyId);
 
-  // Auto-promote status to 'rescheduled' when the scheduled date/window changes,
-  // unless the caller is explicitly setting a different status.
-  const dateFields = ["scheduled_date", "scheduled_window_start", "scheduled_window_end"];
-  const isDateChange = dateFields.some((f) => provided.includes(f));
-  if (isDateChange && !provided.includes("status")) {
-    fields = { ...fields, status: "rescheduled" };
-    provided.push("status");
-  }
+  // NOTE: jobs no longer own hard time. Changing due_by (a soft deadline) does NOT
+  // reschedule anything — reschedule lives entirely on the appointment. Job status is
+  // derived from its appointments (see src/services/lifecycle.js).
 
   const setClauses = provided.map((k, idx) => `${k} = $${idx + 3}`).join(", ");
   const values = [
@@ -248,6 +242,20 @@ async function updateJob(id, companyId, fields) {
 }
 
 // ── Appointments ──────────────────────────────────────────────────────────────
+
+// Keep the derived cache jobs.earliest_appointment_at in sync with the job's
+// earliest ACTIVE appointment. Called after any appointment insert/update.
+async function recomputeJobEarliest(jobId) {
+  await db.query(
+    `UPDATE jobs j
+        SET earliest_appointment_at = (
+          SELECT MIN(a.scheduled_start) FROM appointments a
+           WHERE a.job_id = j.id AND a.status NOT IN ('cancelled','rescheduled')
+        )
+      WHERE j.id = $1`,
+    [jobId]
+  );
+}
 
 async function listAppointmentsByJob(jobId, companyId) {
   const result = await db.query(
@@ -284,6 +292,7 @@ async function createAppointment(companyId, jobId, fields) {
       JSON.stringify(additional_information ?? {}),
     ]
   );
+  await recomputeJobEarliest(jobId);
   return apptRow(result.rows[0]);
 }
 
@@ -332,7 +341,25 @@ async function updateAppointment(id, companyId, fields) {
      RETURNING *`,
     allValues
   );
-  return result.rows[0] ? apptRow(result.rows[0]) : null;
+  if (!result.rows[0]) return null;
+  await recomputeJobEarliest(result.rows[0].job_id);
+  return apptRow(result.rows[0]);
+}
+
+// Reschedule a job to a new date. Hard time lives on the appointment, so this
+// moves the job's active appointment (preserving its time-of-day) when one exists;
+// otherwise it just adjusts the soft deadline (due_by). `dateOnly` is 'YYYY-MM-DD'.
+async function rescheduleJobToDate(jobId, companyId, dateOnly) {
+  const appts = await listAppointmentsByJob(jobId, companyId);
+  const active = appts.find((a) => !["cancelled", "rescheduled"].includes(a.status));
+  if (active) {
+    const prevIso = new Date(active.scheduled_start).toISOString();
+    const newStart = `${dateOnly}T${prevIso.slice(11)}`; // keep time-of-day (UTC)
+    await updateAppointment(active.id, companyId, { scheduled_start: newStart });
+  } else {
+    await updateJob(jobId, companyId, { due_by: dateOnly });
+  }
+  return getJobById(jobId, companyId);
 }
 
 async function getAppointmentById(id, companyId) {
@@ -350,6 +377,6 @@ async function getAppointmentById(id, companyId) {
 }
 
 module.exports = {
-  listJobs, getJobById, createJob, updateJob,
+  listJobs, getJobById, createJob, updateJob, rescheduleJobToDate,
   listAppointmentsByJob, createAppointment, updateAppointment, getAppointmentById,
 };

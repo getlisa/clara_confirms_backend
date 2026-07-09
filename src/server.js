@@ -21,6 +21,7 @@ const todosRoutes = require("./routes/todos");
 const callsRoutes = require("./routes/calls");
 const callSettingsRoutes = require("./routes/call-settings");
 const callTriggersRoutes = require("./routes/call-triggers");
+const campaignsRoutes = require("./routes/campaigns");
 const scheduledCallsRoutes = require("./routes/scheduled-calls");
 const testRoutes = require("./routes/test");
 const schedulerRoutes = require("./routes/scheduler");
@@ -142,6 +143,8 @@ app.use("/call-settings", callSettingsRoutes);
 
 // Call trigger configs (when to auto-call customers) - requires auth
 app.use("/call-triggers", callTriggersRoutes);
+// Campaigns (configurable outreach playbooks, on/off toggle) - requires auth
+app.use("/campaigns", campaignsRoutes);
 
 // Scheduled calls queue (view + cancel) - requires auth
 app.use("/scheduled-calls", scheduledCallsRoutes);

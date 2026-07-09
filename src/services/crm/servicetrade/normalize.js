@@ -57,9 +57,9 @@ function normalizeJob(row, { companyId, customerId }) {
     description:           row.description,
     jobType:               row.job_type,
     status:                mapJobStatus(row.status),
-    scheduledDate:         row.scheduled_date,
-    scheduledWindowStart:  row.scheduled_window_start,
-    scheduledWindowEnd:    row.scheduled_window_end,
+    // Jobs no longer own hard time — the ServiceTrade window syncs into an
+    // appointment (normalizeAppointment). The job keeps only the soft deadline.
+    dueBy:                  row.scheduled_date,
     additionalInformation: {
       servicetrade_job_id: row.servicetrade_id,
       servicetrade_customer_id: row.servicetrade_customer_id || null,

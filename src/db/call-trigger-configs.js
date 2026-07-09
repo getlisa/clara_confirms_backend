@@ -5,6 +5,7 @@ const TRIGGER_TYPES = [
   "quotation_pending",
   "open_job_due_soon",
   "technician_unconfirmed",
+  "post_job_review",
 ];
 
 const BUILTIN_SEEDS = [
@@ -39,6 +40,14 @@ const BUILTIN_SEEDS = [
     days_before:    1,
     trigger_config: {},
     description:    "Call the assigned technician when a job is scheduled and they haven't confirmed availability yet.",
+  },
+  {
+    trigger_type:   "post_job_review",
+    enabled:        false,
+    call_type:      "post_job_review",
+    days_before:    1,
+    trigger_config: { days_after: 1 },
+    description:    "Call the customer after a completed appointment to check in and collect a review.",
   },
 ];
 

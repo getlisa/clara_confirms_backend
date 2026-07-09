@@ -45,7 +45,7 @@ async function summarizeTarget(companyId, triggerType, args) {
     }
     if (field === "job_id") {
       const r = await db.query(
-        `SELECT j.title AS job_title, j.scheduled_date, c.full_name AS customer, c.phone
+        `SELECT j.title AS job_title, j.due_by, c.full_name AS customer, c.phone
          FROM jobs j
          JOIN customers c ON c.id = j.customer_id
          WHERE j.id = $1 AND j.company_id = $2`,

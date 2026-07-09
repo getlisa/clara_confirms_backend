@@ -146,7 +146,7 @@ function buildJobSummary(job) {
     description: job.description,
     job_type: job.job_type,
     status: job.status,
-    scheduled_date: formatDate(job.scheduled_date),
+    due_by: formatDate(job.due_by),
 
     customer: {
       name: c.full_name,
@@ -312,7 +312,7 @@ router.post("/reschedule_job", async (req, res) => {
     // Normalise to YYYY-MM-DD
     const dateOnly = new_scheduled_date.split("T")[0];
 
-    const job = await jobsDb.updateJob(Number(job_id), companyId, { scheduled_date: dateOnly });
+    const job = await jobsDb.rescheduleJobToDate(Number(job_id), companyId, dateOnly);
     if (!job) return res.status(404).json({ error: "Job not found" });
 
     logger.info("Tool: reschedule_job", { companyId, job_id, new_scheduled_date: dateOnly });
@@ -402,7 +402,7 @@ router.post("/schedule_callback", async (req, res) => {
 
     // Find the in-flight scheduled_call row that triggered this Retell call.
     const { rows: scRows } = await db.query(
-      `SELECT sc.*, j.scheduled_date AS job_due_date
+      `SELECT sc.*, j.due_by AS job_due_date
        FROM scheduled_calls sc
        LEFT JOIN jobs j ON j.id::text = sc.job_id AND j.company_id = sc.company_id
        WHERE sc.retell_call_id = $1 AND sc.company_id = $2 LIMIT 1`,

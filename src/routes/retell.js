@@ -309,7 +309,7 @@ async function handleCallAnalyzed(callData) {
 async function handleRetryOrCallback({ companyId, retellCallId, inVoicemail, isNoAnswer, customerOutcome, callbackTime }) {
   // Find the scheduled_call row that triggered this Retell call
   const { rows: scRows } = await db.query(
-    `SELECT sc.*, j.scheduled_date AS job_due_date
+    `SELECT sc.*, j.due_by AS job_due_date
      FROM scheduled_calls sc
      LEFT JOIN jobs j ON j.id::text = sc.job_id AND j.company_id = sc.company_id
      WHERE sc.retell_call_id = $1 LIMIT 1`,

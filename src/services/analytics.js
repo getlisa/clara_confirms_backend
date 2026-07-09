@@ -69,7 +69,7 @@ async function getStats(companyId, periodInput) {
     db.query(
       `SELECT
          COUNT(*)                                                                    AS total,
-         COUNT(*) FILTER (WHERE scheduled_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 7
+         COUNT(*) FILTER (WHERE due_by BETWEEN CURRENT_DATE AND CURRENT_DATE + 7
                             AND status NOT IN ('completed','cancelled'))             AS due_soon,
          COUNT(*) FILTER (WHERE status = 'scheduled'
                             AND NOT EXISTS (
@@ -148,7 +148,7 @@ async function getStats(companyId, periodInput) {
       `SELECT
          COUNT(*) FILTER (WHERE c.is_active = true)  AS total_active,
          COUNT(DISTINCT j.customer_id) FILTER (
-           WHERE j.scheduled_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 7
+           WHERE j.due_by BETWEEN CURRENT_DATE AND CURRENT_DATE + 7
              AND j.status NOT IN ('completed','cancelled')
          )                                            AS with_upcoming_jobs,
          COUNT(DISTINCT c.id) FILTER (
