@@ -2216,7 +2216,7 @@ export async function updateCampaign(
 ```json
 // GET /campaigns
 { "campaigns": [
-  { "key": "post_job_review", "name": "Post-job Review",
+  { "key": "post_job_review", "name": "Post Job Feedback Campaign",
     "enabled": false, "days_before": 1,
     "greeting": "Hi {{customer_name}}, this is {{representative_name}}…",
     "prompt": "You are {{representative_name}}, following up after a completed visit…",

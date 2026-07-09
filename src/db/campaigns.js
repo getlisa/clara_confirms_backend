@@ -22,27 +22,27 @@ const CAMPAIGN_KEYS = [
 // text (historically the linked call_type slug).
 const BUILTIN_SEEDS = [
   {
-    key: "scheduled_unconfirmed", name: "Appointment Confirmation", enabled: false,
+    key: "scheduled_unconfirmed", name: "Confirm Campaign", enabled: false,
     days_before: 2, trigger_config: { retry_if_no_answer: true }, prompt_basis: "customer_confirmation",
     description: "Call customer to confirm their upcoming appointment when job is scheduled but unconfirmed.",
   },
   {
-    key: "quotation_pending", name: "Estimate Follow-up", enabled: false,
+    key: "quotation_pending", name: "Quote Follow Up Campaign", enabled: false,
     days_before: 3, trigger_config: { quote_statuses: ["sent", "viewed"], days_after_sent: 3 }, prompt_basis: "quotation_followup",
     description: "Follow up with customer on a sent or viewed quotation that hasn't been accepted yet.",
   },
   {
-    key: "open_job_due_soon", name: "Appointment Needed (Booking)", enabled: false,
+    key: "open_job_due_soon", name: "Booking Campaign", enabled: false,
     days_before: 7, trigger_config: { only_if_technician_assigned: false }, prompt_basis: "customer_confirmation",
     description: "Call customer when an open (unscheduled) job is approaching its due date.",
   },
   {
-    key: "technician_unconfirmed", name: "Technician Confirmation", enabled: false,
+    key: "technician_unconfirmed", name: "Technician Confirm Campaign", enabled: false,
     days_before: 1, trigger_config: {}, prompt_basis: "technician_confirmation",
     description: "Call the assigned technician when a job is scheduled and they haven't confirmed availability yet.",
   },
   {
-    key: "post_job_review", name: "Post-job Review", enabled: false,
+    key: "post_job_review", name: "Post Job Feedback Campaign", enabled: false,
     days_before: 1, trigger_config: { days_after: 1 }, prompt_basis: "post_job_review",
     description: "Call the customer after a completed appointment to check in and collect a review.",
   },
