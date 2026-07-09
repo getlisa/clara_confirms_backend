@@ -7,7 +7,7 @@
  */
 const db = require("../db");
 const retell = require("./retell");
-const callTypeConfigsDb = require("../db/call-type-configs");
+const campaignsDb = require("../db/campaigns");
 const logger = require("../utils/logger");
 
 /**
@@ -16,23 +16,23 @@ const logger = require("../utils/logger");
  * Only overwrites is_custom = false rows.
  */
 async function resetDefaultPrompts(companyId, types = null) {
-  const seeds = callTypeConfigsDb.BUILTIN_SEEDS.filter(
-    s => !types || types.includes(s.type)
+  const seeds = campaignsDb.BUILTIN_SEEDS.filter(
+    s => !types || types.includes(s.key)
   );
   let updated = 0;
   for (const seed of seeds) {
-    const { begin_message, general_prompt } = callTypeConfigsDb.generateDefaultPrompts(
-      seed.type, seed.name, seed.description
+    const { begin_message, general_prompt } = campaignsDb.generateDefaultPrompts(
+      seed.prompt_basis, seed.name, seed.description
     );
     const result = await db.query(
-      `UPDATE call_type_configs
+      `UPDATE campaigns
        SET begin_message = $1, general_prompt = $2, updated_at = NOW()
-       WHERE company_id = $3 AND type = $4 AND is_custom = false`,
-      [begin_message, general_prompt, companyId, seed.type]
+       WHERE company_id = $3 AND trigger_type = $4`,
+      [begin_message, general_prompt, companyId, seed.key]
     );
     if (result.rowCount > 0) {
       updated++;
-      logger.info("resetDefaultPrompts: updated DB", { companyId, type: seed.type });
+      logger.info("resetDefaultPrompts: updated DB", { companyId, campaign: seed.key });
     }
   }
   return { updated };
@@ -65,18 +65,18 @@ async function resetDefaultPromptsForAllCompanies(types = null) {
 async function syncPromptsForCompany(companyId, types = null) {
   // Fetch call type configs with Retell node IDs
   const { rows } = await db.query(
-    `SELECT type, begin_message, general_prompt,
+    `SELECT trigger_type AS type, begin_message, general_prompt,
             retell_llm_id, retell_subagent_node_id
-     FROM call_type_configs
+     FROM campaigns
      WHERE company_id = $1
        AND retell_llm_id IS NOT NULL
        AND retell_subagent_node_id IS NOT NULL
-       ${types && types.length ? `AND type = ANY($2::text[])` : ""}`,
+       ${types && types.length ? `AND trigger_type = ANY($2::text[])` : ""}`,
     types && types.length ? [companyId, types] : [companyId]
   );
 
   if (rows.length === 0) {
-    logger.warn("syncPrompts: no provisioned call types found", { companyId });
+    logger.warn("syncPrompts: no provisioned campaigns found", { companyId });
     return { updated: 0 };
   }
 

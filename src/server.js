@@ -20,7 +20,6 @@ const retellRoutes = require("./routes/retell");
 const todosRoutes = require("./routes/todos");
 const callsRoutes = require("./routes/calls");
 const callSettingsRoutes = require("./routes/call-settings");
-const callTriggersRoutes = require("./routes/call-triggers");
 const campaignsRoutes = require("./routes/campaigns");
 const scheduledCallsRoutes = require("./routes/scheduled-calls");
 const testRoutes = require("./routes/test");
@@ -141,9 +140,8 @@ app.use("/calls", callsRoutes);
 // Call settings (office hours, attempts, voicemail) - requires auth
 app.use("/call-settings", callSettingsRoutes);
 
-// Call trigger configs (when to auto-call customers) - requires auth
-app.use("/call-triggers", callTriggersRoutes);
-// Campaigns (configurable outreach playbooks, on/off toggle) - requires auth
+// Campaigns — the single config entity (trigger + agent). Requires auth.
+// (Supersedes the former /call-triggers route.)
 app.use("/campaigns", campaignsRoutes);
 
 // Scheduled calls queue (view + cancel) - requires auth

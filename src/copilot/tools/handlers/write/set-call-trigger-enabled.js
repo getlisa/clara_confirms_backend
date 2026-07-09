@@ -1,11 +1,11 @@
 const { z } = require("zod");
 const { interrupt } = require("@langchain/langgraph");
-const triggerConfigsDb = require("../../../../db/call-trigger-configs");
+const triggerConfigsDb = require("../../../../db/campaigns");
 
 const schema = z.object({
   trigger_type: z
-    .enum(["scheduled_unconfirmed", "technician_unconfirmed", "open_job_due_soon", "quotation_pending"])
-    .describe("Which call trigger to toggle."),
+    .enum(["scheduled_unconfirmed", "technician_unconfirmed", "open_job_due_soon", "quotation_pending", "post_job_review"])
+    .describe("Which campaign to toggle."),
   enabled: z.boolean().describe("true to enable the trigger, false to disable it."),
 });
 

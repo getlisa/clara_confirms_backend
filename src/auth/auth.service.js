@@ -8,8 +8,7 @@ const jwt = require("jsonwebtoken");
 const db = require("../db");
 const config = require("../config");
 const logger = require("../utils/logger");
-const callTypeConfigsDb = require("../db/call-type-configs");
-const callTriggerConfigsDb = require("../db/call-trigger-configs");
+const campaignsDb = require("../db/campaigns");
 const { syncFlowForCompany } = require("../services/retell-flow");
 
 const SALT_ROUNDS = 12;
@@ -106,9 +105,8 @@ async function register({ email, password, name, companyName }) {
     );
     const company = companyResult.rows[0];
 
-    // Seed built-in call type configs and call trigger configs for the new company
-    await callTypeConfigsDb.seedBuiltins(company.id, client);
-    await callTriggerConfigsDb.seedBuiltins(company.id, client);
+    // Seed the built-in campaigns for the new company (trigger + agent config in one entity)
+    await campaignsDb.seedBuiltins(company.id, client);
 
     // Hash password
     const passwordHash = await hashPassword(password);

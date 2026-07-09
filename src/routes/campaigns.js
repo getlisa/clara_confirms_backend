@@ -1,42 +1,63 @@
 /**
  * Campaigns routes (Process 2 — Delivery)
  *
- * Campaigns are the company's configurable outreach playbooks. v1 exposes a
- * per-campaign on/off toggle. Each campaign maps to an underlying call trigger
- * (call_trigger_configs); the campaign's `call_type` selects which Retell
- * sub-agent handles the interaction.
+ * A campaign is the single config entity: trigger behavior (when/who) + its own
+ * agent (prompt/greeting/voicemail) + provisioned Retell artifacts. Backed by the
+ * `campaigns` table (src/db/campaigns.js).
  *
- * GET   /campaigns          — list the company's campaigns (with enabled flag)
- * PATCH /campaigns/:key     — toggle on/off (and optionally tweak config)
+ * Campaign-facing field names → underlying columns:
+ *   greeting ↔ begin_message   prompt ↔ general_prompt   voicemail ↔ voicemail_message   config ↔ trigger_config
+ *
+ * GET   /campaigns          — list the company's campaigns
+ * PATCH /campaigns/:key     — update config (enabled, prompt, greeting, voicemail, …)
  */
 
 const express = require("express");
-const triggerDb = require("../db/call-trigger-configs");
+const campaignsDb = require("../db/campaigns");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 
 const router = express.Router();
 router.use(authenticate);
 
-function toCampaign(t) {
+function toCampaign(c) {
   return {
-    key:         t.trigger_type,
-    name:        t.description ?? t.trigger_type,
-    enabled:     t.enabled,
-    call_type:   t.call_type,
-    days_before: t.days_before,
-    config:      t.trigger_config ?? {},
-    updated_at:  t.updated_at ?? null,
+    key:         c.key,
+    name:        c.name,
+    enabled:     c.enabled,
+    days_before: c.days_before,
+    greeting:    c.begin_message ?? null,      // agent's opening line
+    prompt:      c.general_prompt ?? null,      // agent instructions (basis of the agent)
+    voicemail:   c.voicemail_message ?? null,   // voicemail template
+    config:      c.trigger_config ?? {},        // trigger-specific settings
+    description: c.description ?? null,
+    updated_at:  c.updated_at ?? null,
   };
 }
+
+// Map campaign-facing fields → underlying campaigns columns.
+function toColumns(body) {
+  const patch = {};
+  if (body.enabled     !== undefined) patch.enabled           = body.enabled;
+  if (body.days_before !== undefined) patch.days_before       = body.days_before;
+  if (body.name        !== undefined) patch.name              = body.name;
+  if (body.greeting    !== undefined) patch.begin_message     = body.greeting;
+  if (body.prompt      !== undefined) patch.general_prompt    = body.prompt;
+  if (body.voicemail   !== undefined) patch.voicemail_message = body.voicemail;
+  if (body.config      !== undefined) patch.trigger_config    = body.config;
+  return patch;
+}
+
+// Fields that change what the live Retell agent says/does → trigger a re-provision.
+const AGENT_AFFECTING = ["enabled", "name", "greeting", "prompt"];
 
 router.get("/", async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
-    const triggers = await triggerDb.getAllByCompanyId(companyId);
-    return res.json({ campaigns: triggers.map(toCampaign) });
+    const campaigns = await campaignsDb.getAllByCompanyId(companyId);
+    return res.json({ campaigns: campaigns.map(toCampaign) });
   } catch (err) {
     logger.error("GET /campaigns failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load campaigns" });
@@ -48,9 +69,6 @@ router.patch("/:key", async (req, res) => {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
-    if (Object.keys(req.body).length === 0) {
-      return res.status(400).json({ error: "No fields to update" });
-    }
     if (req.body.days_before !== undefined) {
       const val = Number(req.body.days_before);
       if (!Number.isInteger(val) || val < 1) {
@@ -58,8 +76,24 @@ router.patch("/:key", async (req, res) => {
       }
     }
 
-    const trigger = await triggerDb.upsert(companyId, req.params.key, req.body);
-    return res.json({ campaign: toCampaign(trigger) });
+    const patch = toColumns(req.body);
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ error: "No updatable fields provided" });
+    }
+
+    const campaign = await campaignsDb.upsert(companyId, req.params.key, patch);
+
+    // If the change affects the live agent, re-provision the Retell flow (non-fatal).
+    if (AGENT_AFFECTING.some((f) => f in req.body)) {
+      try {
+        const { syncFlowForCompany } = require("../services/retell-flow");
+        await syncFlowForCompany(companyId);
+      } catch (err) {
+        logger.warn("PATCH /campaigns: Retell re-sync failed (non-fatal)", { companyId, key: req.params.key, error: err.message });
+      }
+    }
+
+    return res.json({ campaign: toCampaign(campaign) });
   } catch (err) {
     if (err.status === 400) return res.status(400).json({ error: err.message });
     logger.error("PATCH /campaigns/:key failed", { error: err.message });

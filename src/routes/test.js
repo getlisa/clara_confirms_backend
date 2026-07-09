@@ -24,13 +24,13 @@ router.post("/call", async (req, res) => {
     if (!phone_number) return res.status(400).json({ error: "phone_number is required" });
     if (!call_type)    return res.status(400).json({ error: "call_type is required" });
 
-    // Verify the call_type exists and is enabled for this company
+    // Verify the campaign key exists for this company (call_type carries the campaign key)
     const { rows } = await db.query(
-      `SELECT name FROM call_type_configs WHERE company_id = $1 AND type = $2 LIMIT 1`,
+      `SELECT name FROM campaigns WHERE company_id = $1 AND trigger_type = $2 LIMIT 1`,
       [companyId, call_type]
     );
     if (rows.length === 0)
-      return res.status(400).json({ error: `call_type '${call_type}' not found for this company` });
+      return res.status(400).json({ error: `campaign '${call_type}' not found for this company` });
 
     const dynamicVariables = {
       ...(customer_name && { customer_name }),

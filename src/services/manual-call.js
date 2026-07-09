@@ -41,19 +41,12 @@ async function triggerManualCall({
   appointmentId, jobId: rawJobId, quotationId,
   immediate = true, force = false, scheduledAt = null,
 }) {
-  // ── 1. Validate trigger_type and resolve the company's configured call_type ─
+  // ── 1. Validate trigger_type ────────────────────────────────────────────────
   if (!triggerType || !VALID_TRIGGER_TYPES.includes(triggerType)) {
     return { ok: false, status: 400, error: `Invalid trigger_type. Must be one of: ${VALID_TRIGGER_TYPES.join(", ")}` };
   }
-
-  const { rows: trigRows } = await db.query(
-    `SELECT call_type FROM call_trigger_configs WHERE company_id = $1 AND trigger_type = $2 LIMIT 1`,
-    [companyId, triggerType]
-  );
-  if (trigRows.length === 0) {
-    return { ok: false, status: 400, error: `trigger_type '${triggerType}' is not configured for this company` };
-  }
-  const callType = trigRows[0].call_type;
+  // The campaign key IS the routing call_type now (scheduled_calls.call_type holds it).
+  const callType = triggerType;
 
   // Pick the right target_id for the trigger_type.
   const targetField = TARGET_FIELD[triggerType];

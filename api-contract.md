@@ -11,11 +11,13 @@ Auth: `Authorization: Bearer <token>` on all protected endpoints.
 2. [Company](#2-company)
 3. [Users](#3-users)
 4. [Agent Settings](#4-agent-settings)
-5. [Calls](#5-calls)
-6. [Todos](#6-todos)
-7. [Retell Webhook](#7-retell-webhook)
-8. [ServiceTrade Integration](#8-servicetrade-integration)
-9. [Shared Types](#9-shared-types)
+5. [Call Settings](#5-call-settings)
+6. [Calls](#6-calls)
+7. [Todos](#7-todos)
+8. [Testing](#8-testing)
+9. [Retell Webhook](#9-retell-webhook)
+10. [ServiceTrade Integration](#10-servicetrade-integration)
+11. [Shared Types](#11-shared-types)
 
 ---
 
@@ -267,6 +269,12 @@ Partial update. Upserts — safe to call before a row exists.
 
 ## 4a. Call Type Settings
 
+> **⚠️ REMOVED — superseded by Campaigns.** The `call_type_configs` table and the
+> `/agent-settings/call-types` CRUD endpoints below no longer exist. Call types have been folded into
+> the single **`campaigns`** entity (trigger + agent prompt/greeting/voicemail), managed via
+> `GET/PATCH /campaigns` — see `frontend-implementation-guide.md` §13.6. This section is retained for
+> historical context only.
+
 Each company has three independently configurable call types. The scheduler reads these to decide when and how to place each call.
 
 ### Call type identifiers
@@ -450,9 +458,102 @@ For each company:
 
 The call is placed via the Retell AI API using the call type's `begin_message` and `general_prompt`, with all `{{placeholders}}` substituted at call time.
 
+> **Note (Process 2 domain model):** the pseudo-code above is a simplification. The real daily job is driven
+> by per-company **campaign / trigger configs** (`call_trigger_configs`, also exposed as `/campaigns`), and
+> "job date" now resolves from the **appointment** (`appointments.scheduled_start`) or the job's soft
+> **`due_by`** deadline — jobs no longer carry `scheduled_date` / `scheduled_window_*`. Trigger types:
+> `scheduled_unconfirmed`, `technician_unconfirmed`, `open_job_due_soon` (uses `due_by`), `quotation_pending`,
+> `post_job_review`. The `call_type` here is what selects the Retell sub-agent. Full Jobs / Appointments /
+> Campaigns contracts live in `frontend-implementation-guide.md` (§12–§13).
+
 ---
 
-## 5. Calls
+## 5. Call Settings
+
+Per-company call scheduling configuration. Controls office hours, max attempts, and voicemail behavior.
+
+### `GET /call-settings` 🔒
+
+**Response `200`**
+```json
+{
+  "call_settings": {
+    "business_hours_start": "09:00",
+    "business_hours_end": "17:00",
+    "max_attempts": 3,
+    "voicemail_behavior": "leave",
+    "include_weekends": false
+  }
+}
+```
+
+If no row exists yet, return the above defaults.
+
+---
+
+### `PATCH /call-settings` 🔒
+
+All fields optional (partial update). Upserts.
+
+**Request**
+```json
+{
+  "business_hours_start": "08:00",
+  "business_hours_end": "18:00",
+  "max_attempts": 5,
+  "voicemail_behavior": "skip",
+  "include_weekends": false
+}
+```
+
+**Field validation:**
+- `business_hours_start` / `business_hours_end`: `"HH:MM"` 24-hour format; end must be after start
+- `max_attempts`: integer, min `1`, max `10`
+- `voicemail_behavior`: `"leave"` | `"skip"`
+
+**Response `200`** `{ "call_settings": { ...saved } }`  
+**Response `400`** `{ "error": "end time must be after start time" }`
+
+---
+
+### Data model — `call_settings` table
+
+```sql
+CREATE TABLE call_settings (
+  id                    SERIAL PRIMARY KEY,
+  company_id            INTEGER NOT NULL UNIQUE REFERENCES companies(id) ON DELETE CASCADE,
+  business_hours_start  VARCHAR NOT NULL DEFAULT '09:00',
+  business_hours_end    VARCHAR NOT NULL DEFAULT '17:00',
+  max_attempts          INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts BETWEEN 1 AND 10),
+  voicemail_behavior    VARCHAR NOT NULL DEFAULT 'leave' CHECK (voicemail_behavior IN ('leave','skip')),
+  include_weekends      BOOLEAN NOT NULL DEFAULT false,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+---
+
+### Office hours enforcement (scheduler)
+
+The daily scheduler enforces call windows at **two layers**:
+
+**Layer 1 — Schedule time (when the job is picked up for scheduling):**
+Snap `scheduled_at` to the next valid window slot in the company's `default_timezone`. Steps forward hour by hour (up to 14 days) until the candidate time satisfies:
+- Day is within `include_weekends` setting
+- Time is ≥ `business_hours_start` AND < `business_hours_end`
+
+**Layer 2 — Dispatch time (when the scheduler tries to fire a queued call):**
+Re-check `isWithinActiveHours()` at fire time. If the window has closed since scheduling (e.g. was queued near end of day):
+- Block the call
+- Advance `scheduled_at` to next window open (`nextWindowStart()`)
+- Return without placing the Retell call
+
+**Test calls bypass both layers** — see [§8 Testing](#8-testing).
+
+---
+
+## 6. Calls
 
 ### `GET /calls` 🔒
 Returns paginated call history for the company.
@@ -526,7 +627,7 @@ Returns full call record including raw `transcript` array.
 
 ---
 
-## 6. Todos
+## 7. Todos
 
 Post-call action items auto-created after each analyzed call. Equivalent to "escalations" in collection_agent_backend.
 
@@ -664,7 +765,110 @@ Returns the full audit trail for a todo.
 
 ---
 
-## 7. Retell Webhook
+## 8. Testing
+
+Test calls bypass office hours and are scheduled with a fixed 2-minute gap. They are marked `is_test=true` throughout the system and excluded from all production metrics and reports by default.
+
+### `is_test` propagation
+
+Following the same pattern as collection_agent_backend, `is_test` propagates from the trigger down through all related records:
+
+| Table | Column | Set when |
+|---|---|---|
+| `scheduled_calls` | `is_test` | `POST /test/trigger-call` sets to `true` |
+| `calls` | `is_test` | Copied from `scheduled_calls.is_test` on webhook receipt |
+| `todos` | `is_test` | Copied from `calls.is_test` when a todo is created post-call |
+
+**API filtering:** All list endpoints (`GET /calls`, `GET /todos`) default to `is_test=false`. Pass `?is_test=true` to see test records only.
+
+---
+
+### `POST /test/trigger-call` 🔒
+
+Schedules a test call ~2 minutes from now. Office hours and call-type scheduling rules are bypassed entirely.
+
+**Request**
+```json
+{
+  "phone_number": "+14155550100",
+  "call_type": "customer_confirmation",
+  "customer_name": "Jane Doe",
+  "job_date": "2026-05-20",
+  "is_test": true
+}
+```
+
+- `phone_number` — required
+- `call_type` — required; must be a valid call type slug for this company
+- `customer_name` — optional; used to fill `{{customer_name}}` placeholder
+- `job_date` — optional ISO date; used to fill `{{job_date}}` placeholder
+
+**Response `200`**
+```json
+{
+  "call_id": "call_abc123",
+  "scheduled_at": "2026-05-15T14:32:00Z"
+}
+```
+
+**Response `400`**
+```json
+{ "error": "phone_number is required" }
+```
+
+---
+
+### Test scheduling logic
+
+```
+function scheduleTestCall(params):
+  scheduled_at = now() + 2 minutes          // fixed 2-min gap, no office-hours snap
+  
+  INSERT INTO scheduled_calls (
+    company_id, phone_number, call_type, is_test,
+    scheduled_at, customer_name, job_date, status
+  ) VALUES (
+    ..., TRUE, scheduled_at, ...
+  )
+  
+  return { call_id, scheduled_at }
+```
+
+The dispatcher checks `is_test = true` to skip the `isWithinActiveHours()` gate entirely:
+
+```
+function dispatch(row):
+  if not row.is_test:
+    if not isWithinActiveHours(row.company_id, row.timezone):
+      advanceToNextWindow(row)
+      return
+  // proceed with Retell call
+```
+
+---
+
+### Test data in DB
+
+Seed a test job (for manual scheduler testing scripts):
+
+```sql
+-- Insert a test scheduled call
+INSERT INTO scheduled_calls (company_id, phone_number, call_type, is_test, status, scheduled_at)
+VALUES (<company_id>, '+14155550100', 'customer_confirmation', TRUE, 'pending', NOW() + INTERVAL '2 minutes');
+```
+
+Query test records:
+```sql
+-- All test calls
+SELECT * FROM calls WHERE is_test = TRUE ORDER BY created_at DESC;
+
+-- All test todos
+SELECT * FROM todos WHERE is_test = TRUE ORDER BY created_at DESC;
+```
+
+---
+
+## 9. Retell Webhook
 
 ### `POST /retell/webhook`
 Retell calls this endpoint after every call. No auth header — verified via HMAC signature.
@@ -732,7 +936,7 @@ Backend actions:
 
 ---
 
-## 8. ServiceTrade Integration
+## 10. ServiceTrade Integration
 
 ### `POST /integrations/servicetrade/credentials` 🔒
 Save and verify ServiceTrade credentials.
@@ -787,7 +991,7 @@ Returns location detail with service requests, contacts, and assets.
 
 ---
 
-## 9. Shared Types
+## 11. Shared Types
 
 ### TypeScript interfaces
 

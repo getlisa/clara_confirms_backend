@@ -1,7 +1,7 @@
 const { z } = require("zod");
 const { interrupt } = require("@langchain/langgraph");
 const scheduler = require("../../../../services/scheduler");
-const triggerConfigsDb = require("../../../../db/call-trigger-configs");
+const triggerConfigsDb = require("../../../../db/campaigns");
 
 const schema = z.object({}).describe("No parameters.");
 

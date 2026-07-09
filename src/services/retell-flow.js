@@ -59,20 +59,21 @@ const POST_CALL_ANALYSIS_DATA = [
 
 // ── Flow node builders ─────────────────────────────────────────────────────────
 
-function buildBranchNode(callTypes) {
+function buildBranchNode(campaigns) {
   return {
     id: NODE_ROUTER,
     type: "branch",
-    name: "Call Type Router",
+    name: "Campaign Router",
     // Cheapest model — this node never speaks, only evaluates equations silently
     model_choice: { type: "cascading", model: "gpt-4.1-nano" },
-    edges: callTypes.map((ct) => ({
-      id: `edge_${ct.type}`,
-      destination_node_id: nodeId(ct.type),
+    edges: campaigns.map((c) => ({
+      id: `edge_${c.key}`,
+      destination_node_id: nodeId(c.key),
       transition_condition: {
         type: "equation",
         operator: "&&",
-        equations: [{ left: "{{call_type}}", operator: "==", right: ct.type }],
+        // The dynamic variable is still named `call_type`; its value is the campaign key.
+        equations: [{ left: "{{call_type}}", operator: "==", right: c.key }],
       },
     })),
     else_edge: {
@@ -87,94 +88,103 @@ function buildBranchNode(callTypes) {
   };
 }
 
-// Per-call-type extract variable definitions
+// Extract-variable sets (by outcome shape). Emitted variable NAMES are kept
+// stable (customer_outcome / technician_outcome / quote_decision) so the post-call
+// webhook coalesce (src/routes/retell.js) needs no change.
+const CUSTOMER_OUTCOME_VARS = [
+  {
+    type: "enum", name: "customer_outcome", required: true,
+    choices: ["confirmed", "rescheduled", "declined", "no_answer", "callback_requested", "appointment_needed"],
+    description: "What the customer decided. Use 'appointment_needed' when no active appointment exists and customer gave no time preference. Use 'callback_requested' when customer asked to be called back at a specific time.",
+  },
+  {
+    type: "string", name: "preferred_reschedule_date", required: false,
+    description: "Date/time the customer wants to reschedule to.",
+    conditional_prompt: "Only extract if customer_outcome is rescheduled",
+  },
+  {
+    type: "string", name: "callback_time", required: false,
+    description: "The specific time the customer requested for a callback, e.g. '1pm', 'in 30 minutes', '2:30 PM'. Only extract if customer asked to be called back at a particular time.",
+    conditional_prompt: "Only extract if customer_outcome is callback_requested",
+  },
+  {
+    type: "string", name: "customer_notes", required: false,
+    description: "Any specific concerns, questions, or notes the customer mentioned.",
+  },
+];
+const TECHNICIAN_OUTCOME_VARS = [
+  {
+    type: "enum", name: "technician_outcome", required: true,
+    choices: ["confirmed", "unavailable", "need_to_check", "no_answer", "callback_requested"],
+    description: "Whether the technician confirmed availability for the job. Use 'callback_requested' when the technician asked to be called back at a specific time.",
+  },
+  {
+    type: "string", name: "unavailability_reason", required: false,
+    description: "Reason the technician gave for being unavailable.",
+    conditional_prompt: "Only extract if technician_outcome is unavailable",
+  },
+  {
+    type: "string", name: "callback_time", required: false,
+    description: "The specific time the technician requested for a callback, e.g. '1pm', 'in 30 minutes', '2:30 PM'.",
+    conditional_prompt: "Only extract if technician_outcome is callback_requested",
+  },
+  {
+    type: "string", name: "technician_notes", required: false,
+    description: "Any concerns or special notes the technician mentioned about the job.",
+  },
+];
+const QUOTE_OUTCOME_VARS = [
+  {
+    type: "enum", name: "quote_decision", required: true,
+    choices: ["accepted", "rejected", "needs_more_info", "callback_requested", "no_answer"],
+    description: "What the customer decided about the quotation.",
+  },
+  {
+    type: "string", name: "rejection_reason", required: false,
+    description: "Reason the customer gave for rejecting or not accepting the quote.",
+    conditional_prompt: "Only extract if customer rejected or hesitated on the quote",
+  },
+  {
+    type: "string", name: "callback_time", required: false,
+    description: "The specific time the customer requested for a callback.",
+    conditional_prompt: "Only extract if quote_decision is callback_requested",
+  },
+  {
+    type: "string", name: "customer_questions", required: false,
+    description: "Any questions the customer asked about the quote or the work.",
+  },
+];
+
+// Keyed by CAMPAIGN key. The two customer campaigns share the customer set.
+// post_job_review has no extract node (no structured outcome to capture yet).
 const EXTRACT_VARIABLES = {
-  customer_confirmation: [
-    {
-      type: "enum", name: "customer_outcome", required: true,
-      choices: ["confirmed", "rescheduled", "declined", "no_answer", "callback_requested", "appointment_needed"],
-      description: "What the customer decided. Use 'appointment_needed' when no active appointment exists and customer gave no time preference. Use 'callback_requested' when customer asked to be called back at a specific time.",
-    },
-    {
-      type: "string", name: "preferred_reschedule_date", required: false,
-      description: "Date/time the customer wants to reschedule to.",
-      conditional_prompt: "Only extract if customer_outcome is rescheduled",
-    },
-    {
-      type: "string", name: "callback_time", required: false,
-      description: "The specific time the customer requested for a callback, e.g. '1pm', 'in 30 minutes', '2:30 PM'. Only extract if customer asked to be called back at a particular time.",
-      conditional_prompt: "Only extract if customer_outcome is callback_requested",
-    },
-    {
-      type: "string", name: "customer_notes", required: false,
-      description: "Any specific concerns, questions, or notes the customer mentioned.",
-    },
-  ],
-  technician_confirmation: [
-    {
-      type: "enum", name: "technician_outcome", required: true,
-      choices: ["confirmed", "unavailable", "need_to_check", "no_answer", "callback_requested"],
-      description: "Whether the technician confirmed availability for the job. Use 'callback_requested' when the technician asked to be called back at a specific time.",
-    },
-    {
-      type: "string", name: "unavailability_reason", required: false,
-      description: "Reason the technician gave for being unavailable.",
-      conditional_prompt: "Only extract if technician_outcome is unavailable",
-    },
-    {
-      type: "string", name: "callback_time", required: false,
-      description: "The specific time the technician requested for a callback, e.g. '1pm', 'in 30 minutes', '2:30 PM'.",
-      conditional_prompt: "Only extract if technician_outcome is callback_requested",
-    },
-    {
-      type: "string", name: "technician_notes", required: false,
-      description: "Any concerns or special notes the technician mentioned about the job.",
-    },
-  ],
-  quotation_followup: [
-    {
-      type: "enum", name: "quote_decision", required: true,
-      choices: ["accepted", "rejected", "needs_more_info", "callback_requested", "no_answer"],
-      description: "What the customer decided about the quotation.",
-    },
-    {
-      type: "string", name: "rejection_reason", required: false,
-      description: "Reason the customer gave for rejecting or not accepting the quote.",
-      conditional_prompt: "Only extract if customer rejected or hesitated on the quote",
-    },
-    {
-      type: "string", name: "callback_time", required: false,
-      description: "The specific time the customer requested for a callback.",
-      conditional_prompt: "Only extract if quote_decision is callback_requested",
-    },
-    {
-      type: "string", name: "customer_questions", required: false,
-      description: "Any questions the customer asked about the quote or the work.",
-    },
-  ],
+  scheduled_unconfirmed:  CUSTOMER_OUTCOME_VARS,
+  open_job_due_soon:      CUSTOMER_OUTCOME_VARS,
+  technician_unconfirmed: TECHNICIAN_OUTCOME_VARS,
+  quotation_pending:      QUOTE_OUTCOME_VARS,
 };
 
 function extractNodeId(type) { return `extract_${type}`; }
 
-function buildSubagentNode(callType) {
+function buildSubagentNode(campaign) {
   const parts = [];
-  if (callType.begin_message) {
-    parts.push(`[Opening — say this exactly when the call connects]:\n${callType.begin_message}`);
+  if (campaign.begin_message) {
+    parts.push(`[Opening — say this exactly when the call connects]:\n${campaign.begin_message}`);
   }
-  if (callType.general_prompt) parts.push(callType.general_prompt);
+  if (campaign.general_prompt) parts.push(campaign.general_prompt);
 
-  const extractId = extractNodeId(callType.type);
-  const hasExtract = !!EXTRACT_VARIABLES[callType.type];
+  const extractId = extractNodeId(campaign.key);
+  const hasExtract = !!EXTRACT_VARIABLES[campaign.key];
 
   return {
-    id: nodeId(callType.type),
+    id: nodeId(campaign.key),
     type: "subagent",
-    name: callType.name,
+    name: campaign.name,
     model_choice: { type: "cascading", model: "claude-4.6-sonnet" },
     instruction: { type: "prompt", text: parts.join("\n\n") || `You are a scheduling assistant for {{company_name}}.` },
     edges: [
       {
-        id: `edge_${callType.type}_to_${hasExtract ? extractId : NODE_END}`,
+        id: `edge_${campaign.key}_to_${hasExtract ? extractId : NODE_END}`,
         destination_node_id: hasExtract ? extractId : NODE_END,
         transition_condition: {
           type: "prompt",
@@ -185,16 +195,16 @@ function buildSubagentNode(callType) {
   };
 }
 
-function buildExtractNode(callType) {
-  const variables = EXTRACT_VARIABLES[callType.type];
+function buildExtractNode(campaign) {
+  const variables = EXTRACT_VARIABLES[campaign.key];
   if (!variables) return null;
   return {
-    id: extractNodeId(callType.type),
+    id: extractNodeId(campaign.key),
     type: "extract_dynamic_variables",
-    name: `Extract ${callType.name} Outcome`,
+    name: `Extract ${campaign.name} Outcome`,
     variables,
     edges: [{
-      id: `edge_extract_${callType.type}_to_end`,
+      id: `edge_extract_${campaign.key}_to_end`,
       destination_node_id: NODE_END,
       transition_condition: { type: "prompt", prompt: "Always" },
     }],
@@ -205,11 +215,11 @@ function buildEndNode() {
   return { id: NODE_END, type: "end", name: "End Call" };
 }
 
-function buildFlowNodes(callTypes) {
-  const extractNodes = callTypes.map(buildExtractNode).filter(Boolean);
+function buildFlowNodes(campaigns) {
+  const extractNodes = campaigns.map(buildExtractNode).filter(Boolean);
   return [
-    buildBranchNode(callTypes),
-    ...callTypes.map(buildSubagentNode),
+    buildBranchNode(campaigns),
+    ...campaigns.map(buildSubagentNode),
     ...extractNodes,
     buildEndNode(),
   ];
@@ -270,11 +280,11 @@ async function syncFlowForCompany(companyId) {
       [companyId]
     ),
     db.query(
-      // Only include enabled call types — disabled ones get no subagent node
-      `SELECT type, name, description, enabled, begin_message, general_prompt
-       FROM call_type_configs
+      // Only include enabled campaigns — disabled ones get no subagent node
+      `SELECT trigger_type AS key, name, begin_message, general_prompt
+       FROM campaigns
        WHERE company_id = $1 AND enabled = true
-       ORDER BY is_custom ASC, created_at ASC`,
+       ORDER BY trigger_type ASC`,
       [companyId]
     ),
     db.query(
@@ -286,18 +296,18 @@ async function syncFlowForCompany(companyId) {
   const company = companyResult.rows[0];
   if (!company) throw new Error(`Company ${companyId} not found`);
 
-  const callTypes   = callTypesResult.rows;
+  const campaigns   = callTypesResult.rows;
   const repName     = agentSettingsResult.rows[0]?.representative_name || "Clara";
   const voiceId     = agentSettingsResult.rows[0]?.voice_id || config.retell.defaultVoiceId;
   const companyName = company.name;
 
-  if (callTypes.length === 0) {
-    logger.warn("syncFlowForCompany: no enabled call types — skipping Retell sync", { companyId });
+  if (campaigns.length === 0) {
+    logger.warn("syncFlowForCompany: no enabled campaigns — skipping Retell sync", { companyId });
     return null;
   }
 
   const isFirstProvision = !company.retell_conversation_flow_id;
-  const nodes = buildFlowNodes(callTypes);
+  const nodes = buildFlowNodes(campaigns);
   // Load full catalog from DB, then layer company-specific values on top
   const defaultDynVars = await dynamicVarsDb.buildDefaultsForCompany({
     companyName,
@@ -391,19 +401,19 @@ async function syncFlowForCompany(companyId) {
   await agentSettingsDb.updateRetellIds(companyId, {
     retellAgentId:            agentId,
     retellConversationFlowId: flowId,
-    subagentCount:            callTypes.length,
+    subagentCount:            campaigns.length,
   });
 
-  // Stamp each call_type_config row with the node ID, agent ID, and flow ID
-  for (const ct of callTypes) {
+  // Stamp each campaign row with the node ID, agent ID, and flow ID
+  for (const c of campaigns) {
     await db.query(
-      `UPDATE call_type_configs
+      `UPDATE campaigns
        SET retell_subagent_node_id = $1,
            retell_agent_id         = $2,
            retell_llm_id           = $3,
            updated_at              = NOW()
-       WHERE company_id = $4 AND type = $5`,
-      [`node_${ct.type}`, agentId, flowId, companyId, ct.type]
+       WHERE company_id = $4 AND trigger_type = $5`,
+      [`node_${c.key}`, agentId, flowId, companyId, c.key]
     );
   }
 
@@ -471,7 +481,7 @@ async function syncFlowForCompany(companyId) {
     flowId,
     agentId,
     phoneNumber:     phoneNumber || "not set",
-    callTypesInFlow: callTypes.map((ct) => ct.type),
+    campaignsInFlow: campaigns.map((c) => c.key),
     snapshotsSaved:  !!(agentSnapshot && flowSnapshot),
     isFirstProvision,
   });

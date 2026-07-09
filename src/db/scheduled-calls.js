@@ -1,7 +1,8 @@
 const db = require("./index");
 
-/** Customer-facing call types — used for cross-trigger dedup on the same job. */
-const CUSTOMER_CALL_TYPES = ["customer_confirmation", "quotation_followup"];
+/** Customer-facing campaign keys — used for cross-campaign dedup on the same job.
+ *  (scheduled_calls.call_type now holds the campaign key.) */
+const CUSTOMER_CALL_TYPES = ["scheduled_unconfirmed", "open_job_due_soon", "quotation_pending", "post_job_review"];
 
 function quotationJobId(quotationId) {
   return `quotation:${quotationId}`;

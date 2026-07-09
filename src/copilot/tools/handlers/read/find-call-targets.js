@@ -1,6 +1,6 @@
 const { z } = require("zod");
 const db = require("../../../../db");
-const triggerConfigsDb = require("../../../../db/call-trigger-configs");
+const triggerConfigsDb = require("../../../../db/campaigns");
 
 const schema = z.object({
   customer_id: z.union([z.string(), z.number()]).describe("The customer's id (resolve a name with find_customer first)."),

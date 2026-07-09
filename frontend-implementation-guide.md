@@ -5,6 +5,25 @@
 Base URL: `VITE_API_URL` (e.g. `http://localhost:3000`)  
 Auth header: `Authorization: Bearer <token>` on all 🔒 endpoints.
 
+> ### ⚠️ Backend changes — Process 2 (Delivery) domain model
+> The backend now follows the domain model in `domain-model-architecture.md`. Frontend-visible changes:
+> - **Jobs no longer own scheduled time.** `scheduled_date` / `scheduled_window_start` / `scheduled_window_end`
+>   are **removed** from the `jobs` payload. A job now has **`due_by`** (a soft date-only deadline) and
+>   **`earliest_appointment_at`** (read-only, derived from the job's earliest active appointment). **The actual
+>   visit time lives only on the appointment** (`active_appointment.scheduled_start`).
+> - **Reschedule = move the appointment**, not the job. `PATCH /jobs/:id/reschedule` now moves the job's active
+>   appointment (or sets `due_by` if the job has none).
+> - **Campaigns are now the single config entity** (see §13.6). A campaign = trigger behavior + its own
+>   agent (prompt / greeting / voicemail). The old **`/call-triggers`** and **`/agent-settings/call-types`**
+>   endpoints are **REMOVED** — use **`GET/PATCH /campaigns`** for everything (enable/disable, prompt, greeting,
+>   voicemail, days_before, trigger config). The technician campaign key is `technician_unconfirmed`, and a
+>   `post_job_review` campaign was added. Custom call-type creation is gone (fixed campaign set).
+> - Job list filters `scheduled_date_from`/`scheduled_date_to` now filter by `due_by`; new `due_soon` param.
+
+> **⚠️ Superseded sections below:** the `Call Trigger Configuration` (§13.1–§13.5) and the
+> `/agent-settings/call-types` endpoint docs describe removed endpoints. They are retained for history only —
+> **use §13.6 `/campaigns`**. Ignore `technician_scheduled`, `POST/DELETE /call-types`, and `/call-triggers`.
+
 ---
 
 ## Table of Contents
@@ -965,9 +984,8 @@ export interface CustomerJob {
   description: string | null;
   job_type: string | null;
   status: 'open' | 'scheduled' | 'confirmed' | 'in_progress' | 'completed' | 'cancelled';
-  scheduled_date: string | null;
-  scheduled_window_start: string | null;
-  scheduled_window_end: string | null;
+  due_by: string | null;                   // ISO date "2026-05-28" — soft booking/completion deadline
+  earliest_appointment_at: string | null;  // ISO datetime — derived: earliest active appointment (read-only)
   technician_name: string | null;
   technician_phone: string | null;
   // Latest appointment for this job
@@ -1099,8 +1117,8 @@ Returns customer + their complete job history (each with latest appointment) + q
         "title": "Annual HVAC Inspection",
         "job_type": "inspection",
         "status": "scheduled",
-        "scheduled_date": "2026-05-28",
-        "scheduled_window_start": "2026-05-28T09:00:00Z",
+        "due_by": "2026-05-28",
+        "earliest_appointment_at": "2026-05-28T09:00:00Z",
         "technician_name": "Ryan Brooks",
         "technician_phone": "+14085552001",
         "appointment_id": 1,
@@ -1229,7 +1247,8 @@ getCustomer(token, Number(id))
 | Title | `job.title` |
 | Type | `job.job_type` badge |
 | Status | `job.status` badge (color-coded) |
-| Scheduled | `job.scheduled_date` |
+| Due by | `job.due_by` |
+| Scheduled | `job.earliest_appointment_at ?? '—'` |
 | Technician | `job.technician_name` |
 | Appointment | `job.appointment_status` badge |
 | Confirmed | `job.customer_confirmed` ✅/❌ |
@@ -1349,9 +1368,8 @@ export interface Job {
   description: string | null;
   job_type: JobType | null;
   status: JobStatus;
-  scheduled_date: string | null;          // ISO date "2026-05-28"
-  scheduled_window_start: string | null;  // ISO datetime
-  scheduled_window_end: string | null;
+  due_by: string | null;                    // ISO date — soft booking/completion deadline (hard time lives on appointments)
+  earliest_appointment_at: string | null;   // ISO datetime — derived cache of the earliest active appointment (read-only)
   external_ref: string | null;
   source: string | null;
   additional_information: Record<string, unknown>;
@@ -1440,8 +1458,9 @@ export async function getJobs(
     job_type?: JobType;
     customer_id?: number;
     technician_id?: number;
-    scheduled_date_from?: string;   // ISO date
-    scheduled_date_to?: string;
+    scheduled_date_from?: string;   // ISO date — filters by job.due_by (>=)
+    scheduled_date_to?: string;     // ISO date — filters by job.due_by (<=)
+    due_soon?: number;              // jobs whose due_by is within the next N days
     search?: string;                // searches title + customer name
     limit?: number;                 // max 200, default 50
     offset?: number;
@@ -1462,9 +1481,7 @@ export async function createJob(
     description?: string;
     job_type?: JobType;
     status?: JobStatus;
-    scheduled_date?: string;
-    scheduled_window_start?: string;
-    scheduled_window_end?: string;
+    due_by?: string;                // ISO date — soft deadline. Set the visit time via appointments, not here.
     additional_information?: Record<string, unknown>;
   }
 ): Promise<{ success: boolean; job?: Job; error?: string }>
@@ -1474,7 +1491,7 @@ export async function updateJob(
   id: number,
   body: Partial<Pick<Job,
     'technician_id' | 'title' | 'description' | 'job_type' | 'status' |
-    'scheduled_date' | 'scheduled_window_start' | 'scheduled_window_end' | 'additional_information'
+    'due_by' | 'additional_information'
   >>
 ): Promise<{ success: boolean; job?: Job; error?: string }>
 
@@ -1535,7 +1552,7 @@ export async function getTechnicians(
 
 #### `GET /jobs` 🔒
 
-**Query params:** `status`, `job_type`, `customer_id`, `technician_id`, `scheduled_date_from`, `scheduled_date_to`, `search`, `limit` (max 200), `offset`
+**Query params:** `status`, `job_type`, `customer_id`, `technician_id`, `scheduled_date_from` / `scheduled_date_to` (filter by `due_by`), `due_soon` (jobs due within N days), `search`, `limit` (max 200), `offset`
 
 ```json
 {
@@ -1546,9 +1563,8 @@ export async function getTechnicians(
     "title": "Annual HVAC Inspection",
     "job_type": "inspection",
     "status": "scheduled",
-    "scheduled_date": "2026-05-28",
-    "scheduled_window_start": "2026-05-28T09:00:00Z",
-    "scheduled_window_end": "2026-05-28T11:00:00Z",
+    "due_by": "2026-05-28",
+    "earliest_appointment_at": "2026-05-28T09:00:00Z",
     "customer_name": "James Carter",
     "customer_phone": "+14085551001",
     "customer_address": "142 Oak Street, San Jose, CA",
@@ -1606,7 +1622,7 @@ Full detail with nested `customer`, `technician`, `appointments` (full history),
 ```json
 // Request — customer_id required
 { "customer_id": 1, "technician_id": 1, "title": "New Repair", "job_type": "repair",
-  "scheduled_date": "2026-06-10", "scheduled_window_start": "2026-06-10T10:00:00Z" }
+  "due_by": "2026-06-10" }
 // Response 201
 { "job": { ...created } }
 // Response 400
@@ -1619,11 +1635,21 @@ Full detail with nested `customer`, `technician`, `appointments` (full history),
 { "technician_id": 2 }
 // Change status
 { "status": "confirmed" }
-// Update schedule
-{ "scheduled_date": "2026-06-15", "scheduled_window_start": "2026-06-15T09:00:00Z" }
+// Update the soft due date (the visit time is set on the appointment, not the job)
+{ "due_by": "2026-06-15" }
 // Response 200
 { "job": { ...updated } }
 ```
+
+#### `PATCH /jobs/:id/reschedule` 🔒
+Moves the job's **active appointment** to a new date (preserving its time-of-day). If the job has no
+appointment yet, this just sets `due_by`. Body takes a date-only string (key name kept for compatibility):
+```json
+{ "scheduled_date": "2026-06-20" }
+// Response 200 — returns the full updated job (with its appointments)
+{ "job": { ...updated } }
+```
+> Invalidate both `["jobs"]` and `["job", id]` after this call — the appointment moved and job status may have changed to `rescheduled`.
 
 #### `GET /jobs/technicians` 🔒
 
@@ -1704,6 +1730,11 @@ These rules are enforced server-side. The UI must reflect them to avoid confusin
 | `cancelled` | Job cancelled | Either |
 
 **`open` means no appointment record exists for the job.** A job can only be `open` while it has no appointments.
+
+> **Time model:** a job never stores a clock time. `job.due_by` is a soft *deadline* (date-only); the actual
+> visit date/time lives on the appointment (`active_appointment.scheduled_start`). `job.earliest_appointment_at`
+> is a read-only convenience mirror of the earliest active appointment. To show "when is this happening", read
+> the appointment; to show "when is this due", read `due_by`.
 
 ---
 
@@ -1813,7 +1844,7 @@ const jobs = data?.jobs ?? [];
 | Customer | `job.customer_name` | With phone as subtext |
 | Type | `job.job_type` | Badge |
 | Status | `job.status` | Color-coded badge (see below) |
-| Scheduled | `job.scheduled_date` | `May 28` format |
+| Scheduled | `job.active_appointment?.scheduled_start ?? job.due_by` | `May 28` — appointment time if booked, else the due date |
 | Technician | `job.technician_name` | `—` if unassigned |
 | Appointment | `job.active_appointment?.status` | Badge, `—` if none |
 | Confirmed | `job.active_appointment?.customer_confirmed` | ✅ / ❌ / `—` |
@@ -1908,10 +1939,11 @@ const TYPE_OPTIONS = [
 |---|---|---|---|
 | `scheduled_unconfirmed` | **Customer** | Job is scheduled but customer hasn't confirmed | 2 days before appointment |
 | `quotation_pending` | **Customer** | Quotation sent/viewed but not yet accepted | 3 days after sent |
-| `open_job_due_soon` | **Customer** | Open job's `scheduled_date` is approaching | 7 days before |
-| `technician_scheduled` | **Technician** | Appointment is scheduled with an assigned technician who hasn't confirmed | 1 day before appointment |
+| `open_job_due_soon` | **Customer** | Open job's `due_by` is approaching (no appointment yet) | 7 days before |
+| `technician_unconfirmed` | **Technician** | Appointment is scheduled with an assigned technician who hasn't confirmed | 1 day before appointment |
+| `post_job_review` | **Customer** | An appointment was completed — check in / collect a review | 1 day after (via `trigger_config.days_after`) |
 
-**All four are disabled by default.** Tenant enables them in Settings → Call Triggers.
+**All are disabled by default.** Tenant enables them in Settings → Call Triggers (a.k.a. Campaigns — see §13.6).
 
 ---
 
@@ -1924,7 +1956,8 @@ export type CallTriggerType =
   | 'scheduled_unconfirmed'
   | 'quotation_pending'
   | 'open_job_due_soon'
-  | 'technician_scheduled';
+  | 'technician_unconfirmed'
+  | 'post_job_review';
 
 export interface CallTriggerConfig {
   trigger_type: CallTriggerType;
@@ -1939,6 +1972,8 @@ export interface CallTriggerConfig {
     days_after_sent?: number;    // default: 3
     // open_job_due_soon
     only_if_technician_assigned?: boolean;
+    // post_job_review
+    days_after?: number;         // default: 1 — call this many days after the appointment completes
   };
   description: string | null;
   updated_at: string;
@@ -1952,7 +1987,7 @@ export interface CallTriggerConfig {
 Add to `src/lib/auth-api.ts`:
 
 ```typescript
-// GET /call-triggers — always returns all 3 trigger configs
+// GET /call-triggers — always returns all trigger configs (currently 5)
 export async function getCallTriggers(token: string):
   Promise<{ call_triggers: CallTriggerConfig[] } | null>
 
@@ -1975,7 +2010,7 @@ export async function updateCallTrigger(
 
 #### `GET /call-triggers` 🔒
 
-Always returns all four triggers. Missing DB rows return built-in defaults.
+Always returns all trigger configs (currently 5). Missing DB rows return built-in defaults.
 
 ```json
 {
@@ -2005,12 +2040,20 @@ Always returns all four triggers. Missing DB rows return built-in defaults.
       "description": "Call customer when an open (unscheduled) job is approaching its expected date."
     },
     {
-      "trigger_type": "technician_scheduled",
+      "trigger_type": "technician_unconfirmed",
       "enabled": false,
       "call_type": "technician_confirmation",
       "days_before": 1,
       "trigger_config": {},
-      "description": "Call the assigned technician when an appointment is scheduled to confirm their availability."
+      "description": "Call the assigned technician when a job is scheduled and they haven't confirmed availability yet."
+    },
+    {
+      "trigger_type": "post_job_review",
+      "enabled": false,
+      "call_type": "post_job_review",
+      "days_before": 1,
+      "trigger_config": { "days_after": 1 },
+      "description": "Call the customer after a completed appointment to check in and collect a review."
     }
   ]
 }
@@ -2018,7 +2061,7 @@ Always returns all four triggers. Missing DB rows return built-in defaults.
 
 #### `PATCH /call-triggers/:type` 🔒
 
-`:type` must be one of: `scheduled_unconfirmed`, `quotation_pending`, `open_job_due_soon`, `technician_scheduled`
+`:type` must be one of: `scheduled_unconfirmed`, `quotation_pending`, `open_job_due_soon`, `technician_unconfirmed`, `post_job_review`
 
 ```json
 // Enable a trigger
@@ -2095,10 +2138,11 @@ Call Triggers
 | Tenant scenario | Configuration |
 |---|---|
 | "Only confirm scheduled appointments" | Enable `scheduled_unconfirmed` only |
-| "Also notify technicians" | Enable `scheduled_unconfirmed` + `technician_scheduled` |
+| "Also notify technicians" | Enable `scheduled_unconfirmed` + `technician_unconfirmed` |
 | "No quotation follow-ups" | Leave `quotation_pending` disabled |
 | "Call open jobs 1 week out" | Enable `open_job_due_soon`, `days_before = 7` |
-| "Full automation" | Enable all four |
+| "Review calls after visits" | Enable `post_job_review` |
+| "Full automation" | Enable all |
 | "Manual calls only" | All disabled (default) |
 
 ---
@@ -2112,6 +2156,80 @@ Call Triggers
 - [ ] Toggle `enabled` → immediate PATCH (no Save)
 - [ ] `days_before` / `trigger_config` → Save button → PATCH
 - [ ] `call_type` dropdown from `GET /agent-settings/call-types`
+
+---
+
+### 13.6 Campaigns endpoint (`/campaigns`) — the campaign config surface
+
+A **campaign** is the single editable unit that owns **both** the trigger config (*when/who* to call) **and
+the agent's `prompt` + `greeting`** (*what the agent says* — the campaign is the basis of the agent). It maps
+to a `call_trigger_configs` row. `/campaigns` is the recommended surface for the campaign UI; the campaign-
+facing field names are translated to the underlying columns for you:
+
+**This is the single config surface.** `/call-triggers` and `/agent-settings/call-types` are removed.
+
+| Campaign field | Underlying column |
+|---|---|
+| `greeting` | `begin_message` |
+| `prompt` | `general_prompt` |
+| `voicemail` | `voicemail_message` |
+| `config` | `trigger_config` |
+
+```typescript
+export type CampaignKey =
+  | 'scheduled_unconfirmed' | 'open_job_due_soon' | 'quotation_pending'
+  | 'technician_unconfirmed' | 'post_job_review';
+
+export interface Campaign {
+  key: CampaignKey;
+  name: string;
+  enabled: boolean;
+  days_before: number;
+  greeting: string | null;            // agent's opening line (== begin_message)
+  prompt: string | null;              // agent instructions — the basis of the agent (== general_prompt)
+  voicemail: string | null;           // voicemail template (== voicemail_message)
+  config: Record<string, unknown>;    // trigger-specific settings (== trigger_config)
+  description: string | null;
+  updated_at: string | null;
+}
+
+// GET /campaigns 🔒
+export async function getCampaigns(token: string):
+  Promise<{ campaigns: Campaign[] } | null>
+
+// PATCH /campaigns/:key 🔒 — update any config field (send only what changes)
+export async function updateCampaign(
+  token: string,
+  key: CampaignKey,
+  body: {
+    enabled?: boolean;
+    days_before?: number;   // integer >= 1
+    name?: string;
+    greeting?: string;      // → begin_message
+    prompt?: string;        // → general_prompt
+    voicemail?: string;     // → voicemail_message
+    config?: Record<string, unknown>;  // → trigger_config
+  }
+): Promise<{ campaign?: Campaign; error?: string }>
+```
+
+```json
+// GET /campaigns
+{ "campaigns": [
+  { "key": "post_job_review", "name": "Post-job Review",
+    "enabled": false, "days_before": 1,
+    "greeting": "Hi {{customer_name}}, this is {{representative_name}}…",
+    "prompt": "You are {{representative_name}}, following up after a completed visit…",
+    "voicemail": "Hi {{customer_name}}, this is {{representative_name}} from {{company_name}}…",
+    "config": { "days_after": 1 }, "description": "…", "updated_at": null } ] }
+
+// PATCH /campaigns/post_job_review  { "enabled": true, "prompt": "New agent instructions…" }
+{ "campaign": { "key": "post_job_review", "enabled": true, "prompt": "New agent instructions…", ... } }
+```
+
+> **Prompt/greeting edits take effect on live calls.** A campaign owns its agent; editing `prompt`,
+> `greeting`, `name`, or `enabled` triggers a Retell re-provision automatically on the backend, so the
+> next call reflects the change. `config`/`days_before` affect scheduling immediately.
 
 ---
 
@@ -2390,16 +2508,18 @@ Scheduled Calls
 
 ---
 
-### 14.6 Naming Note — `technician_scheduled` vs `technician_unconfirmed`
+### 14.6 Naming Note — `technician_unconfirmed` (corrected)
 
-The frontend agent's `BACKEND_CHANGES.md` refers to a trigger called `technician_unconfirmed`. The backend uses `technician_scheduled` — same logic, different name. Use `technician_scheduled` everywhere in the frontend.
+⚠️ **Correction:** the backend trigger type is **`technician_unconfirmed`** (renamed from the old
+`technician_scheduled` in an earlier migration). Use `technician_unconfirmed` everywhere in the frontend —
+`technician_scheduled` no longer exists and returns `400`.
 
 ```typescript
 // Correct
-updateCallTrigger(token, 'technician_scheduled', { enabled: true })
+updateCallTrigger(token, 'technician_unconfirmed', { enabled: true })
 
-// Wrong — this type does not exist
-updateCallTrigger(token, 'technician_unconfirmed', { enabled: true })  // ← 400 error
+// Wrong — this type no longer exists
+updateCallTrigger(token, 'technician_scheduled', { enabled: true })  // ← 400 error
 ```
 
 ---
@@ -2416,8 +2536,8 @@ The frontend agent's `BACKEND_CHANGES.md` listed several items as "missing". All
 | `quotation_followup` call type seeded | ✅ Done |
 | Scheduler `quotation_pending` logic | ✅ Done |
 | Scheduler `open_job_due_soon` logic | ✅ Done |
-| Scheduler `technician_scheduled` logic | ✅ Done |
-| 4 call trigger types seeded per company | ✅ Done |
+| Scheduler `technician_unconfirmed` logic | ✅ Done |
+| Call trigger types seeded per company (now 5, incl. `post_job_review`) | ✅ Done |
 
 ---
 
@@ -2433,7 +2553,7 @@ The frontend agent's `BACKEND_CHANGES.md` listed several items as "missing". All
 - [ ] "Run daily job" button → `POST /scheduler/daily` → refetch
 - [ ] "Run dispatcher" button → `POST /scheduler/run` → refetch
 - [ ] Auto-refresh every 30s when `in_progress` rows exist
-- [ ] Use `technician_scheduled` (not `technician_unconfirmed`) for the 4th trigger type
+- [ ] Use `technician_unconfirmed` for the technician trigger type (the old `technician_scheduled` name is gone)
 
 ---
 

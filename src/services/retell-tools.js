@@ -12,6 +12,7 @@ const retell = require("./retell");
 const db = require("../db");
 const callSettingsDb = require("../db/call-settings");
 const toolDefsDb = require("../db/tool-definitions");
+const campaignsDb = require("../db/campaigns");
 const logger = require("../utils/logger");
 
 function getBaseUrl() {
@@ -68,17 +69,17 @@ async function registerToolsForCompany(companyId) {
   const settings = await callSettingsDb.getByCompanyId(companyId);
   const canMakeChanges = settings.agent_can_make_changes !== false;
 
-  // Fetch subagent node IDs per call type
-  const { rows: callTypeRows } = await db.query(
-    `SELECT type, retell_llm_id, retell_subagent_node_id
-     FROM call_type_configs
+  // Fetch subagent node IDs per campaign
+  const { rows: campaignRows } = await db.query(
+    `SELECT trigger_type AS key, retell_llm_id, retell_subagent_node_id
+     FROM campaigns
      WHERE company_id = $1
        AND retell_llm_id IS NOT NULL
        AND retell_subagent_node_id IS NOT NULL`,
     [companyId]
   );
 
-  if (callTypeRows.length === 0) {
+  if (campaignRows.length === 0) {
     logger.warn("registerToolsForCompany: no provisioned subagent nodes found", { companyId });
     return;
   }
@@ -101,7 +102,7 @@ async function registerToolsForCompany(companyId) {
     toolsByCallType[t.call_type].push(built);
   }
 
-  const flowId = callTypeRows[0].retell_llm_id;
+  const flowId = campaignRows[0].retell_llm_id;
   const client = retell.getClient();
   const flow = await client.conversationFlow.retrieve(flowId);
   const nodes = flow.nodes ?? [];
@@ -112,8 +113,10 @@ async function registerToolsForCompany(companyId) {
       "Collect the customer's intent and preferences, let them know a team member will follow up, then end the call politely.]";
 
   let updated = 0;
-  for (const row of callTypeRows) {
-    const perTypeTools = toolsByCallType[row.type] || [];
+  for (const row of campaignRows) {
+    // Tools are still keyed by the historical call_type; map the campaign → its basis.
+    const basis = campaignsDb.PROMPT_BASIS[row.key] || row.key;
+    const perTypeTools = toolsByCallType[basis] || [];
     // Universal tools always appended. Sort_order=99 on universal tools keeps
     // them at the end of the agent's tool list (lower-precedence visually).
     const tools = [...perTypeTools, ...universalTools];
@@ -136,7 +139,7 @@ async function registerToolsForCompany(companyId) {
     };
     updated++;
     logger.info("registerToolsForCompany: node patched", {
-      type: row.type,
+      campaign: row.key,
       nodeId: row.retell_subagent_node_id,
       toolCount: tools.length,
       perTypeCount: perTypeTools.length,
