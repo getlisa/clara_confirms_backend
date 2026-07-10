@@ -32,6 +32,7 @@ const adminRoutes = require("./routes/admin");
 const enginesRoutes = require("./routes/engines");
 const manualCallsRoutes = require("./routes/manual-calls");
 const copilotRoutes = require("./routes/copilot");
+const onboardingRoutes = require("./routes/onboarding");
 
 const app = express();
 
@@ -143,6 +144,8 @@ app.use("/call-settings", callSettingsRoutes);
 // Campaigns — the single config entity (trigger + agent). Requires auth.
 // (Supersedes the former /call-triggers route.)
 app.use("/campaigns", campaignsRoutes);
+// Onboarding — server-side new-company setup orchestration. Requires auth.
+app.use("/onboarding", onboardingRoutes);
 
 // Scheduled calls queue (view + cancel) - requires auth
 app.use("/scheduled-calls", scheduledCallsRoutes);

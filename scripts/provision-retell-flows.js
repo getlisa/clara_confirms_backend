@@ -5,14 +5,14 @@
  *   node scripts/provision-retell-flows.js
  *
  * What it does per company:
- *   1. Seeds missing built-in call_type_configs rows (idempotent)
+ *   1. Seeds missing built-in campaigns (idempotent)
  *   2. Calls syncFlowForCompany — creates ConversationFlow + Agent in Retell
  *   3. Links retell_phone_number to agent if one is set on the company
  */
 
 require("dotenv").config();
 const db = require("../src/db");
-const { seedBuiltins } = require("../src/db/call-type-configs");
+const { seedBuiltins } = require("../src/db/campaigns");
 const { syncFlowForCompany } = require("../src/services/retell-flow");
 const logger = require("../src/utils/logger");
 

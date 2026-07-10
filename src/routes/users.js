@@ -12,6 +12,7 @@ const logger = require("../utils/logger");
 const { authenticate, requireRole } = require("../auth/auth.middleware");
 const { sendMail, buildEmailTemplate } = require("../utils/email");
 const companySettings = require("../db/company-settings");
+const { inviteUser } = require("../services/user-invite");
 
 const router = express.Router();
 
@@ -57,99 +58,11 @@ router.get("/", authenticate, async (req, res) => {
 router.post("/invite", authenticate, requireRole("admin"), async (req, res) => {
   try {
     const { email, first_name, last_name, role } = req.body;
-
-    if (!email || !first_name) {
-      return res.status(400).json({ error: "Email and first name are required" });
-    }
-
-    const normalizedEmail = email.toLowerCase().trim();
-    const userRole = role === "admin" ? "admin" : "user";
-
-    // Check if email already exists in any company
-    const existing = await db.query(
-      "SELECT id FROM users WHERE email = $1",
-      [normalizedEmail]
+    const newUser = await inviteUser(
+      req.user.companyId,
+      { email, first_name, last_name, role },
+      req.user.userId
     );
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ error: "Email is already registered" });
-    }
-
-    // Enforce max_users from company_settings (count only non-deleted users)
-    const companyId = req.user.companyId;
-    if (companyId == null) {
-      logger.warn("Invite rejected: company context missing");
-      return res.status(400).json({ error: "Company context missing" });
-    }
-    const maxUsers = Number(await companySettings.getMaxUsers(companyId)) || companySettings.DEFAULT_MAX_USERS;
-    const countResult = await db.query(
-      "SELECT COUNT(*)::int AS count FROM users WHERE company_id = $1 AND is_deleted = FALSE",
-      [companyId]
-    );
-    const currentCount = Number(countResult.rows[0]?.count ?? 0);
-    logger.info("Invite max_users check", { companyId, currentCount, maxUsers, allowed: currentCount < maxUsers });
-    if (currentCount >= maxUsers) {
-      return res.status(403).json({
-        error: "User limit reached",
-        message: `This company can have up to ${maxUsers} user(s). Contact your admin to increase the limit.`,
-        max_users: maxUsers,
-      });
-    }
-
-    // Get company name for the email
-    const companyResult = await db.query(
-      "SELECT name FROM companies WHERE id = $1",
-      [req.user.companyId]
-    );
-    const companyName = companyResult.rows[0]?.name || "Clara Confirms";
-
-    // Insert user without password (invited, pending setup)
-    const insertResult = await db.query(
-      `INSERT INTO users (company_id, email, first_name, last_name, role, is_active)
-       VALUES ($1, $2, $3, $4, $5, true)
-       RETURNING id, email, first_name, last_name, role, is_active, created_at`,
-      [req.user.companyId, normalizedEmail, first_name.trim(), (last_name || "").trim(), userRole]
-    );
-    const newUser = insertResult.rows[0];
-
-    // Generate invite token (7-day expiry, type: invite)
-    const inviteToken = jwt.sign(
-      {
-        email: normalizedEmail,
-        companyId: req.user.companyId,
-        type: "invite",
-      },
-      config.jwt.secret,
-      { expiresIn: "7d" }
-    );
-
-    // Build invite URL (uses reset-password page with invite flag)
-    const inviteUrl = `${config.frontendUrl}/reset-password?token=${encodeURIComponent(inviteToken)}&invite=true`;
-
-    // Send invite email
-    const html = buildEmailTemplate({
-      userName: first_name.trim(),
-      companyName,
-      title: "You've been invited to join " + companyName,
-      bodyHtml: `
-        <p>You've been invited to join <strong>${companyName}</strong> on Clara Confirms.</p>
-        <p>Click the button below to set up your password and access your account.</p>
-      `,
-      buttonText: "Set Up Your Account",
-      buttonUrl: inviteUrl,
-      footerText: "This invitation link expires in 7 days.",
-    });
-
-    await sendMail({
-      to: normalizedEmail,
-      subject: `You're invited to ${companyName}`,
-      html,
-    });
-
-    logger.info("User invited", {
-      invitedUserId: newUser.id,
-      invitedBy: req.user.userId,
-      companyId: req.user.companyId,
-    });
 
     return res.status(201).json({
       message: "Invitation sent",
@@ -165,6 +78,12 @@ router.post("/invite", authenticate, requireRole("admin"), async (req, res) => {
       },
     });
   } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({
+        error: err.message,
+        ...(err.max_users ? { max_users: err.max_users } : {}),
+      });
+    }
     logger.error("Failed to invite user", { error: err.message });
     return res.status(500).json({ error: "Failed to invite user" });
   }
