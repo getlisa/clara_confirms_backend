@@ -11,6 +11,8 @@ Auth: `Authorization: Bearer <token>` on all protected endpoints.
 2. [Company](#2-company)
 3. [Users](#3-users)
 4. [Agent Settings](#4-agent-settings)
+4a. [Campaigns](#4a-campaigns)
+4b. [Onboarding](#4b-onboarding)
 5. [Call Settings](#5-call-settings)
 6. [Calls](#6-calls)
 7. [Todos](#7-todos)
@@ -267,204 +269,80 @@ Partial update. Upserts — safe to call before a row exists.
 
 ---
 
-## 4a. Call Type Settings
+## 4a. Campaigns
 
-> **⚠️ REMOVED — superseded by Campaigns.** The `call_type_configs` table and the
-> `/agent-settings/call-types` CRUD endpoints below no longer exist. Call types have been folded into
-> the single **`campaigns`** entity (trigger + agent prompt/greeting/voicemail), managed via
-> `GET/PATCH /campaigns` — see `frontend-implementation-guide.md` §13.6. This section is retained for
-> historical context only.
+A **campaign** is the single config entity for outreach — trigger behavior (when/who to call) + its own
+agent (prompt/greeting/voicemail). It replaces the removed `call_type_configs` + `call_trigger_configs`.
+Fixed set of 5 keys: `scheduled_unconfirmed`, `open_job_due_soon`, `quotation_pending`,
+`technician_unconfirmed`, `post_job_review`. `enabled` controls both scheduling and whether the campaign's
+sub-agent is provisioned into the Retell flow.
 
-Each company has three independently configurable call types. The scheduler reads these to decide when and how to place each call.
+Campaign-facing fields → columns: `greeting`↔`begin_message`, `prompt`↔`general_prompt`,
+`voicemail`↔`voicemail_message`, `config`↔`trigger_config`.
 
-### Call type identifiers
+### `GET /campaigns` 🔒
+```json
+{ "campaigns": [
+  { "key": "scheduled_unconfirmed", "name": "Confirm Campaign", "enabled": true, "days_before": 2,
+    "greeting": "Hi {{customer_name}}…", "prompt": "You are {{representative_name}}…",
+    "voicemail": "Hi {{customer_name}}…", "config": { "retry_if_no_answer": true },
+    "description": "…", "updated_at": "2026-05-09T10:00:00Z" }
+] }
+```
 
-| `type` | Who is called | When triggered |
-|---|---|---|
-| `customer_confirmation` | End customer | N days before the job |
-| `technician_confirmation` | Assigned technician | N days before the job |
-| `technician_reschedule` | Assigned technician | N days before the job when technician is marked unavailable |
+### `PATCH /campaigns/:key` 🔒
+Send only the fields that change. Editing `enabled`/`name`/`greeting`/`prompt` re-provisions the Retell flow
+automatically.
+```json
+// Request
+{ "enabled": true, "prompt": "New agent instructions", "greeting": "Hi…", "voicemail": "…",
+  "days_before": 2, "config": { "days_after": 1 } }
+// Response 200
+{ "campaign": { ...updated } }
+```
 
 ---
 
-### `GET /agent-settings/call-types` 🔒
-Returns all three call type configs for the company. Missing rows are returned with default values.
+## 4b. Onboarding
 
-**Response `200`**
+Server-side new-company setup — one call runs every step in order and ends with an awaited Retell provision.
+Replaces the old frontend-orchestrated sequence of PATCH calls.
+
+### `POST /onboarding` 🔒 Admin
+Runs, in order, each best-effort: company profile + area code → agent identity → call settings →
+enable/configure campaigns → **awaited** Retell provision (builds flow/agent, buys phone) → team invites.
+A failing Retell provision is **non-fatal** (reported in `errors`; the other steps still persist), so this
+returns `200` with a status payload rather than erroring.
 ```json
+// Request — all sections optional; send what you're setting
 {
-  "call_types": [
-    {
-      "type": "customer_confirmation",
-      "enabled": true,
-      "days_before": 2,
-      "begin_message": "Hi {{customer_name}}, this is {{representative_name}} calling from {{company_name}}...",
-      "general_prompt": "You are {{representative_name}}, a friendly scheduling assistant..."
-    },
-    {
-      "type": "technician_confirmation",
-      "enabled": true,
-      "days_before": 1,
-      "begin_message": "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}...",
-      "general_prompt": "You are {{representative_name}}, a scheduling coordinator..."
-    },
-    {
-      "type": "technician_reschedule",
-      "enabled": false,
-      "days_before": 1,
-      "begin_message": "Hi {{technician_name}}, this is {{representative_name}} from {{company_name}}...",
-      "general_prompt": "You are {{representative_name}}, a scheduling coordinator..."
-    }
-  ]
+  "company":  { "default_timezone": "America/Los_Angeles", "state": "CA", "address_line1": "…", "city": "…",
+                "zipcode": "…", "country": "US", "office_area_code": "408" },
+  "agent":    { "representative_name": "Clara", "voice_id": "…" },
+  "call_settings": { "business_hours_start": "09:00", "business_hours_end": "17:00", "include_weekends": false },
+  "campaigns": [ { "key": "scheduled_unconfirmed", "enabled": true, "prompt": "…", "greeting": "…", "voicemail": "…" } ],
+  "invites":  [ { "email": "u@x.com", "first_name": "A", "last_name": "B", "role": "user" } ],
+  "mark_complete": true
+}
+// Response 200
+{
+  "steps": { "company_profile": true, "agent_identity": true, "call_settings": true },
+  "campaigns": [ { "key": "scheduled_unconfirmed", "enabled": true } ],
+  "invited": [ { "id": 3, "email": "u@x.com" } ],
+  "retell": { "flow_id": "…", "agent_id": "…", "phone_number": "…" },
+  "errors": [],
+  "status": { "...": "same shape as GET /onboarding/status" }
 }
 ```
+> `office_area_code` is optional — if `state` is given it's derived automatically. `retell` is `null` until a
+> campaign is enabled + provisioning succeeds.
 
----
-
-### `POST /agent-settings/call-types` 🔒
-Create a custom call type. Built-in types cannot be created via this endpoint.
-
-**Request**
+### `GET /onboarding/status` 🔒
 ```json
-{
-  "name": "Post-job Follow-up",
-  "description": "Call the customer after the job is completed to confirm satisfaction.",
-  "days_before": 0,
-  "begin_message": "Hi {{customer_name}}, this is {{representative_name}} from {{company_name}}...",
-  "general_prompt": "You are {{representative_name}}, a customer satisfaction assistant..."
-}
+{ "status": {
+  "company_profile": true, "agent_identity": true, "campaigns_enabled": true, "enabled_campaign_count": 2,
+  "retell_provisioned": true, "phone_number_set": true, "completed": true } }
 ```
-- `name` — required, must be unique within the company
-- `description` — required
-- `days_before`, `begin_message`, `general_prompt` — optional, default to `2`, empty string, empty string
-
-**Response `201`**
-```json
-{
-  "call_type": {
-    "type": "post_job_follow_up",
-    "name": "Post-job Follow-up",
-    "description": "Call the customer after the job is completed to confirm satisfaction.",
-    "is_custom": true,
-    "enabled": false,
-    "days_before": 2,
-    "begin_message": "...",
-    "general_prompt": "..."
-  }
-}
-```
-> `type` (slug) is auto-generated from `name` on the backend (e.g. `"Post-job Follow-up"` → `"post_job_follow_up"`). It is used as the URL param for subsequent PATCH/DELETE calls.
-
-**Response `400`** `{ "error": "name is required" }`  
-**Response `409`** `{ "error": "A call type with this name already exists" }`
-
----
-
-### `PATCH /agent-settings/call-types/:type` 🔒
-Partial update for any call type (built-in or custom). Upserts for built-ins — safe to call before a row exists.  
-`:type` is the slug: built-in (`customer_confirmation`, etc.) or custom (auto-generated slug).
-
-**Request** _(all fields optional)_
-```json
-{
-  "name": "Post-job Follow-up",
-  "description": "Updated description.",
-  "enabled": true,
-  "days_before": 2,
-  "begin_message": "Hi {{customer_name}}, this is {{representative_name}}...",
-  "general_prompt": "You are {{representative_name}}, a scheduling assistant..."
-}
-```
-> `name` and `description` are only updatable on custom types. They are ignored for built-in types.
-
-**Response `200`** `{ "call_type": { ...saved } }`  
-**Response `400`** `{ "error": "days_before must be an integer >= 1" }`  
-**Response `404`** `{ "error": "Call type not found" }`
-
----
-
-### `DELETE /agent-settings/call-types/:type` 🔒
-Delete a custom call type. Built-in types cannot be deleted.
-
-**Response `200`** `{ "message": "Deleted" }`  
-**Response `403`** `{ "error": "Built-in call types cannot be deleted" }`  
-**Response `404`** `{ "error": "Call type not found" }`
-
----
-
-### Data model — `call_type_configs` table
-
-```sql
-CREATE TABLE call_type_configs (
-  id            SERIAL PRIMARY KEY,
-  company_id    INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-  type          VARCHAR NOT NULL,                     -- slug; built-in or auto-generated
-  name          VARCHAR NOT NULL,                     -- display name
-  description   TEXT NOT NULL DEFAULT '',
-  is_custom     BOOLEAN NOT NULL DEFAULT false,
-  enabled       BOOLEAN NOT NULL DEFAULT false,
-  days_before   INTEGER NOT NULL DEFAULT 2 CHECK (days_before >= 1),
-  begin_message TEXT,
-  general_prompt TEXT,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (company_id, type)
-);
-```
-
-Seed the three built-in rows for every new company on registration:
-```sql
-INSERT INTO call_type_configs (company_id, type, name, description, is_custom, enabled, days_before)
-VALUES
-  (<id>, 'customer_confirmation',   'Customer Confirmation',         'Call the end customer to confirm their upcoming appointment.',              false, true,  2),
-  (<id>, 'technician_confirmation', 'Technician Confirmation',       'Call the assigned technician to confirm availability for the job.',         false, true,  1),
-  (<id>, 'technician_reschedule',   'Technician Reschedule Notice',  'Notify the technician that their job needs to be rescheduled.',             false, false, 1);
-```
-
----
-
-### Placeholder reference
-
-| Placeholder | Available in |
-|---|---|
-| `{{company_name}}` | All types |
-| `{{representative_name}}` | All types |
-| `{{job_date}}` | All types |
-| `{{job_id}}` | All types |
-| `{{customer_name}}` | `customer_confirmation` |
-| `{{technician_name}}` | `technician_confirmation`, `technician_reschedule` |
-| `{{customer_address}}` | `technician_confirmation`, `technician_reschedule` |
-
----
-
-### Scheduler logic (backend daily job)
-
-```
-For each company:
-  For each enabled call_type_config:
-    target_date = today + days_before
-    jobs = fetch jobs where job_date = target_date
-
-    if type = customer_confirmation:
-      for each job: place call to job.customer.phone
-    
-    if type = technician_confirmation:
-      for each job: place call to job.technician.phone
-    
-    if type = technician_reschedule:
-      for each job where technician.available = false:
-        place call to job.technician.phone
-```
-
-The call is placed via the Retell AI API using the call type's `begin_message` and `general_prompt`, with all `{{placeholders}}` substituted at call time.
-
-> **Note (Process 2 domain model):** the pseudo-code above is a simplification. The real daily job is driven
-> by per-company **campaign / trigger configs** (`call_trigger_configs`, also exposed as `/campaigns`), and
-> "job date" now resolves from the **appointment** (`appointments.scheduled_start`) or the job's soft
-> **`due_by`** deadline — jobs no longer carry `scheduled_date` / `scheduled_window_*`. Trigger types:
-> `scheduled_unconfirmed`, `technician_unconfirmed`, `open_job_due_soon` (uses `due_by`), `quotation_pending`,
-> `post_job_review`. The `call_type` here is what selects the Retell sub-agent. Full Jobs / Appointments /
-> Campaigns contracts live in `frontend-implementation-guide.md` (§12–§13).
 
 ---
 
@@ -791,7 +669,7 @@ Schedules a test call ~2 minutes from now. Office hours and call-type scheduling
 ```json
 {
   "phone_number": "+14155550100",
-  "call_type": "customer_confirmation",
+  "call_type": "scheduled_unconfirmed",
   "customer_name": "Jane Doe",
   "job_date": "2026-05-20",
   "is_test": true
@@ -799,7 +677,7 @@ Schedules a test call ~2 minutes from now. Office hours and call-type scheduling
 ```
 
 - `phone_number` — required
-- `call_type` — required; must be a valid call type slug for this company
+- `call_type` — required; the campaign key to route to (e.g. `scheduled_unconfirmed`)
 - `customer_name` — optional; used to fill `{{customer_name}}` placeholder
 - `job_date` — optional ISO date; used to fill `{{job_date}}` placeholder
 
@@ -1017,17 +895,21 @@ interface AgentSettings {
   representative_name: string | null;
 }
 
-type CallTypeName = 'customer_confirmation' | 'technician_confirmation' | 'technician_reschedule';
+type CampaignKey =
+  | 'scheduled_unconfirmed' | 'open_job_due_soon' | 'quotation_pending'
+  | 'technician_unconfirmed' | 'post_job_review';
 
-interface CallTypeConfig {
-  type: string;            // built-in slug or auto-generated custom slug
-  name: string;            // display name
-  description: string;
-  is_custom: boolean;
+interface Campaign {
+  key: CampaignKey;
+  name: string;
   enabled: boolean;
-  days_before: number;     // integer >= 1
-  begin_message: string | null;
-  general_prompt: string | null;
+  days_before: number;              // integer >= 1
+  greeting: string | null;          // == begin_message
+  prompt: string | null;            // == general_prompt (the agent's basis)
+  voicemail: string | null;         // == voicemail_message
+  config: Record<string, unknown>;  // == trigger_config
+  description: string | null;
+  updated_at: string | null;
 }
 
 // ─── Calls ───────────────────────────────────────────────────────────────────

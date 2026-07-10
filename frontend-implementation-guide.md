@@ -452,7 +452,7 @@ Use these three flags to drive the status checklist in the Retell Setup settings
 }
 
 // Response 422
-{ "error": "No call types configured — add at least one call type before syncing" }
+{ "error": "No campaigns enabled — enable at least one campaign before syncing" }
 ```
 
 ---
@@ -491,72 +491,6 @@ All optional. Validation: `max_attempts` 1–10, `voicemail_behavior` `"leave"` 
 - Read-only tools remain: `get_job`, `get_appointment`, `get_quotation`
 - Agent prompt appended with: *"You are in read-only mode. Collect the customer's intent and let them know a team member will follow up."*
 - Post-call analysis and todos are still created normally
-
----
-
-### 5.6 Call Type Settings
-
-#### `GET /agent-settings/call-types` 🔒
-
-> **Changed:** No Retell internal IDs in response (`retell_llm_id`, `retell_agent_id`, `retell_subagent_node_id` are stored in DB but never sent to clients).
-
-```json
-{
-  "call_types": [
-    {
-      "type": "customer_confirmation",
-      "name": "Customer Confirmation",
-      "description": "Call the end customer to confirm their upcoming appointment.",
-      "is_custom": false,
-      "enabled": true,
-      "days_before": 2,
-      "begin_message": "Hi {{customer_name}}, this is {{representative_name}}...",
-      "general_prompt": "You are {{representative_name}}, a friendly scheduling assistant..."
-    },
-    {
-      "type": "technician_confirmation",
-      "name": "Technician Confirmation",
-      "is_custom": false, "enabled": true, "days_before": 1, ...
-    },
-    {
-      "type": "technician_reschedule",
-      "name": "Technician Reschedule Notice",
-      "is_custom": false, "enabled": false, "days_before": 1, ...
-    },
-    {
-      "type": "quotation_followup",
-      "name": "Quotation Follow-up",
-      "description": "Follow up with the customer on a sent or viewed quotation that hasn't been accepted yet.",
-      "is_custom": false,
-      "enabled": false,
-      "days_before": 3,
-      "begin_message": "Hi {{customer_name}}, this is {{representative_name}} calling from {{company_name}}. I'm following up on the quote we recently sent you — do you have a moment to discuss it?",
-      "general_prompt": "You are {{representative_name}}, a friendly representative calling on behalf of {{company_name}}. Your goal is to follow up on a quotation that was sent but not yet accepted..."
-    }
-  ]
-}
-```
-
-> **4 built-in types:** `customer_confirmation`, `technician_confirmation`, `technician_reschedule`, `quotation_followup`. All are built-in (`is_custom: false`) and cannot be deleted. Only **enabled** types are active in the Retell flow. Toggling `enabled` re-syncs the flow.
-
-#### `POST /agent-settings/call-types` 🔒
-```json
-{ "name": "Post-Job Follow-up", "description": "Call customer after job completion." }
-```
-`begin_message` and `general_prompt` are **auto-generated** — do not send them.
-
-#### `PATCH /agent-settings/call-types/:type` 🔒
-All optional: `enabled`, `days_before`, `begin_message`, `general_prompt`, `name` (custom only), `description` (custom only)
-
-#### `DELETE /agent-settings/call-types/:type` 🔒
-Custom types only. `403` for built-ins.
-
-#### Placeholder reference
-| Placeholder | Available in |
-|---|---|
-| `{{company_name}}` `{{representative_name}}` `{{job_date}}` `{{job_id}}` | All types |
-| `{{customer_name}}` | `customer_confirmation` + custom |
-| `{{technician_name}}` `{{customer_address}}` | `technician_confirmation`, `technician_reschedule` |
 
 ---
 
@@ -679,6 +613,47 @@ Fires immediately. No scheduler. Marked `is_test=true`.
 
 ---
 
+### 5.11 Onboarding
+
+Server-side new-company setup — **one call** replaces the old multi-request FE sequence. Drive the setup
+wizard from `GET /onboarding/status` (per-step booleans + `completed`), and submit whatever the user filled
+in via `POST /onboarding` (re-runnable / idempotent).
+
+```typescript
+// POST /onboarding 🔒 admin
+export async function runOnboarding(token: string, body: {
+  company?: { default_timezone?: string; address_line1?: string; city?: string; state?: string;
+              zipcode?: string; country?: string; office_area_code?: string };   // area code derived from state if omitted
+  agent?: { representative_name?: string; voice_id?: string };
+  call_settings?: { business_hours_start?: string; business_hours_end?: string; include_weekends?: boolean;
+                    max_attempts?: number; voicemail_behavior?: 'leave' | 'skip' };
+  campaigns?: Array<{ key: CampaignKey; enabled?: boolean; greeting?: string; prompt?: string;
+                      voicemail?: string; days_before?: number; config?: Record<string, unknown> }>;
+  invites?: Array<{ email: string; first_name: string; last_name?: string; role?: 'admin' | 'user' }>;
+  mark_complete?: boolean;
+}): Promise<OnboardingResult | null>;
+
+// GET /onboarding/status 🔒
+export async function getOnboardingStatus(token: string): Promise<{ status: OnboardingStatus } | null>;
+```
+
+`POST /onboarding` runs, in order: company profile + area code → agent identity → call settings →
+enable/configure campaigns → **awaited** Retell provision (builds flow/agent, buys phone) → invites. Each
+step is best-effort; a failing provision is **non-fatal** (surfaced in `errors`, `status.retell_provisioned:false`).
+
+```json
+// Response 200
+{ "steps": { "company_profile": true, "agent_identity": true, "call_settings": true },
+  "campaigns": [ { "key": "scheduled_unconfirmed", "enabled": true } ],
+  "invited": [ { "id": 3, "email": "u@x.com" } ],
+  "retell": { "flow_id": "…", "agent_id": "…", "phone_number": "…" },   // null until a campaign is enabled + provisioned
+  "errors": [],
+  "status": { "company_profile": true, "agent_identity": true, "campaigns_enabled": true,
+              "enabled_campaign_count": 2, "retell_provisioned": true, "phone_number_set": true, "completed": true } }
+```
+
+---
+
 ## 6. Settings Page Changes
 
 ### 6.1 General Settings tab — no change
@@ -720,11 +695,11 @@ Retell Setup
 | `!phone_number_set` | ⚠️ — show area code config |
 | `!company.office_area_code` | 🔴 — "Set area code first" |
 
-#### Section C: Call Types
-- Cards from `GET /agent-settings/call-types` (no Retell IDs in response)
-- Enable toggle → immediate `PATCH`
-- Edit prompts + days → Save → `PATCH /agent-settings/call-types/:type`
-- Add custom → `POST /agent-settings/call-types`
+#### Section C: Campaigns
+- Cards from `GET /campaigns` (the 5 campaigns; each = trigger + its own agent).
+- Enable toggle → `PATCH /campaigns/:key { enabled }` (re-provisions the Retell flow).
+- Edit greeting / prompt / voicemail / days_before / config → `PATCH /campaigns/:key`.
+- Full contract in §13. (Custom call-type creation is removed — the campaign set is fixed.)
 
 #### Section D: Call Settings
 - `GET /call-settings` / `PATCH /call-settings`
@@ -1927,239 +1902,14 @@ const TYPE_OPTIONS = [
 
 ---
 
-## 13. Call Trigger Configuration — When to Auto-Call Customers
+## 13. Campaigns — the single outreach config entity
 
-> New Settings section that lets each tenant configure **which business conditions trigger an outbound confirmation call**. All four triggers are seeded as disabled — tenants toggle them on as needed.
+> Campaigns are the one place to configure outbound calling: each campaign = a trigger (when/who to call) +
+> its own agent (prompt / greeting / voicemail). All are seeded disabled; enabling one provisions its
+> sub-agent into the Retell flow. **Replaces the removed Call Types (`/agent-settings/call-types`) and Call
+> Triggers (`/call-triggers`) endpoints.**
 
----
-
-### 13.1 Trigger Types
-
-| Trigger | Calls | Fires when... | Default `days_before` |
-|---|---|---|---|
-| `scheduled_unconfirmed` | **Customer** | Job is scheduled but customer hasn't confirmed | 2 days before appointment |
-| `quotation_pending` | **Customer** | Quotation sent/viewed but not yet accepted | 3 days after sent |
-| `open_job_due_soon` | **Customer** | Open job's `due_by` is approaching (no appointment yet) | 7 days before |
-| `technician_unconfirmed` | **Technician** | Appointment is scheduled with an assigned technician who hasn't confirmed | 1 day before appointment |
-| `post_job_review` | **Customer** | An appointment was completed — check in / collect a review | 1 day after (via `trigger_config.days_after`) |
-
-**All are disabled by default.** Tenant enables them in Settings → Call Triggers (a.k.a. Campaigns — see §13.6).
-
----
-
-### 13.2 New TypeScript Type
-
-Add to `src/types/agent-settings.ts`:
-
-```typescript
-export type CallTriggerType =
-  | 'scheduled_unconfirmed'
-  | 'quotation_pending'
-  | 'open_job_due_soon'
-  | 'technician_unconfirmed'
-  | 'post_job_review';
-
-export interface CallTriggerConfig {
-  trigger_type: CallTriggerType;
-  enabled: boolean;
-  call_type: string;          // which call type slug to use (e.g. "customer_confirmation")
-  days_before: number;        // days before job date to fire
-  trigger_config: {
-    // scheduled_unconfirmed
-    retry_if_no_answer?: boolean;
-    // quotation_pending
-    quote_statuses?: string[];   // default: ["sent", "viewed"]
-    days_after_sent?: number;    // default: 3
-    // open_job_due_soon
-    only_if_technician_assigned?: boolean;
-    // post_job_review
-    days_after?: number;         // default: 1 — call this many days after the appointment completes
-  };
-  description: string | null;
-  updated_at: string;
-}
-```
-
----
-
-### 13.3 New API Functions
-
-Add to `src/lib/auth-api.ts`:
-
-```typescript
-// GET /call-triggers — always returns all trigger configs (currently 5)
-export async function getCallTriggers(token: string):
-  Promise<{ call_triggers: CallTriggerConfig[] } | null>
-
-// PATCH /call-triggers/:type — update one trigger
-export async function updateCallTrigger(
-  token: string,
-  type: CallTriggerType,
-  body: {
-    enabled?: boolean;
-    call_type?: string;
-    days_before?: number;
-    trigger_config?: CallTriggerConfig['trigger_config'];
-  }
-): Promise<{ success: boolean; call_trigger?: CallTriggerConfig; error?: string }>
-```
-
----
-
-### 13.4 Endpoint Reference
-
-#### `GET /call-triggers` 🔒
-
-Always returns all trigger configs (currently 5). Missing DB rows return built-in defaults.
-
-```json
-{
-  "call_triggers": [
-    {
-      "trigger_type": "scheduled_unconfirmed",
-      "enabled": false,
-      "call_type": "customer_confirmation",
-      "days_before": 2,
-      "trigger_config": { "retry_if_no_answer": true },
-      "description": "Call customer to confirm their upcoming appointment when job is scheduled but unconfirmed."
-    },
-    {
-      "trigger_type": "quotation_pending",
-      "enabled": false,
-      "call_type": "quotation_followup",
-      "days_before": 3,
-      "trigger_config": { "quote_statuses": ["sent", "viewed"], "days_after_sent": 3 },
-      "description": "Follow up with customer on a sent or viewed quotation that hasn't been accepted yet."
-    },
-    {
-      "trigger_type": "open_job_due_soon",
-      "enabled": false,
-      "call_type": "customer_confirmation",
-      "days_before": 7,
-      "trigger_config": { "only_if_technician_assigned": false },
-      "description": "Call customer when an open (unscheduled) job is approaching its expected date."
-    },
-    {
-      "trigger_type": "technician_unconfirmed",
-      "enabled": false,
-      "call_type": "technician_confirmation",
-      "days_before": 1,
-      "trigger_config": {},
-      "description": "Call the assigned technician when a job is scheduled and they haven't confirmed availability yet."
-    },
-    {
-      "trigger_type": "post_job_review",
-      "enabled": false,
-      "call_type": "post_job_review",
-      "days_before": 1,
-      "trigger_config": { "days_after": 1 },
-      "description": "Call the customer after a completed appointment to check in and collect a review."
-    }
-  ]
-}
-```
-
-#### `PATCH /call-triggers/:type` 🔒
-
-`:type` must be one of: `scheduled_unconfirmed`, `quotation_pending`, `open_job_due_soon`, `technician_unconfirmed`, `post_job_review`
-
-```json
-// Enable a trigger
-{ "enabled": true }
-
-// Enable with custom days
-{ "enabled": true, "days_before": 3 }
-
-// Update trigger-specific config
-{ "trigger_config": { "quote_statuses": ["sent"], "days_after_sent": 5 } }
-
-// Response 200
-{ "call_trigger": { ...updated } }
-
-// Response 400 — invalid type or days_before < 1
-{ "error": "days_before must be an integer >= 1" }
-```
-
----
-
-### 13.5 Settings Page — Call Triggers Section
-
-Add a new **"Call Triggers"** section to the Settings page (after Call Settings, before Testing). Group the triggers into two tabs or visual sections: **Customer Calls** and **Technician Calls**.
-
-```
-Call Triggers
-──────────────────────────────────────────────────────────────────
-  Configure when Clara should automatically place outbound calls.
-  Each trigger creates a scheduled call via the daily job.
-
-  ── Customer Calls ────────────────────────────────────────────
-
-  ┌─────────────────────────────────────────────────────────────┐
-  │  [●  Enabled  ]   Scheduled — Unconfirmed      👤 Customer  │
-  │  Call when job is scheduled but customer hasn't confirmed   │
-  │  Days before appointment:  [2]                              │
-  │  Call type: [Customer Confirmation ▼]              [Save]   │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─────────────────────────────────────────────────────────────┐
-  │  [○  Disabled ]   Quotation Pending            👤 Customer  │
-  │  Follow up on sent/viewed quotations not yet accepted       │
-  │  Days after sent:  [3]   Statuses: [sent] [viewed]          │
-  │  Call type: [Quotation Follow-up ▼]                [Save]   │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─────────────────────────────────────────────────────────────┐
-  │  [○  Disabled ]   Open Job Due Soon            👤 Customer  │
-  │  Call when an unscheduled job's date is approaching         │
-  │  Days before:  [7]                                          │
-  │  Call type: [Customer Confirmation ▼]              [Save]   │
-  └─────────────────────────────────────────────────────────────┘
-
-  ── Technician Calls ──────────────────────────────────────────
-
-  ┌─────────────────────────────────────────────────────────────┐
-  │  [○  Disabled ]   Appointment Scheduled        🔧 Technician│
-  │  Call technician to confirm when appointment is booked      │
-  │  Days before appointment:  [1]                              │
-  │  Call type: [Technician Confirmation ▼]            [Save]   │
-  └─────────────────────────────────────────────────────────────┘
-──────────────────────────────────────────────────────────────────
-```
-
-**UX behaviour:**
-- Toggle `enabled` → immediate `PATCH` (no Save needed)
-- Editing `days_before` or `trigger_config` fields → Save button → `PATCH`
-- `call_type` dropdown populated from `GET /agent-settings/call-types` (all enabled types + the type currently set on the trigger)
-- Disabled triggers show a muted/greyed card
-- Show 👤 or 🔧 icon to distinguish who gets called
-
-**Tenant scenarios:**
-
-| Tenant scenario | Configuration |
-|---|---|
-| "Only confirm scheduled appointments" | Enable `scheduled_unconfirmed` only |
-| "Also notify technicians" | Enable `scheduled_unconfirmed` + `technician_unconfirmed` |
-| "No quotation follow-ups" | Leave `quotation_pending` disabled |
-| "Call open jobs 1 week out" | Enable `open_job_due_soon`, `days_before = 7` |
-| "Review calls after visits" | Enable `post_job_review` |
-| "Full automation" | Enable all |
-| "Manual calls only" | All disabled (default) |
-
----
-
-### 13.6 Checklist
-
-- [ ] Add `CallTriggerType` and `CallTriggerConfig` to `src/types/agent-settings.ts`
-- [ ] Add `getCallTriggers()`, `updateCallTrigger()` to `src/lib/auth-api.ts`
-- [ ] Create `src/components/settings/CallTriggerSettings.tsx` — three toggle cards
-- [ ] Add `CallTriggerSettings` to `src/pages/SettingsPage.tsx` after Call Settings section
-- [ ] Toggle `enabled` → immediate PATCH (no Save)
-- [ ] `days_before` / `trigger_config` → Save button → PATCH
-- [ ] `call_type` dropdown from `GET /agent-settings/call-types`
-
----
-
-### 13.6 Campaigns endpoint (`/campaigns`) — the campaign config surface
+### 13.1 Campaigns endpoint (`/campaigns`)
 
 A **campaign** is the single editable unit that owns **both** the trigger config (*when/who* to call) **and
 the agent's `prompt` + `greeting`** (*what the agent says* — the campaign is the basis of the agent). It maps
@@ -2688,7 +2438,7 @@ Always returns all 5 outcome configs ordered by severity.
 
 ### 15.5 Settings Page — Post-Call Analysis Section
 
-Add a **"Post-Call Analysis"** section to the Settings page (after Call Triggers).
+Add a **"Post-Call Analysis"** section to the Settings page (after Campaigns).
 
 ```
 Post-Call Analysis
@@ -2738,7 +2488,7 @@ Post-Call Analysis
 - [ ] Add `CallAnalysisConfig`, `CallAnalysisPriority` to `src/types/todo.ts`
 - [ ] Add `getCallAnalysisConfigs()`, `updateCallAnalysisConfig()` to `src/lib/auth-api.ts`
 - [ ] Create `src/components/settings/CallAnalysisSettings.tsx` — 5 toggle+priority cards
-- [ ] Add `CallAnalysisSettings` to `src/pages/SettingsPage.tsx` after Call Triggers section
+- [ ] Add `CallAnalysisSettings` to `src/pages/SettingsPage.tsx` after Campaigns section
 - [ ] Toggle `enabled` → immediate PATCH
 - [ ] Priority dropdown → immediate PATCH
 - [ ] Disabled cards are visually muted
