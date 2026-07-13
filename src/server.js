@@ -14,6 +14,8 @@ const companyRoutes = require("./routes/company");
 const usersRoutes = require("./routes/users");
 const customersRoutes = require("./routes/customers");
 const jobsRoutes = require("./routes/jobs");
+const locationsRoutes = require("./routes/locations");
+const serviceOpportunitiesRoutes = require("./routes/service-opportunities");
 const servicetradeRoutes = require("./routes/servicetrade");
 const agentSettingsRoutes = require("./routes/agent-settings");
 const retellRoutes = require("./routes/retell");
@@ -125,6 +127,12 @@ app.use("/customers", customersRoutes);
 
 // Jobs & Appointments - requires auth
 app.use("/jobs", jobsRoutes);
+
+// Locations (ServiceTrade-synced platform data) - requires auth
+app.use("/locations", locationsRoutes);
+
+// Service opportunities (unbooked ServiceTrade service requests) - requires auth
+app.use("/service-opportunities", serviceOpportunitiesRoutes);
 
 // ServiceTrade integration - requires auth
 app.use("/integrations/servicetrade", servicetradeRoutes);

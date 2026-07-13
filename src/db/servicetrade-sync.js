@@ -23,6 +23,10 @@ const SYNC_STATE_COLUMNS = [
   "last_appointments_updated_at",
   "last_technicians_created_at",
   "last_technicians_updated_at",
+  "last_locations_created_at",
+  "last_locations_updated_at",
+  "last_service_requests_created_at",
+  "last_service_requests_updated_at",
 ];
 
 async function getSyncState(companyId) {
@@ -215,6 +219,401 @@ async function upsertTechniciansBatch(companyId, rows) {
   }
 }
 
+async function upsertLocationsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(
+        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}::jsonb, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`
+      );
+      params.push(
+        companyId, r.servicetrade_id, r.servicetrade_customer_id ?? null, r.servicetrade_primary_contact_id ?? null,
+        r.name ?? null, r.lat ?? null, r.lon ?? null, r.phone ?? null, r.email ?? null,
+        r.general_manager_name ?? null,
+        r.address_line1 ?? null, r.city ?? null, r.state ?? null, r.zipcode ?? null, r.country ?? "US",
+        r.company ? JSON.stringify(r.company) : null,
+        r.brand ? JSON.stringify(r.brand) : null,
+        r.taxable ?? null,
+        r.status ?? null,
+        r.is_active !== false,
+        r.payload ? JSON.stringify(r.payload) : "{}"
+      );
+    });
+    await db.query(
+      `INSERT INTO servicetrade_locations
+         (company_id, servicetrade_id, servicetrade_customer_id, servicetrade_primary_contact_id,
+          name, lat, lon, phone, email, general_manager_name,
+          address_line1, city, state, zipcode, country,
+          company, brand, taxable, status, is_active, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         servicetrade_customer_id        = EXCLUDED.servicetrade_customer_id,
+         servicetrade_primary_contact_id = EXCLUDED.servicetrade_primary_contact_id,
+         name                 = EXCLUDED.name,
+         lat                  = EXCLUDED.lat,
+         lon                  = EXCLUDED.lon,
+         phone                = EXCLUDED.phone,
+         email                = EXCLUDED.email,
+         general_manager_name = EXCLUDED.general_manager_name,
+         address_line1        = EXCLUDED.address_line1,
+         city                 = EXCLUDED.city,
+         state                = EXCLUDED.state,
+         zipcode              = EXCLUDED.zipcode,
+         country              = EXCLUDED.country,
+         company              = EXCLUDED.company,
+         brand                = EXCLUDED.brand,
+         taxable              = EXCLUDED.taxable,
+         status               = EXCLUDED.status,
+         payload              = EXCLUDED.payload,
+         is_active            = EXCLUDED.is_active,
+         updated_at           = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertContactsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(
+        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}::jsonb, $${++idx}::jsonb, NOW())`
+      );
+      params.push(
+        companyId, r.servicetrade_id,
+        r.first_name ?? null, r.last_name ?? null,
+        r.phone ?? null, r.mobile ?? null, r.alternate_phone ?? null, r.email ?? null, r.type ?? null,
+        r.status ?? null,
+        r.types ? JSON.stringify(r.types) : null,
+        r.external_ids ? JSON.stringify(r.external_ids) : null,
+        r.payload ? JSON.stringify(r.payload) : "{}"
+      );
+    });
+    await db.query(
+      `INSERT INTO servicetrade_contacts
+         (company_id, servicetrade_id, first_name, last_name, phone, mobile, alternate_phone, email, type,
+          status, types, external_ids, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         first_name      = EXCLUDED.first_name,
+         last_name       = EXCLUDED.last_name,
+         phone           = EXCLUDED.phone,
+         mobile          = EXCLUDED.mobile,
+         alternate_phone = EXCLUDED.alternate_phone,
+         email           = EXCLUDED.email,
+         type            = EXCLUDED.type,
+         status          = EXCLUDED.status,
+         types           = EXCLUDED.types,
+         external_ids    = EXCLUDED.external_ids,
+         payload         = EXCLUDED.payload,
+         updated_at      = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertOfficesBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(
+        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`
+      );
+      params.push(
+        companyId, r.servicetrade_id,
+        r.name ?? null,
+        r.address_line1 ?? null, r.city ?? null, r.state ?? null, r.zipcode ?? null, r.country ?? "US",
+        r.lat ?? null, r.lon ?? null, r.phone ?? null, r.email ?? null,
+        r.is_active !== false,
+        r.payload ? JSON.stringify(r.payload) : "{}"
+      );
+    });
+    await db.query(
+      `INSERT INTO servicetrade_offices
+         (company_id, servicetrade_id, name, address_line1, city, state, zipcode, country,
+          lat, lon, phone, email, is_active, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         name          = EXCLUDED.name,
+         address_line1 = EXCLUDED.address_line1,
+         city          = EXCLUDED.city,
+         state         = EXCLUDED.state,
+         zipcode       = EXCLUDED.zipcode,
+         country       = EXCLUDED.country,
+         lat           = EXCLUDED.lat,
+         lon           = EXCLUDED.lon,
+         phone         = EXCLUDED.phone,
+         email         = EXCLUDED.email,
+         is_active     = EXCLUDED.is_active,
+         payload       = EXCLUDED.payload,
+         updated_at    = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertTagsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(companyId, r.servicetrade_id, r.name ?? null, r.payload ? JSON.stringify(r.payload) : "{}");
+    });
+    await db.query(
+      `INSERT INTO servicetrade_tags (company_id, servicetrade_id, name, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         name       = EXCLUDED.name,
+         payload    = EXCLUDED.payload,
+         updated_at = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertServiceLinesBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(companyId, r.servicetrade_id, r.name ?? null, r.trade ?? null, r.abbr ?? null, r.payload ? JSON.stringify(r.payload) : "{}");
+    });
+    await db.query(
+      `INSERT INTO servicetrade_service_lines (company_id, servicetrade_id, name, trade, abbr, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         name = EXCLUDED.name, trade = EXCLUDED.trade, abbr = EXCLUDED.abbr,
+         payload = EXCLUDED.payload, updated_at = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertDeficienciesBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(companyId, r.servicetrade_id, r.ref_number ?? null, r.name ?? null, r.description ?? null, r.payload ? JSON.stringify(r.payload) : "{}");
+    });
+    await db.query(
+      `INSERT INTO servicetrade_deficiencies (company_id, servicetrade_id, ref_number, name, description, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         ref_number = EXCLUDED.ref_number, name = EXCLUDED.name, description = EXCLUDED.description,
+         payload = EXCLUDED.payload, updated_at = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertChangeOrdersBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(companyId, r.servicetrade_id, r.status ?? null, r.type ?? null, r.reference_number ?? null, r.payload ? JSON.stringify(r.payload) : "{}");
+    });
+    await db.query(
+      `INSERT INTO servicetrade_change_orders (company_id, servicetrade_id, status, type, reference_number, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         status = EXCLUDED.status, type = EXCLUDED.type, reference_number = EXCLUDED.reference_number,
+         payload = EXCLUDED.payload, updated_at = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertContractsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(companyId, r.servicetrade_id, r.name ?? null, r.payload ? JSON.stringify(r.payload) : "{}");
+    });
+    await db.query(
+      `INSERT INTO servicetrade_contracts (company_id, servicetrade_id, name, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         name = EXCLUDED.name, payload = EXCLUDED.payload, updated_at = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertServiceRecurrencesBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(
+        companyId, r.servicetrade_id, r.description ?? null, r.frequency ?? null,
+        r.recurrence_interval ?? null, r.repeat_weekday ?? null,
+        r.payload ? JSON.stringify(r.payload) : "{}"
+      );
+    });
+    await db.query(
+      `INSERT INTO servicetrade_service_recurrences
+         (company_id, servicetrade_id, description, frequency, recurrence_interval, repeat_weekday, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         description = EXCLUDED.description, frequency = EXCLUDED.frequency,
+         recurrence_interval = EXCLUDED.recurrence_interval, repeat_weekday = EXCLUDED.repeat_weekday,
+         payload = EXCLUDED.payload, updated_at = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertServiceRequestsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(
+        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}::jsonb, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}::jsonb, $${++idx}::jsonb, NOW())`
+      );
+      params.push(
+        companyId, r.servicetrade_id, r.status ?? null, r.description ?? null,
+        r.servicetrade_service_line_id ?? null, r.servicetrade_job_id ?? null,
+        r.servicetrade_deficiency_id ?? null, r.servicetrade_change_order_id ?? null,
+        r.servicetrade_contract_id ?? null, r.servicetrade_location_id ?? null, r.servicetrade_recurrence_id ?? null,
+        r.asset ? JSON.stringify(r.asset) : null,
+        r.budget ? JSON.stringify(r.budget) : null,
+        r.window_start ?? null, r.window_end ?? null, r.closed_on ?? null,
+        r.estimated_price ?? null, r.duration ?? null, r.preferred_start_time ?? null,
+        r.preferred_vendor ? JSON.stringify(r.preferred_vendor) : null,
+        r.visibility ? JSON.stringify(r.visibility) : null,
+        r.payload ? JSON.stringify(r.payload) : "{}"
+      );
+    });
+    await db.query(
+      `INSERT INTO servicetrade_service_requests
+         (company_id, servicetrade_id, status, description,
+          servicetrade_service_line_id, servicetrade_job_id, servicetrade_deficiency_id,
+          servicetrade_change_order_id, servicetrade_contract_id, servicetrade_location_id, servicetrade_recurrence_id,
+          asset, budget, window_start, window_end, closed_on,
+          estimated_price, duration, preferred_start_time, preferred_vendor, visibility, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         status                       = EXCLUDED.status,
+         description                  = EXCLUDED.description,
+         servicetrade_service_line_id = EXCLUDED.servicetrade_service_line_id,
+         servicetrade_job_id          = EXCLUDED.servicetrade_job_id,
+         servicetrade_deficiency_id   = EXCLUDED.servicetrade_deficiency_id,
+         servicetrade_change_order_id = EXCLUDED.servicetrade_change_order_id,
+         servicetrade_contract_id     = EXCLUDED.servicetrade_contract_id,
+         servicetrade_location_id     = EXCLUDED.servicetrade_location_id,
+         servicetrade_recurrence_id   = EXCLUDED.servicetrade_recurrence_id,
+         asset                        = EXCLUDED.asset,
+         budget                       = EXCLUDED.budget,
+         window_start                 = EXCLUDED.window_start,
+         window_end                   = EXCLUDED.window_end,
+         closed_on                    = EXCLUDED.closed_on,
+         estimated_price              = EXCLUDED.estimated_price,
+         duration                     = EXCLUDED.duration,
+         preferred_start_time         = EXCLUDED.preferred_start_time,
+         preferred_vendor             = EXCLUDED.preferred_vendor,
+         visibility                   = EXCLUDED.visibility,
+         payload                      = EXCLUDED.payload,
+         updated_at                   = NOW()`,
+      params
+    );
+  }
+}
+
+/** Insert-only (never overwrite) — guarantees FK-resolvability for a job referenced by a service request but not yet seen by the dedicated /job sync. */
+async function upsertJobStubsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb)`);
+      params.push(companyId, r.servicetrade_id, r.title ?? null, r.job_type ?? null, r.payload ? JSON.stringify(r.payload) : "{}");
+    });
+    await db.query(
+      `INSERT INTO servicetrade_jobs (company_id, servicetrade_id, title, job_type, payload)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO NOTHING`,
+      params
+    );
+  }
+}
+
+/** Insert-only (never overwrite) — guarantees FK-resolvability for a location referenced by a service request but not covered by /location's isCustomer=true&status=active filter. */
+async function upsertLocationStubsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(
+        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb)`
+      );
+      params.push(
+        companyId, r.servicetrade_id, r.name ?? null, r.lat ?? null, r.lon ?? null,
+        r.phone ?? null, r.email ?? null, r.general_manager_name ?? null,
+        r.address_line1 ?? null, r.city ?? null, r.state ?? null, r.zipcode ?? null, r.country ?? "US",
+        r.taxable ?? null, r.status ?? null,
+        r.payload ? JSON.stringify(r.payload) : "{}"
+      );
+    });
+    await db.query(
+      `INSERT INTO servicetrade_locations
+         (company_id, servicetrade_id, name, lat, lon, phone, email, general_manager_name,
+          address_line1, city, state, zipcode, country, taxable, status, payload)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO NOTHING`,
+      params
+    );
+  }
+}
+
 // ── Reads ───────────────────────────────────────────────────────────────────
 
 async function listCustomers(companyId, { includeInactive = false, page = 1, perPage = 50 } = {}) {
@@ -266,11 +665,62 @@ async function listTechnicians(companyId, { includeInactive = false } = {}) {
   return r.rows;
 }
 
+async function listLocations(companyId, { includeInactive = false, page = 1, perPage = 50 } = {}) {
+  const where = includeInactive ? "company_id = $1" : "company_id = $1 AND is_active = true";
+  const offset = (page - 1) * perPage;
+  const [rows, total] = await Promise.all([
+    db.query(`SELECT * FROM servicetrade_locations WHERE ${where} ORDER BY id DESC LIMIT $2 OFFSET $3`, [companyId, perPage, offset]),
+    db.query(`SELECT COUNT(*)::int AS n FROM servicetrade_locations WHERE ${where}`, [companyId]),
+  ]);
+  return { rows: rows.rows, total: total.rows[0].n };
+}
+
+async function listContacts(companyId) {
+  const r = await db.query(`SELECT * FROM servicetrade_contacts WHERE company_id = $1 ORDER BY id DESC`, [companyId]);
+  return r.rows;
+}
+
+async function listOffices(companyId, { includeInactive = false } = {}) {
+  const where = includeInactive ? "company_id = $1" : "company_id = $1 AND is_active = true";
+  const r = await db.query(`SELECT * FROM servicetrade_offices WHERE ${where} ORDER BY name`, [companyId]);
+  return r.rows;
+}
+
+async function listTags(companyId) {
+  const r = await db.query(`SELECT * FROM servicetrade_tags WHERE company_id = $1 ORDER BY name`, [companyId]);
+  return r.rows;
+}
+
+async function listServiceRequests(companyId, { status = null, page = 1, perPage = 50 } = {}) {
+  const conditions = ["company_id = $1"];
+  const values = [companyId];
+  let i = 2;
+  if (status) { conditions.push(`status = $${i++}`); values.push(status); }
+  values.push(perPage, (page - 1) * perPage);
+  const r = await db.query(
+    `SELECT * FROM servicetrade_service_requests WHERE ${conditions.join(" AND ")}
+     ORDER BY window_start DESC NULLS LAST, id DESC
+     LIMIT $${i++} OFFSET $${i}`,
+    values
+  );
+  return r.rows;
+}
+
 // ── Cleanup ─────────────────────────────────────────────────────────────────
 
 async function deleteAllSyncData(companyId) {
+  await db.query("DELETE FROM servicetrade_service_requests    WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_service_recurrences WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_contracts           WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_change_orders       WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_deficiencies        WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_service_lines       WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_appointments WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_jobs         WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_locations    WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_offices      WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_contacts     WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_tags         WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_customers    WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_technicians  WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_sync_state   WHERE company_id = $1", [companyId]);
@@ -285,11 +735,28 @@ module.exports = {
   upsertJobsBatch,
   upsertAppointmentsBatch,
   upsertTechniciansBatch,
+  upsertLocationsBatch,
+  upsertContactsBatch,
+  upsertOfficesBatch,
+  upsertTagsBatch,
+  upsertServiceLinesBatch,
+  upsertDeficienciesBatch,
+  upsertChangeOrdersBatch,
+  upsertContractsBatch,
+  upsertServiceRecurrencesBatch,
+  upsertServiceRequestsBatch,
+  upsertJobStubsBatch,
+  upsertLocationStubsBatch,
   // Reads
   listCustomers,
   listJobs,
   listAppointments,
   listTechnicians,
+  listLocations,
+  listContacts,
+  listOffices,
+  listTags,
+  listServiceRequests,
   // Cleanup
   deleteAllSyncData,
 };

@@ -142,7 +142,7 @@ router.all("/crm-sync", async (req, res) => {
       for (const companyId of companies) {
         try {
           const r = await provider.syncAll(companyId);
-          perCompany.push({ companyId, ok: r.ok, counts: r.counts, error: r.error });
+          perCompany.push({ companyId, ok: r.ok, counts: r.counts, error: r.error, incomplete: r.incomplete || [] });
         } catch (err) {
           logger.error("Admin crm-sync: company failed", { provider: slug, companyId, error: err.message });
           perCompany.push({ companyId, ok: false, error: err.message });

@@ -21,19 +21,19 @@
 const { Engine } = require("../core/engine");
 const crm = require("../../services/crm");
 
-async function start({ companyId, provider = "servicetrade", full = false, startedBy = null }) {
+async function start({ companyId, provider = "servicetrade", full = false, range = "month", startedBy = null }) {
   const engine = await Engine.create({ kind: "crm_sync", companyId, startedBy });
   // Don't await — run in background so HTTP can return the runId immediately.
-  run(engine, { provider, full }).catch(() => { /* errors already captured by engine.fail */ });
+  run(engine, { provider, full, range }).catch(() => { /* errors already captured by engine.fail */ });
   return engine;
 }
 
-async function run(engine, { provider, full }) {
+async function run(engine, { provider, full, range }) {
   await engine.wrap(async (eng) => {
     const p = crm.getProvider(provider);
     if (!p) throw new Error(`Unknown CRM provider: ${provider}`);
     await eng.transition("authenticating", { provider });
-    const result = await p.syncAll(eng.companyId, { full, engine: eng });
+    const result = await p.syncAll(eng.companyId, { full, range, engine: eng });
     if (!result.ok) throw new Error(result.error || "sync failed");
     return result.counts;
   });
