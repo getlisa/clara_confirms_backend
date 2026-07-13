@@ -9,6 +9,7 @@ const express = require("express");
 const db = require("../db");
 const jobsDb = require("../db/jobs");
 const scheduledCallsDb = require("../db/scheduled-calls");
+const serviceOpportunitiesDb = require("../db/service-opportunities");
 const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
 const { parseCallbackTime } = require("../services/callback-time");
@@ -383,6 +384,96 @@ router.post("/get_quotation", async (req, res) => {
 // Lookup: the in-flight scheduled_calls row by retell_call_id from call.call_id.
 // The dispatcher writes retell_call_id at dial time (markCompleted), so by the
 // time the agent calls a tool the row already has it populated.
+
+/** Short recurrence phrase for tool output, e.g. "every 3 months". */
+function recurrencePhrase(frequency, interval) {
+  if (!frequency) return null;
+  const n = Number(interval) || 1;
+  const unit = { daily: "day", weekly: "week", monthly: "month", yearly: "year" }[frequency] || frequency;
+  return n === 1 ? `recurring ${frequency}` : `every ${n} ${unit}s`;
+}
+
+/**
+ * get_service_opportunities — READ tool for the Service Opportunity Follow Up agent.
+ * Returns the open service opportunities for the CURRENT call as structured data.
+ * The agent has no ids up front; it calls this to learn what to discuss. The
+ * opportunity set is resolved from the in-flight scheduled_calls row (matched by
+ * this Retell call id), whose synthetic job_id encodes the ids ("service_opportunity:3-4").
+ */
+router.post("/get_service_opportunities", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(400).json({ error: "company_id is required" });
+
+    const retellCallId = req.body?.call?.call_id;
+    if (!retellCallId) return res.status(400).json({ error: "call.call_id missing from request" });
+
+    const { rows: scRows } = await db.query(
+      `SELECT job_id FROM scheduled_calls WHERE retell_call_id = $1 AND company_id = $2 LIMIT 1`,
+      [retellCallId, companyId]
+    );
+    const jobKey = scRows[0]?.job_id || "";
+    const ids = jobKey.startsWith("service_opportunity:")
+      ? jobKey.slice("service_opportunity:".length).split("-").map(Number).filter(Number.isInteger)
+      : [];
+    if (ids.length === 0) {
+      return res.json({ service_opportunities: [], count: 0 });
+    }
+
+    const rows = await serviceOpportunitiesDb.listByIdsForScheduling(companyId, ids);
+    const serviceOpportunities = rows.map((r) => ({
+      id: r.id,
+      description: r.description,
+      service_line: [r.service_line_name, r.service_line_trade].filter(Boolean).join(" / ") || null,
+      why_recommended: [r.deficiency_name, r.deficiency_description].filter(Boolean).join(" — ") || null,
+      estimated_price: r.estimated_price != null ? `$${r.estimated_price}` : null,
+      recurring_service: recurrencePhrase(r.recurrence_frequency, r.recurrence_interval),
+      requested_window: r.window_start
+        ? { start: r.window_start, end: r.window_end }
+        : null,
+    }));
+
+    logger.info("Tool: get_service_opportunities", { companyId, retellCallId, count: serviceOpportunities.length });
+    return res.json({ service_opportunities: serviceOpportunities, count: serviceOpportunities.length });
+  } catch (err) {
+    logger.error("Tool get_service_opportunities failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * book_service_opportunity — WRITE tool for the Service Opportunity Follow Up agent.
+ * Books one service opportunity IN THE PLATFORM (sets status='booked' + records
+ * booking metadata). Only registered when agent_can_make_changes=true.
+ *
+ * NOTE: ServiceTrade CRM write-back is intentionally deferred — serviceOpportunitiesDb
+ * .markBooked is the seam where that future call will be added.
+ */
+router.post("/book_service_opportunity", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    const { service_opportunity_id, preferred_date, notes } = getArgs(req);
+    if (!companyId || !service_opportunity_id) {
+      return res.status(400).json({ error: "company_id and service_opportunity_id are required" });
+    }
+
+    const retellCallId = req.body?.call?.call_id || null;
+    const booked = await serviceOpportunitiesDb.markBooked(Number(service_opportunity_id), companyId, {
+      preferredDate: preferred_date || null,
+      notes: notes || null,
+      retellCallId,
+    });
+    if (!booked) return res.status(404).json({ error: "Service opportunity not found" });
+
+    logger.info("Tool: book_service_opportunity", { companyId, service_opportunity_id, preferred_date });
+    return res.json({ success: true, service_opportunity: booked });
+  } catch (err) {
+    logger.error("Tool book_service_opportunity failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 router.post("/schedule_callback", async (req, res) => {
   if (!verifyToolSecret(req, res)) return;

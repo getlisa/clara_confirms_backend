@@ -267,6 +267,39 @@ async function handleCallAnalyzed(callData) {
     logger.info("Todo created", { callId: call_id, companyId, todoType });
   }
 
+  // ── Service Opportunity Follow-Up escalation ──────────────────────────────
+  // When the customer wanted to book but the agent was NOT allowed to make
+  // changes (agent_can_make_changes = false), nothing was booked in-platform
+  // during the call — raise a SERVICE_OPPORTUNITY todo so a human completes it.
+  // (When writes are enabled, the agent already booked live via the
+  // book_service_opportunity tool, so no escalation is needed.)
+  if (metadata?.call_type === "service_opportunity_followup") {
+    const bookingOutcome = custom.booking_outcome ?? null;
+    const wantsBooking = ["booked", "partially_booked", "needs_to_check"].includes(bookingOutcome);
+    if (wantsBooking) {
+      const cs = await callSettingsDb.getByCompanyId(companyId).catch(() => null);
+      const canMakeChanges = cs ? cs.agent_can_make_changes !== false : true;
+      if (!canMakeChanges) {
+        await todosDb.create({
+          companyId,
+          callId,
+          type: todosDb.TODO_TYPES.SERVICE_OPPORTUNITY,
+          isTest,
+          metadata: {
+            retell_call_id: call_id,
+            to_number: callData.to_number,
+            booking_outcome: bookingOutcome,
+            preferred_date: custom.preferred_date ?? null,
+            notes: custom.notes ?? null,
+            call_summary: outcome.callSummary,
+            reason: "Customer wanted to book but the agent is not permitted to make changes — please book these service opportunities.",
+          },
+        });
+        logger.info("Service opportunity escalation todo created", { callId: call_id, companyId, bookingOutcome });
+      }
+    }
+  }
+
   logger.info("Call analyzed — outcome saved", {
     callId: call_id,
     companyId,
@@ -283,7 +316,7 @@ async function handleCallAnalyzed(callData) {
   // quote_decision (quotation_followup). All of them use 'callback_requested' as the
   // sentinel value, so we normalize them into a single field for handleRetryOrCallback.
   if (!isDev && !isTest) {
-    const outcomeStr = custom.customer_outcome ?? custom.technician_outcome ?? custom.quote_decision ?? null;
+    const outcomeStr = custom.customer_outcome ?? custom.technician_outcome ?? custom.quote_decision ?? custom.booking_outcome ?? null;
     await handleRetryOrCallback({
       companyId,
       retellCallId: call_id,

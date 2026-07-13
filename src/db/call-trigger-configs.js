@@ -5,6 +5,7 @@ const TRIGGER_TYPES = [
   "quotation_pending",
   "open_job_due_soon",
   "technician_unconfirmed",
+  "booking_service_opportunity",
 ];
 
 const BUILTIN_SEEDS = [
@@ -39,6 +40,16 @@ const BUILTIN_SEEDS = [
     days_before:    1,
     trigger_config: {},
     description:    "Call the assigned technician when a job is scheduled and they haven't confirmed availability yet.",
+  },
+  {
+    trigger_type:   "booking_service_opportunity",
+    enabled:        false,
+    call_type:      "service_opportunity_followup",
+    // days_before is unused for this trigger (user-initiated, no cron sweep),
+    // but the column has a CHECK (days_before >= 1), so use the minimum.
+    days_before:    1,
+    trigger_config: {},
+    description:    "Call the customer about selected open service opportunities to get them booked. User-initiated from the UI — there is no automatic cron sweep for this trigger.",
   },
 ];
 

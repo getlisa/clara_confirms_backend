@@ -152,6 +152,27 @@ const EXTRACT_VARIABLES = {
       description: "Any questions the customer asked about the quote or the work.",
     },
   ],
+  service_opportunity_followup: [
+    {
+      type: "enum", name: "booking_outcome", required: true,
+      choices: ["booked", "partially_booked", "declined", "callback_requested", "no_answer", "needs_to_check"],
+      description: "Overall outcome for the service opportunities discussed. Use 'booked' if the customer agreed to all items, 'partially_booked' if they agreed to some but not all, 'declined' if none, 'callback_requested' when the customer asked to be called back at a specific time, 'needs_to_check' if they need time to decide.",
+    },
+    {
+      type: "string", name: "preferred_date", required: false,
+      description: "The date/time the customer preferred for the work they agreed to book.",
+      conditional_prompt: "Only extract if the customer agreed to book one or more items",
+    },
+    {
+      type: "string", name: "callback_time", required: false,
+      description: "The specific time the customer requested for a callback, e.g. '1pm', 'in 30 minutes', '2:30 PM'.",
+      conditional_prompt: "Only extract if booking_outcome is callback_requested",
+    },
+    {
+      type: "string", name: "notes", required: false,
+      description: "Any concerns, questions, or details the customer mentioned about the service opportunities.",
+    },
+  ],
 };
 
 function extractNodeId(type) { return `extract_${type}`; }

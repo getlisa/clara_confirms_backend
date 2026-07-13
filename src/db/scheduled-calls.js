@@ -14,9 +14,9 @@ function quotationDedupeKeys(quotationId, linkedJobId) {
   return [...new Set(keys)];
 }
 
-async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, scheduledAt, isTest = false, maxAttempts = 3, callPriority, bypassOfficeHours }) {
+async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest = false, maxAttempts = 3, callPriority, bypassOfficeHours }) {
   try {
-    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, scheduledAt, isTest, maxAttempts, callPriority, bypassOfficeHours });
+    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest, maxAttempts, callPriority, bypassOfficeHours });
   } catch (err) {
     if (err.code === "23505") {
       const dup = new Error("Duplicate active scheduled call");
@@ -30,7 +30,7 @@ async function create({ companyId, callType, phoneNumber, jobId, jobDate, appoin
 async function insertScheduledCall({
   companyId, callType, phoneNumber, jobId, jobDate, appointmentId,
   customerName, technicianName, customerAddress,
-  jobName, jobDescription, jobType, totalAmount,
+  jobName, jobDescription, jobType, totalAmount, callContext,
   scheduledAt, isTest = false, maxAttempts = 3,
   callPriority = "normal", parentCallId = null, retryCount = 0,
   bypassOfficeHours = false,
@@ -39,14 +39,15 @@ async function insertScheduledCall({
     `INSERT INTO scheduled_calls
        (company_id, call_type, phone_number, job_id, job_date, appointment_id,
         customer_name, technician_name, customer_address,
-        job_name, job_description, job_type, total_amount,
+        job_name, job_description, job_type, total_amount, call_context,
         scheduled_at, is_test, max_attempts,
         call_priority, parent_call_id, retry_count, bypass_office_hours)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21)
      RETURNING *`,
     [companyId, callType, phoneNumber, jobId ?? null, jobDate ?? null, appointmentId ?? null,
      customerName ?? null, technicianName ?? null, customerAddress ?? null,
      jobName ?? null, jobDescription ?? null, jobType ?? null, totalAmount ?? null,
+     callContext ? JSON.stringify(callContext) : null,
      scheduledAt, isTest, maxAttempts,
      callPriority, parentCallId ?? null, retryCount, !!bypassOfficeHours]
   );
