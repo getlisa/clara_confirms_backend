@@ -34,6 +34,13 @@ const VARIABLE_SEEDS = [
   // ── Appointment + quotation ─────────────────────────────────────────────────
   { name: "appointment_id",      sort_order: 50, resolved_from: "scheduled_calls.appointment_id", description: "Numeric appointment ID for confirm/reschedule tools." },
   { name: "total_amount",        sort_order: 60, resolved_from: "scheduled_calls.total_amount",   description: "Quotation total amount (string) — used in quotation_followup calls." },
+
+  // ── Service opportunity follow-up ─────────────────────────────────────────────
+  { name: "location_name",           sort_order: 70, resolved_from: "scheduled_calls.call_context", description: "The location (site) the service opportunities belong to — used in service_opportunity_followup calls." },
+  { name: "location_address",        sort_order: 71, resolved_from: "scheduled_calls.call_context", description: "The location's address, joined as one string." },
+  { name: "primary_contact_name",    sort_order: 72, resolved_from: "scheduled_calls.call_context", description: "The site's primary contact name — who the agent can ask for on a service_opportunity_followup call." },
+  { name: "general_manager_name",    sort_order: 73, resolved_from: "scheduled_calls.call_context", description: "The site's general manager name (alternate contact) for service_opportunity_followup calls." },
+  { name: "service_opportunity_count", sort_order: 74, resolved_from: "scheduled_calls.call_context", description: "How many open service opportunities this call covers (used in the opening). The detailed list is fetched by the agent via the get_service_opportunities tool, not a variable." },
 ];
 
 async function seedAll() {

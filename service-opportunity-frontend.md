@@ -26,12 +26,14 @@ into new platform tables, and exposes them as two new top-level routes:
 - ❌ No comments sync (ServiceTrade's `/comment` API has no bulk-list shape).
 
 **The one non-obvious data fact that matters most for UI design:**
-`service_opportunities.job_id` **will always be `null`** right now. A service
-request only becomes a `service_opportunities` row when ServiceTrade reports
-**no job at all** attached to it (the qualification rule is "no job AND no
-appointment"). So don't design a "view the linked job" affordance expecting
-it to be populated — there usually won't be one yet. `location_id` is the one
-FK that's always present and reliable.
+a service opportunity's `job` will almost always be `null` right now. A
+service request only becomes a `service_opportunities` row when ServiceTrade
+reports **no job at all** attached to it (the qualification rule is "no job
+AND no appointment"). So don't design a "view the linked job" affordance
+expecting it to be populated — there usually won't be one yet. `location` is
+the one relation that's always present and reliable — see §2.3 for the full
+nested shape (every foreign-key relation is embedded as a full object, never
+a bare id).
 
 ---
 
@@ -97,7 +99,8 @@ Query params: `search`, `customer_id`, `is_active` (`true`/`false`), `limit`, `o
       "created_at": "2026-07-10T12:00:00.000Z",
       "updated_at": "2026-07-10T12:00:00.000Z"
     }
-  ]
+  ],
+  "pagination": { "total": 1, "limit": 50, "offset": 0, "totalPages": 1 }
 }
 ```
 
@@ -133,59 +136,125 @@ zero, one, or several of each.
 ### 2.3 `GET /service-opportunities`
 
 Query params: `location_id`, `office_id` (filters by any office serving that
-location, via the location↔office relationship), `job_id`, `status`, `limit`, `offset`.
+location, via the location↔office relationship), `job_id`, `status`,
+`service_line_id`, `city` (matches the location's `city`, exact match),
+`limit`, `offset`.
+
+**Every foreign-key relation is embedded as a full nested object, never a
+bare `*_id`.** `location_id`, `job_id`, `deficiency_id`, `change_order_id`,
+`contract_id`, `service_recurrence_id`, and `service_line_id` do **not**
+appear anywhere in the response — don't build UI that expects them, and don't
+make a follow-up request to resolve one of these; the full related object is
+already there. Each relation is `null` when ServiceTrade didn't set it (true
+for most of `job`/`deficiency`/`change_order`/`contract` on any given row).
 
 ```json
 {
   "service_opportunities": [
     {
-      "id": 5,
-      "company_id": 4,
-      "location_id": 12,
-      "job_id": null,
-      "deficiency_id": 2,
-      "change_order_id": null,
-      "contract_id": 1,
-      "service_recurrence_id": 3,
-      "service_line_id": 1,
-      "status": "in_progress",
-      "description": "Fire Suppression: 10.20 Per MOD Jason, another company, doing unrelated work, removed the piping...",
-      "window_start": "2026-08-16T04:00:00.000Z",
-      "window_end": "2026-08-16T04:00:00.000Z",
+      "id": 271,
+      "company_id": 7,
+      "status": "open",
+      "description": "Stat Holidays",
+      "window_start": "2026-01-01T08:00:00.000Z",
+      "window_end": "2027-01-01T07:00:00.000Z",
       "closed_on": null,
       "estimated_price": null,
-      "duration": 0,
-      "preferred_start_time": 0,
+      "duration": null,
+      "preferred_start_time": null,
       "budget": null,
       "preferred_vendor": null,
       "asset": null,
       "visibility": ["public"],
-      "external_ref": "34",
+      "external_ref": "1794327052706305",
       "source": "servicetrade",
-      "additional_information": { "servicetrade_service_request_id": 34, "warnings": [] },
-      "created_at": "2026-07-13T10:00:00.000Z",
-      "updated_at": "2026-07-13T10:00:00.000Z",
-      "location_name": "Ruby Tuesday - #4722 Kinston",
-      "job_status": null,
-      "service_line_name": "Sprinkler"
+      "additional_information": { "warnings": [], "servicetrade_service_request_id": "1794327052706305" },
+      "created_at": "2026-07-13T13:59:55.287Z",
+      "updated_at": "2026-07-13T16:02:12.567Z",
+      "location": {
+        "id": 2642,
+        "name": "Elite Fire Protection Ltd",
+        "address_line1": "1 - 33605 Maclure Road",
+        "city": "Abbotsford",
+        "state": "BC",
+        "zipcode": "V2S 7W2",
+        "country": "US",
+        "lat": 49.059372,
+        "lon": -122.294063,
+        "phone": "+18778500014",
+        "email": "info@elitefireprotection.com",
+        "general_manager_name": "Andy Rempel",
+        "primary_contact": {
+          "id": 655,
+          "first_name": "Andy",
+          "last_name": "Rempel",
+          "phone": "+16048500014",
+          "mobile": null,
+          "alternate_phone": null,
+          "email": "andy@elitefireprotection.com",
+          "type": null
+        },
+        "customer": {
+          "id": 4585,
+          "full_name": "Elite Fire Protection Ltd",
+          "email": null,
+          "phone": "(877) 850-0014",
+          "alternate_phone": null,
+          "address_line1": "1 - 33605 Maclure Road",
+          "city": "Abbotsford",
+          "state": "BC",
+          "zipcode": "V2S 7W2",
+          "country": "US"
+        }
+      },
+      "job": null,
+      "deficiency": null,
+      "change_order": null,
+      "contract": null,
+      "service_recurrence": {
+        "id": 264,
+        "description": "Stat Holidays",
+        "frequency": "yearly",
+        "recurrence_interval": 1,
+        "repeat_weekday": false
+      },
+      "service_line": { "id": 2, "name": "Window", "trade": "Home Maintenance", "abbr": "WNDOW", "icon": null }
     }
-  ]
+  ],
+  "pagination": { "total": 283, "limit": 50, "offset": 0, "totalPages": 6 }
 }
 ```
 
-Remember: **`job_id` and `job_status` will be `null` for essentially every row**
-right now (see §0). Design around `location_name` / `service_line_name` /
-`description` / `window_start` / `window_end` as the primary display fields,
-not "linked job" info.
+Field shapes for each relation:
+- `location` — `id`, `name`, `address_line1`, `city`, `state`, `zipcode`, `country`, `lat`, `lon`, `phone`, `email`, `general_manager_name`, `primary_contact` (nested, `null` if none — same shape as `GET /locations/:id`'s `primary_contact`), and `customer` (nested — the location's owning customer/company: `id`, `full_name` (the customer's name — a company name for ServiceTrade customers), `email`, `phone`, `alternate_phone`, `address_line1`, `city`, `state`, `zipcode`, `country`; `null` only if the location isn't linked to a customer). `location` itself is never `null` (every service opportunity has a location). **Note:** `customer.phone` is *not* E.164-normalized (customer records are synced as-is from ServiceTrade), unlike `location.phone` and `primary_contact.phone` which are.
+- `job` — `id`, `title`, `status`, `job_type`. Almost always `null` right now (see §0 — a request only becomes a service opportunity when it has *no* job).
+- `deficiency` — `id`, `ref_number`, `name`, `description`.
+- `change_order` — `id`, `status`, `type`, `reference_number`.
+- `contract` — `id`, `name`.
+- `service_recurrence` — `id`, `description`, `frequency`, `recurrence_interval`, `repeat_weekday`.
+- `service_line` — `id`, `name`, `trade`, `abbr`, `icon`.
+
+Design around `location.city` / `service_line.name` / `description` /
+`window_start` / `window_end` as the primary list-view fields — not "linked
+job" info, since `job` is null for essentially every row right now (see §0).
+
+#### `GET /service-opportunities/service-lines`
+
+Distinct service lines for this company, for a filter dropdown — registered
+before `/:id` so the literal path `service-lines` isn't swallowed as an `:id`.
+
+```json
+{ "service_lines": [{ "id": 1, "name": "Sprinkler" }, { "id": 2, "name": "Window" }] }
+```
 
 ### 2.4 `GET /service-opportunities/:id`
 
-Same shape, plus:
+Identical shape to a list row, plus one addition:
 
 ```json
 {
   "service_opportunity": {
-    "...": "all fields above, plus:",
+    "...": "every field from the list row above, plus:",
     "preferred_technicians": [{ "id": 9, "first_name": "Alex", "last_name": "Tech", "phone": "+19195551234" }]
   }
 }

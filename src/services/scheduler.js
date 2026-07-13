@@ -131,6 +131,10 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         ...(row.job_description && { job_description: row.job_description }),
         ...(row.job_type        && { job_type:        row.job_type }),
         ...(row.total_amount != null && { total_amount: String(row.total_amount) }),
+        // Extra per-call context (e.g. service_opportunities, service_opportunity_count,
+        // location_name, location_address) for call types that carry more than the flat
+        // single-job columns. Values are already-stringified in call_context.
+        ...(row.call_context && typeof row.call_context === "object" ? row.call_context : {}),
       };
 
       // Resolve call-type-specific voicemail message with actual values
@@ -147,7 +151,8 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         .replace(/\{\{customer_name\}\}/g,      row.customer_name   || "")
         .replace(/\{\{technician_name\}\}/g,     row.technician_name || "")
         .replace(/\{\{representative_name\}\}/g, co.representative_name || "Clara")
-        .replace(/\{\{company_name\}\}/g,        co.company_name || "our company");
+        .replace(/\{\{company_name\}\}/g,        co.company_name || "our company")
+        .replace(/\{\{location_name\}\}/g,       (row.call_context && row.call_context.location_name) || "your location");
 
       const call = await retell.createCall({
         toNumber: row.phone_number,

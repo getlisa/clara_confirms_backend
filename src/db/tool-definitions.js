@@ -174,6 +174,43 @@ const TOOL_SEEDS = [
     },
   },
 
+  {
+    call_type: "service_opportunity_followup",
+    name: "get_service_opportunities",
+    description: "Fetch the open service opportunities this call is about — each item's ID, the work, why it's recommended (inspection deficiency), estimated price, whether it's a recurring service, and the requested window. Call this first, at the start of the call, to know what to discuss. Takes no arguments — it returns the items for the current call.",
+    endpoint: "/retell/tools/get_service_opportunities",
+    speak_during_execution: true,
+    speak_after_execution: false,
+    execution_message_description: "Let me pull up the details.",
+    is_write_tool: false,
+    sort_order: 0,
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    call_type: "service_opportunity_followup",
+    name: "book_service_opportunity",
+    description: "Book a service opportunity in the platform once the customer has agreed to have that work scheduled. Call this per service opportunity the customer accepts, using the exact service_opportunity_id from the list you were given at the start of the call.",
+    endpoint: "/retell/tools/book_service_opportunity",
+    speak_during_execution: true,
+    speak_after_execution: false,
+    execution_message_description: "Let me get that noted for you.",
+    is_write_tool: true,
+    sort_order: 1,
+    parameters: {
+      type: "object",
+      properties: {
+        service_opportunity_id: { type: "string", description: "The numeric ID of the specific service opportunity the customer agreed to book. Use the exact ID from the list provided at the start of the call." },
+        preferred_date:         { type: "string", description: "Optional. The date/time the customer prefers for this work, e.g. 'next Tuesday morning', '2026-08-16'." },
+        notes:                  { type: "string", description: "Optional. Any details or constraints the customer mentioned about this item." },
+      },
+      required: ["service_opportunity_id"],
+    },
+  },
+
   // ── Universal tools (attached to every call_type's subagent node) ───────────
   // Sentinel call_type '_universal' — `registerToolsForCompany` merges these
   // into every node's tool list so the agent always has them available
