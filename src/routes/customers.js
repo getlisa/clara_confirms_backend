@@ -26,15 +26,20 @@ router.get("/", async (req, res) => {
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
     const { search, is_active, limit, offset } = req.query;
+    const limitNum = limit ? Math.min(Number(limit), 200) : 50;
+    const offsetNum = offset ? Number(offset) : 0;
 
-    const customers = await customersDb.list(companyId, {
+    const { rows: customers, total } = await customersDb.list(companyId, {
       search:   search || undefined,
       isActive: is_active === "true" ? true : is_active === "false" ? false : undefined,
-      limit:    limit  ? Math.min(Number(limit), 200)  : 50,
-      offset:   offset ? Number(offset) : 0,
+      limit:    limitNum,
+      offset:   offsetNum,
     });
 
-    return res.json({ customers });
+    return res.json({
+      customers,
+      pagination: { total, limit: limitNum, offset: offsetNum, totalPages: Math.max(Math.ceil(total / limitNum), 1) },
+    });
   } catch (err) {
     logger.error("GET /customers failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load customers" });

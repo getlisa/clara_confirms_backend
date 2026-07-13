@@ -40,15 +40,18 @@ async function list(companyId, { search, isActive, limit = 50, offset = 0 } = {}
     i++;
   }
 
-  values.push(limit, offset);
-  const result = await db.query(
-    `SELECT * FROM customers
-     WHERE ${conditions.join(" AND ")}
-     ORDER BY full_name ASC NULLS LAST, created_at DESC
-     LIMIT $${i++} OFFSET $${i}`,
-    values
-  );
-  return result.rows.map(rowToObject);
+  const where = conditions.join(" AND ");
+  const [rowsResult, countResult] = await Promise.all([
+    db.query(
+      `SELECT * FROM customers
+       WHERE ${where}
+       ORDER BY full_name ASC NULLS LAST, created_at DESC
+       LIMIT $${i} OFFSET $${i + 1}`,
+      [...values, limit, offset]
+    ),
+    db.query(`SELECT COUNT(*)::int AS n FROM customers WHERE ${where}`, values),
+  ]);
+  return { rows: rowsResult.rows.map(rowToObject), total: countResult.rows[0].n };
 }
 
 async function getById(id, companyId) {
