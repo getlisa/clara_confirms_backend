@@ -31,7 +31,7 @@
     },
     {
       "path": "/admin/crm-sync",
-      "schedule": "0 */6 * * *"
+      "schedule": "0 * * * *"
     },
     {
       "path": "/admin/engines/gc",

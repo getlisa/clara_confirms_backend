@@ -133,17 +133,19 @@ router.delete("/session", async (req, res) => {
 });
 
 /**
- * POST /integrations/servicetrade/sync?full=true
+ * POST /integrations/servicetrade/sync?full=true&range=week|month|3month
  * Run full or incremental sync. full=true forces full sync and resets last_sync_at.
+ * range controls the /servicerequest fetch window (default month).
  */
 router.post("/sync", async (req, res) => {
   const companyId = req.user.companyId;
   const full = req.query.full === "true" || req.query.full === true;
   const stream = req.query.stream === "true" || req.query.stream === true;
+  const range = ["week", "month", "3month"].includes(req.query.range) ? req.query.range : "month";
 
   try {
     const engine = await crmSyncEngine.start({
-      companyId, provider: "servicetrade", full, startedBy: req.user.id,
+      companyId, provider: "servicetrade", full, range, startedBy: req.user.id,
     });
 
     // Streaming mode: return runId + token immediately so the FE can subscribe
@@ -265,6 +267,95 @@ router.get("/technicians", async (req, res) => {
   } catch (err) {
     logger.error("ServiceTrade technicians list error", { error: err.message });
     return res.status(500).json({ error: "Failed to list technicians" });
+  }
+});
+
+/**
+ * GET /integrations/servicetrade/locations
+ * List synced ServiceTrade locations (raw rows from servicetrade_locations).
+ * Query: includeInactive=true|false (default false), page, perPage (max 200).
+ */
+router.get("/locations", async (req, res) => {
+  const companyId = req.user.companyId;
+  const includeInactive = req.query.includeInactive === "true";
+  const page    = Math.max(parseInt(req.query.page, 10)    || 1, 1);
+  const perPage = Math.min(Math.max(parseInt(req.query.perPage, 10) || 50, 1), 200);
+
+  try {
+    const { rows, total } = await syncDb.listLocations(companyId, { includeInactive, page, perPage });
+    return res.json({
+      locations: rows,
+      pagination: { page, perPage, total, totalPages: Math.max(Math.ceil(total / perPage), 1) },
+    });
+  } catch (err) {
+    logger.error("ServiceTrade locations list error", { error: err.message });
+    return res.status(500).json({ error: "Failed to list locations" });
+  }
+});
+
+/**
+ * GET /integrations/servicetrade/contacts
+ * List synced ServiceTrade contacts (raw rows, sourced from locations' embedded primaryContact).
+ */
+router.get("/contacts", async (req, res) => {
+  const companyId = req.user.companyId;
+  try {
+    const contacts = await syncDb.listContacts(companyId);
+    return res.json({ contacts });
+  } catch (err) {
+    logger.error("ServiceTrade contacts list error", { error: err.message });
+    return res.status(500).json({ error: "Failed to list contacts" });
+  }
+});
+
+/**
+ * GET /integrations/servicetrade/offices
+ * List synced ServiceTrade offices (raw rows, sourced from locations' embedded offices[]).
+ */
+router.get("/offices", async (req, res) => {
+  const companyId = req.user.companyId;
+  const includeInactive = req.query.includeInactive === "true";
+  try {
+    const offices = await syncDb.listOffices(companyId, { includeInactive });
+    return res.json({ offices });
+  } catch (err) {
+    logger.error("ServiceTrade offices list error", { error: err.message });
+    return res.status(500).json({ error: "Failed to list offices" });
+  }
+});
+
+/**
+ * GET /integrations/servicetrade/tags
+ * List synced ServiceTrade tags (raw rows, sourced from locations' embedded tags[]).
+ */
+router.get("/tags", async (req, res) => {
+  const companyId = req.user.companyId;
+  try {
+    const tags = await syncDb.listTags(companyId);
+    return res.json({ tags });
+  } catch (err) {
+    logger.error("ServiceTrade tags list error", { error: err.message });
+    return res.status(500).json({ error: "Failed to list tags" });
+  }
+});
+
+/**
+ * GET /integrations/servicetrade/service-requests
+ * List synced ServiceTrade service requests (raw rows from servicetrade_service_requests).
+ * Query: status, page, perPage.
+ */
+router.get("/service-requests", async (req, res) => {
+  const companyId = req.user.companyId;
+  const status  = req.query.status || null;
+  const page    = Math.max(parseInt(req.query.page, 10)    || 1, 1);
+  const perPage = Math.min(Math.max(parseInt(req.query.perPage, 10) || 50, 1), 200);
+
+  try {
+    const serviceRequests = await syncDb.listServiceRequests(companyId, { status, page, perPage });
+    return res.json({ service_requests: serviceRequests });
+  } catch (err) {
+    logger.error("ServiceTrade service requests list error", { error: err.message });
+    return res.status(500).json({ error: "Failed to list service requests" });
   }
 });
 
