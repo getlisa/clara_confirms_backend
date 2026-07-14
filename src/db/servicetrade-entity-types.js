@@ -15,6 +15,7 @@ const db = require("./index");
 // entity-types reference. Keep in sync with migration 060's seed.
 const RELEVANT_ENTITY_TYPES = [
   { entityKey: "appointment",     servicetradeEntityType: 16, servicetradeEntityName: "Appointment",    platformTable: "appointments",          description: "Confirmation calls comment on the appointment." },
+  { entityKey: "job",             servicetradeEntityType:  3, servicetradeEntityName: "Job",            platformTable: "jobs",                  description: "Confirmation calls also comment on the parent job, if it exists." },
   { entityKey: "service_request", servicetradeEntityType: 18, servicetradeEntityName: "ServiceRequest", platformTable: "service_opportunities", description: "Service-opportunity follow-up calls comment on the service request." },
 ];
 

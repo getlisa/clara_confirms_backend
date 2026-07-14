@@ -92,44 +92,69 @@ function buildCommentBody({ entityId, entityType, content }) {
 }
 
 /**
- * Resolve the ServiceTrade entity ids to comment on for this call.
- * @returns {Promise<{entityKey:string, entityType:number, entityIds:string[]}|null>}
+ * Resolve the ServiceTrade entities to comment on for this call. Returns an
+ * array of targets (a call may write to more than one entity) — confirmation
+ * calls comment on BOTH the appointment and the parent job, whichever exist.
+ * @returns {Promise<Array<{entityKey:string, entityType:number, entityIds:string[]}>>}
  */
 async function resolveTargets(companyId, callType, scheduledCall) {
+  const targets = [];
+
   if (callType === "customer_confirmation" || callType === "technician_confirmation") {
-    const cfg = await entityTypesDb.getByKey("appointment");
-    if (!cfg || !scheduledCall.appointment_id) return null;
-    const { rows } = await db.query(
-      `SELECT external_ref FROM appointments
-       WHERE id = $1 AND company_id = $2 AND source = 'servicetrade'`,
-      [scheduledCall.appointment_id, companyId]
-    );
-    const ref = rows[0]?.external_ref;
-    if (!isNumericRef(ref)) return null;
-    return { entityKey: "appointment", entityType: cfg.servicetrade_entity_type, entityIds: [String(ref)] };
+    // Appointment (entityType 16), via scheduled_calls.appointment_id.
+    const apptCfg = await entityTypesDb.getByKey("appointment");
+    if (apptCfg && scheduledCall.appointment_id) {
+      const { rows } = await db.query(
+        `SELECT external_ref FROM appointments
+         WHERE id = $1 AND company_id = $2 AND source = 'servicetrade'`,
+        [scheduledCall.appointment_id, companyId]
+      );
+      const ref = rows[0]?.external_ref;
+      if (isNumericRef(ref)) {
+        targets.push({ entityKey: "appointment", entityType: apptCfg.servicetrade_entity_type, entityIds: [String(ref)] });
+      }
+    }
+
+    // Parent Job (entityType 3), via scheduled_calls.job_id (a real platform job id string).
+    const jobCfg = await entityTypesDb.getByKey("job");
+    const jobKey = scheduledCall.job_id || "";
+    if (jobCfg && /^\d+$/.test(jobKey)) {
+      const { rows } = await db.query(
+        `SELECT external_ref FROM jobs
+         WHERE id = $1 AND company_id = $2 AND source = 'servicetrade'`,
+        [Number(jobKey), companyId]
+      );
+      const ref = rows[0]?.external_ref;
+      if (isNumericRef(ref)) {
+        targets.push({ entityKey: "job", entityType: jobCfg.servicetrade_entity_type, entityIds: [String(ref)] });
+      }
+    }
+    return targets;
   }
 
   if (callType === "service_opportunity_followup") {
     const cfg = await entityTypesDb.getByKey("service_request");
     const jobId = scheduledCall.job_id || "";
-    if (!cfg || !jobId.startsWith("service_opportunity:")) return null;
+    if (!cfg || !jobId.startsWith("service_opportunity:")) return targets;
     const soIds = jobId
       .slice("service_opportunity:".length)
       .split("-")
       .map(Number)
       .filter((n) => Number.isInteger(n));
-    if (soIds.length === 0) return null;
+    if (soIds.length === 0) return targets;
     const { rows } = await db.query(
       `SELECT external_ref FROM service_opportunities
        WHERE id = ANY($1::int[]) AND company_id = $2 AND source = 'servicetrade'`,
       [soIds, companyId]
     );
     const entityIds = rows.map((r) => r.external_ref).filter(isNumericRef).map(String);
-    if (entityIds.length === 0) return null;
-    return { entityKey: "service_request", entityType: cfg.servicetrade_entity_type, entityIds };
+    if (entityIds.length > 0) {
+      targets.push({ entityKey: "service_request", entityType: cfg.servicetrade_entity_type, entityIds });
+    }
+    return targets;
   }
 
-  return null;
+  return targets;
 }
 
 /**
@@ -180,7 +205,7 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
   }
 
   const targets = await resolveTargets(companyId, callType, scheduledCall);
-  if (!targets) {
+  if (targets.length === 0) {
     logger.debug("servicetrade comment: no servicetrade entity to comment on; skipping", { companyId, callType, retellCallId });
     return;
   }
@@ -188,18 +213,24 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
   const provider = getProvider("servicetrade");
   const content = buildCommentContent(label, callSummary, retellCallId);
 
-  for (const entityId of targets.entityIds) {
+  // Flatten to (entityKey, entityType, entityId) so we post one comment per
+  // entity — a confirmation call writes to both the appointment and the job.
+  const posts = targets.flatMap((t) =>
+    t.entityIds.map((entityId) => ({ entityKey: t.entityKey, entityType: t.entityType, entityId }))
+  );
+
+  for (const { entityKey, entityType, entityId } of posts) {
     try {
-      if (await alreadyPosted(provider, companyId, targets.entityType, entityId, retellCallId)) {
-        logger.info("servicetrade comment: already posted for this call; skipping", { companyId, entityId, retellCallId });
+      if (await alreadyPosted(provider, companyId, entityType, entityId, retellCallId)) {
+        logger.info("servicetrade comment: already posted for this call; skipping", { companyId, entityKey, entityId, retellCallId });
         continue;
       }
-      const body = buildCommentBody({ entityId, entityType: targets.entityType, content });
+      const body = buildCommentBody({ entityId, entityType, content });
       const res = await provider.request(companyId, "POST", "/comment", { body });
       if (!res.ok) {
-        logger.error("servicetrade comment: POST failed", { companyId, entityId, status: res.status, messages: res.messages });
+        logger.error("servicetrade comment: POST failed", { companyId, entityKey, entityId, status: res.status, messages: res.messages });
       } else {
-        logger.info("servicetrade comment: posted", { companyId, entityKey: targets.entityKey, entityId, retellCallId });
+        logger.info("servicetrade comment: posted", { companyId, entityKey, entityId, retellCallId });
       }
       await callLogsDb
         .insert({
@@ -210,8 +241,8 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
           payload: {
             ok: res.ok,
             status: res.status,
-            entity_key: targets.entityKey,
-            entity_type: targets.entityType,
+            entity_key: entityKey,
+            entity_type: entityType,
             entity_id: entityId,
             comment_id: res.data?.id ?? null,
             label,

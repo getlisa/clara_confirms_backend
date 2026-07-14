@@ -3,8 +3,8 @@
 -- reference) so we can write comments back onto the correct CRM entity.
 -- Global (not per-company) — entity types are ServiceTrade-wide.
 -- Seeded with only the entities we actually comment on today:
---   Appointment (16)  ← confirmation calls
---   ServiceRequest(18) ← service-opportunity follow-up calls
+--   Appointment (16) + Job (3) ← confirmation calls (both, if they exist)
+--   ServiceRequest(18)         ← service-opportunity follow-up calls
 -- Extend with more rows (e.g. Quote=9) as write-back scope grows.
 
 CREATE TABLE IF NOT EXISTS servicetrade_entity_type_config (
@@ -22,6 +22,7 @@ INSERT INTO servicetrade_entity_type_config
   (entity_key, servicetrade_entity_type, servicetrade_entity_name, platform_table, description)
 VALUES
   ('appointment',     16, 'Appointment',    'appointments',          'Confirmation calls comment on the appointment.'),
+  ('job',              3, 'Job',            'jobs',                  'Confirmation calls also comment on the parent job, if it exists.'),
   ('service_request', 18, 'ServiceRequest', 'service_opportunities', 'Service-opportunity follow-up calls comment on the service request.')
 ON CONFLICT (entity_key) DO UPDATE SET
   servicetrade_entity_type = EXCLUDED.servicetrade_entity_type,
