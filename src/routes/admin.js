@@ -8,6 +8,7 @@
 const express = require("express");
 const toolDefsDb = require("../db/tool-definitions");
 const dynamicVarsDb = require("../db/dynamic-variable-definitions");
+const stEntityTypesDb = require("../db/servicetrade-entity-types");
 const { registerToolsForAllCompanies } = require("../services/retell-tools");
 const { syncFlowForCompany } = require("../services/retell-flow");
 const db = require("../db");
@@ -38,6 +39,7 @@ router.post("/sync-tools", async (req, res) => {
   try {
     await toolDefsDb.seedAll();
     await dynamicVarsDb.seedAll();
+    await stEntityTypesDb.seedAll();
     const result = await registerToolsForAllCompanies();
     logger.info("Admin: tools synced", result);
     return res.json({ ok: true, ...result });

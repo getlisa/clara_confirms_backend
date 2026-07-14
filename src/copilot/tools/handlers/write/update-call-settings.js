@@ -6,6 +6,7 @@ const FIELDS = [
   "agent_can_make_changes",
   "auto_schedule_enabled",
   "auto_dispatch_enabled",
+  "crm_comment_writeback_enabled",
   "business_hours_start",
   "business_hours_end",
   "max_attempts",
@@ -17,6 +18,7 @@ const schema = z
     agent_can_make_changes: z.boolean().nullish().describe("Whether the AI agents are allowed to make changes on calls."),
     auto_schedule_enabled: z.boolean().nullish().describe("Whether confirmation calls are auto-scheduled."),
     auto_dispatch_enabled: z.boolean().nullish().describe("Whether scheduled calls are auto-dispatched by the cron."),
+    crm_comment_writeback_enabled: z.boolean().nullish().describe("Whether call-outcome summary comments are written back to the connected CRM (ServiceTrade) after answered calls."),
     business_hours_start: z.string().nullish().describe("Business hours start, 'HH:MM' (24h)."),
     business_hours_end: z.string().nullish().describe("Business hours end, 'HH:MM' (24h)."),
     max_attempts: z.number().int().min(1).max(10).nullish().describe("Max call attempts before giving up."),
@@ -55,7 +57,7 @@ async function run(args, config) {
 module.exports = {
   name: "update_call_settings",
   description:
-    "Update the company's call/agent settings — e.g. toggle agent_can_make_changes, auto-schedule/auto-dispatch, business hours, max attempts, or alert-days-before. This is a write action: the user will be asked to confirm before it is applied.",
+    "Update the company's call/agent settings — e.g. toggle agent_can_make_changes, auto-schedule/auto-dispatch, CRM comment write-back, business hours, max attempts, or alert-days-before. This is a write action: the user will be asked to confirm before it is applied.",
   isWrite: true,
   schema,
   run,
