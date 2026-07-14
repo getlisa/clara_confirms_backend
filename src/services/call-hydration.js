@@ -6,7 +6,13 @@
  *                                              pass to scheduledCallsDb.create()
  *                                              (minus scheduledAt/isTest/maxAttempts).
  *   { ok: false, status: 404 }               — target not found for this company.
- *   { ok: false, status: 422, error: "..." } — found but cannot dial (e.g. no phone).
+ *   { ok: false, status: 422, error: "..." } — found but not callable (cancelled,
+ *                                              in the past, closed, no technician).
+ *
+ * A missing phone number is NOT rejected here — hydrators return the context with
+ * params.phoneNumber possibly null, plus phoneSubject ("customer"|"technician").
+ * manual-call.js decides the final number (manual override wins) and enforces
+ * presence, so a caller can supply a phone_number to dial a target with no number.
  *
  * Mirrors the JOINs in src/services/scheduler.js's four process* functions
  * but filtered to a single target_id so a UI button can place exactly one call.
@@ -42,17 +48,17 @@ async function hydrateScheduledUnconfirmed(companyId, appointmentId) {
   if (row.scheduled_start && new Date(row.scheduled_start) < new Date()) {
     return { ok: false, status: 422, code: "appointment_in_past", error: "Appointment scheduled time has already passed" };
   }
-  if (!row.customer_phone) {
-    return { ok: false, status: 422, code: "missing_phone", error: "Customer phone number not provided", subject: "customer" };
-  }
+  // Phone may be absent here — enforcement (and manual-number override) happens
+  // in manual-call.js so a caller can supply a phone_number to dial.
   const jobId = String(row.job_id);
   return {
     ok: true,
     jobId,
+    phoneSubject: "customer",
     callType: "scheduled_unconfirmed",
     params: {
       callType:        "scheduled_unconfirmed",
-      phoneNumber:     row.customer_phone,
+      phoneNumber:     row.customer_phone || null,
       jobId,
       jobDate:         row.scheduled_start || row.scheduled_date || null,
       appointmentId:   row.appointment_id,
@@ -94,17 +100,16 @@ async function hydrateTechnicianUnconfirmed(companyId, appointmentId) {
   if (!row.technician_id) {
     return { ok: false, status: 422, code: "no_technician", error: "No technician assigned to this appointment", subject: "technician" };
   }
-  if (!row.technician_phone) {
-    return { ok: false, status: 422, code: "missing_phone", error: "Technician phone number not provided", subject: "technician" };
-  }
+  // Phone may be absent — enforced/overridable in manual-call.js.
   const jobId = String(row.job_id);
   return {
     ok: true,
     jobId,
+    phoneSubject: "technician",
     callType: "technician_unconfirmed",
     params: {
       callType:        "technician_unconfirmed",
-      phoneNumber:     row.technician_phone,
+      phoneNumber:     row.technician_phone || null,
       jobId,
       jobDate:         row.scheduled_start || row.scheduled_date || null,
       appointmentId:   row.appointment_id,
@@ -145,17 +150,16 @@ async function hydrateOpenJobDueSoon(companyId, jobIdInput) {
       return { ok: false, status: 422, code: "job_in_past", error: "Job scheduled date has already passed" };
     }
   }
-  if (!row.customer_phone) {
-    return { ok: false, status: 422, code: "missing_phone", error: "Customer phone number not provided", subject: "customer" };
-  }
+  // Phone may be absent — enforced/overridable in manual-call.js.
   const jobId = String(row.job_id);
   return {
     ok: true,
     jobId,
+    phoneSubject: "customer",
     callType: "open_job_due_soon",
     params: {
       callType:        "open_job_due_soon",
-      phoneNumber:     row.customer_phone,
+      phoneNumber:     row.customer_phone || null,
       jobId,
       jobDate:         row.scheduled_date || null,
       customerName:    row.customer_name,
@@ -181,19 +185,18 @@ async function hydrateQuotationPending(companyId, quotationId) {
   );
   const row = rows[0];
   if (!row) return { ok: false, status: 404, error: "Quotation not found" };
-  if (!row.customer_phone) {
-    return { ok: false, status: 422, error: "Customer phone number not provided", subject: "customer" };
-  }
+  // Phone may be absent — enforced/overridable in manual-call.js.
   // quotations are deduped against a synthetic jobId encoding (see scheduledCallsDb.quotationJobId).
   const jobId = scheduledCallsDb.quotationJobId(row.quotation_id);
   return {
     ok: true,
     jobId,
     realJobId: row.job_id || null,
+    phoneSubject: "customer",
     callType: "quotation_pending",
     params: {
       callType:       "quotation_pending",
-      phoneNumber:    row.customer_phone,
+      phoneNumber:    row.customer_phone || null,
       jobId,
       jobDate:        null,
       customerName:   row.customer_name,

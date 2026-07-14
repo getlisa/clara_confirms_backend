@@ -437,6 +437,14 @@ queues a `scheduled_calls` row, and (by default) pokes the dispatcher to
 fire it inside the same HTTP request. The UI does NOT need to know about
 dynamic variables, addresses, office hours, or phone numbers.
 
+**Manual phone override (new):** the caller may pass an optional `phone_number`
+to dial a specific number. When present it **always wins over the target's
+on-file number** — whether or not one exists. So it serves two purposes:
+override the number even when the customer/technician already has one on file,
+and rescue targets that have no number at all (which would otherwise return
+`422 missing_phone`). The target (appointment/job/quotation) is still required —
+it supplies the call context.
+
 ## Request
 
 ```http
@@ -452,6 +460,8 @@ Content-Type: application/json
   "appointment_id": 123,        // for scheduled_unconfirmed | technician_unconfirmed
   "job_id":         "456",      // for open_job_due_soon
   "quotation_id":   789,        // for quotation_pending
+
+  "phone_number":   "(415) 520-1480", // optional — dial this number instead of the target's on-file number; normalized to E.164 server-side
 
   "immediate":      true,       // default true — dial now (poke dispatcher in-request)
   "force":          false,      // default false — bypass active-call dedup
@@ -469,6 +479,12 @@ Content-Type: application/json
 | `quotation_pending` | `quotation_id` | follows up on an unaccepted quote |
 
 The actual `call_type` written to `scheduled_calls` (e.g. `customer_confirmation`) is looked up from the company's `call_trigger_configs` row for the given `trigger_type`. If the company has not configured that trigger (row missing), the request returns `400`.
+
+### Optional `phone_number` override
+
+| Field | Type | Notes |
+|---|---|---|
+| `phone_number` | `string` | Optional. When present, this number is dialed **instead of** the target's on-file number — it always takes precedence, even if a number already exists on file. Accepts US 10-digit, formatted (e.g. `(415) 520-1480`), or `+E.164` — the server normalizes via `toE164`. If it can't be normalized to a valid number, the request returns `400`. When omitted, the on-file number is used as before. |
 
 ## Responses
 
@@ -493,6 +509,7 @@ null` — the next 2-minute cron tick will pick it up.
 | Status | Shape | When |
 |---|---|---|
 | 400 | `{ok:false, status:400, error:"trigger_type 'open_job_due_soon' requires job_id"}` | missing/invalid trigger_type, missing target_id, or trigger not configured for company |
+| 400 | `{ok:false, status:400, error:"Invalid phone_number — could not normalize to a valid E.164 number."}` | `phone_number` was provided but isn't a recognizable number |
 | 404 | `{ok:false, status:404, error:"Appointment not found"}` | target_id doesn't exist for caller's company |
 | 409 | `{ok:false, status:409, error:"A scheduled call already exists for this target. Pass force:true to override."}` | dedup hit; retry with `force:true` |
 | 422 | `{ok:false, status:422, code:"...", error:"..."}` | found but cannot dial — see codes below |
@@ -506,7 +523,7 @@ null` — the next 2-minute cron tick will pick it up.
 | `job_closed` | job.status ∈ ('cancelled', 'completed') | Disable Call button on closed jobs |
 | `job_in_past` | job.scheduled_date < today | Disable Call button on overdue jobs |
 | `no_technician` | appointment.technician_id is null | Prompt user to assign a technician first |
-| `missing_phone` | customer/technician phone is null. Includes `subject:"customer"\|"technician"` so the UI can deep-link to the right edit screen | Toast with "Edit customer/technician" action |
+| `missing_phone` | no number on file **and** no `phone_number` override was passed. Includes `subject:"customer"\|"technician"` so the UI can deep-link to the right edit screen | Toast with "Edit customer/technician" action — **or** offer a "Call a different number" input that re-sends the request with `phone_number` (see below) |
 
 ## UI patterns
 
@@ -549,6 +566,35 @@ function handleManualCallError(err) {
   }
 }
 ```
+
+### "Call a different number" (override)
+
+Offer this as a general affordance on the "Call now" control — e.g. a "Call a
+different number…" menu item next to "Call now", or a small phone input in the
+call confirmation popover. It applies in two situations:
+
+- **Proactively**, when the user wants to reach the customer/technician on a
+  number other than the one on file (a cell instead of the office line, etc.).
+- **Reactively**, after a `422 missing_phone` — prompt for a number and re-send.
+
+Wire it by adding `phone_number` to the same request:
+
+```ts
+async function callNowWithNumber(
+  triggerType: TriggerType,
+  target: { appointmentId?: number; jobId?: string; quotationId?: number },
+  phoneNumber: string,
+) {
+  const r = await api.post('/calls/manual', {
+    trigger_type: triggerType, ...target, phone_number: phoneNumber, immediate: true,
+  });
+  // 400 => invalid number (show inline validation); otherwise same handling as callNow.
+}
+```
+
+The number can be entered loosely (US 10-digit, `(415) 520-1480`, or `+E.164`) —
+the server normalizes it. On a `400` (`Invalid phone_number …`), surface inline
+validation on the input rather than a generic toast.
 
 ### "Schedule for later" variant (optional)
 

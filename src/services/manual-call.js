@@ -20,6 +20,7 @@ const scheduledCallsDb = require("../db/scheduled-calls");
 const callSettingsDb = require("../db/call-settings");
 const scheduler = require("./scheduler");
 const db = require("../db");
+const { toE164 } = require("../utils/phone");
 const logger = require("../utils/logger");
 
 const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
@@ -31,6 +32,7 @@ const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
  * @param {number} [args.appointmentId]
  * @param {string|number} [args.jobId]
  * @param {number} [args.quotationId]
+ * @param {string} [args.phoneNumber]              — optional manual override; dials this number instead of the target's on-file number. Normalized to E.164.
  * @param {boolean} [args.immediate=true]
  * @param {boolean} [args.force=false]
  * @param {string}  [args.scheduledAt]
@@ -38,12 +40,21 @@ const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
  */
 async function triggerManualCall({
   companyId, triggerType,
-  appointmentId, jobId: rawJobId, quotationId,
+  appointmentId, jobId: rawJobId, quotationId, phoneNumber = null,
   immediate = true, force = false, scheduledAt = null,
 }) {
   // ── 1. Validate trigger_type and resolve the company's configured call_type ─
   if (!triggerType || !VALID_TRIGGER_TYPES.includes(triggerType)) {
     return { ok: false, status: 400, error: `Invalid trigger_type. Must be one of: ${VALID_TRIGGER_TYPES.join(", ")}` };
+  }
+
+  // Optional manual phone override — normalize up front so we fail fast on a bad number.
+  let manualPhone = null;
+  if (phoneNumber != null && String(phoneNumber).trim() !== "") {
+    manualPhone = toE164(String(phoneNumber).trim());
+    if (!manualPhone) {
+      return { ok: false, status: 400, error: "Invalid phone_number — could not normalize to a valid E.164 number." };
+    }
   }
 
   const { rows: trigRows } = await db.query(
@@ -71,6 +82,22 @@ async function triggerManualCall({
   if (!hydrated.ok) return hydrated;
   // Override the hydrator's placeholder call_type with the company's configured one.
   hydrated.params.callType = callType;
+
+  // ── 2b. Resolve the number to dial ─────────────────────────────────────────
+  // A manually-supplied phone_number overrides the target's on-file number and
+  // rescues targets that have no number on file. If neither is present, 422.
+  const dialPhone = manualPhone || hydrated.params.phoneNumber;
+  if (!dialPhone) {
+    const subject = hydrated.phoneSubject || "customer";
+    return {
+      ok: false, status: 422, code: "missing_phone", subject,
+      error: `No ${subject} phone number on file. Pass phone_number to dial a specific number.`,
+    };
+  }
+  hydrated.params.phoneNumber = dialPhone;
+  if (manualPhone) {
+    logger.info("Manual call: using manual phone override", { companyId, triggerType, targetId });
+  }
 
   // ── 3. Dedup (unless forced) ───────────────────────────────────────────────
   if (force) {
