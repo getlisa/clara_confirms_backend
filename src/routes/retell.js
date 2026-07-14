@@ -304,8 +304,10 @@ async function handleCallAnalyzed(callData) {
   // ── ServiceTrade comment write-back ───────────────────────────────────────
   // For ANSWERED calls only (voicemail/no-answer excluded), post a comment onto
   // the underlying ServiceTrade entity summarizing the outcome. Fire-and-forget;
-  // gated internally by the SERVICETRADE_COMMENT_WRITEBACK flag + source guards.
-  if (!inVoicemail && !isNoAnswer && stComments.isCommentWritebackEnabled()) {
+  // gated internally by the per-company crm_comment_writeback_enabled setting +
+  // source guards. The call-type pre-gate avoids a scheduled_calls lookup for
+  // call types that never write back.
+  if (!inVoicemail && !isNoAnswer && stComments.appliesToCallType(metadata?.call_type)) {
     db.query(`SELECT * FROM scheduled_calls WHERE retell_call_id = $1 LIMIT 1`, [call_id])
       .then(({ rows }) => {
         if (!rows[0]) return;

@@ -18,6 +18,7 @@
 const db = require("../db");
 const { getProvider } = require("./crm");
 const entityTypesDb = require("../db/servicetrade-entity-types");
+const callSettingsDb = require("../db/call-settings");
 const callLogsDb = require("../db/call-logs");
 const logger = require("../utils/logger");
 
@@ -27,8 +28,18 @@ const CALL_TYPES_WITH_WRITEBACK = [
   "service_opportunity_followup",
 ];
 
-function isCommentWritebackEnabled() {
-  return process.env.SERVICETRADE_COMMENT_WRITEBACK === "true";
+/** Whether comment write-back could apply to this call type (cheap pre-gate). */
+function appliesToCallType(callType) {
+  return CALL_TYPES_WITH_WRITEBACK.includes(callType);
+}
+
+/**
+ * Per-company enablement — driven by the `crm_comment_writeback_enabled` call
+ * setting (toggled from the UI), replacing the old env flag. Off by default.
+ */
+async function isCommentWritebackEnabled(companyId) {
+  const cs = await callSettingsDb.getByCompanyId(companyId).catch(() => null);
+  return cs?.crm_comment_writeback_enabled === true;
 }
 
 /** true when `v` is a non-empty numeric ServiceTrade id (skips 'TEST-SO-*' etc.). */
@@ -193,10 +204,13 @@ async function alreadyPosted(provider, companyId, entityType, entityId, retellCa
  * @param {number|null} [args.callId]  our calls.id (for call_logs linkage)
  */
 async function postCallComment({ companyId, scheduledCall, outcome, custom, callSummary, retellCallId, callId = null }) {
-  if (!isCommentWritebackEnabled()) return;
-
   const callType = scheduledCall?.call_type;
-  if (!CALL_TYPES_WITH_WRITEBACK.includes(callType)) return;
+  if (!appliesToCallType(callType)) return;
+
+  if (!(await isCommentWritebackEnabled(companyId))) {
+    logger.debug("servicetrade comment: write-back disabled for company; skipping", { companyId, callType, retellCallId });
+    return;
+  }
 
   const label = deriveLabel(callType, outcome, custom);
   if (!label) {
@@ -258,6 +272,7 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
 
 module.exports = {
   postCallComment,
+  appliesToCallType,
   isCommentWritebackEnabled,
   // exported for tests / live verification
   buildCommentBody,
