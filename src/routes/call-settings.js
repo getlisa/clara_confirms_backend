@@ -124,6 +124,9 @@ router.patch("/", async (req, res) => {
       });
     }
 
+    // No side effect needed for crm_comment_writeback_enabled — it's read live
+    // per-company at call-analyzed time by the write-back service.
+
     return res.json({ call_settings: settings });
   } catch (err) {
     logger.error("PATCH /call-settings failed", { error: err.message });
