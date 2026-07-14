@@ -307,10 +307,18 @@ async function handleCallAnalyzed(callData) {
   // gated internally by the per-company crm_comment_writeback_enabled setting +
   // source guards. The call-type pre-gate avoids a scheduled_calls lookup for
   // call types that never write back.
-  if (!inVoicemail && !isNoAnswer && stComments.appliesToCallType(metadata?.call_type)) {
+  const stWritebackEligible = !inVoicemail && !isNoAnswer && stComments.appliesToCallType(metadata?.call_type);
+  logger.info("servicetrade comment: gate", {
+    callId: call_id, companyId, callType: metadata?.call_type,
+    inVoicemail, isNoAnswer, eligible: stWritebackEligible,
+  });
+  if (stWritebackEligible) {
     db.query(`SELECT * FROM scheduled_calls WHERE retell_call_id = $1 LIMIT 1`, [call_id])
       .then(({ rows }) => {
-        if (!rows[0]) return;
+        if (!rows[0]) {
+          logger.warn("servicetrade comment: no scheduled_calls row for retell_call_id; cannot resolve entity", { callId: call_id, companyId });
+          return;
+        }
         return stComments.postCallComment({
           companyId,
           scheduledCall: rows[0],

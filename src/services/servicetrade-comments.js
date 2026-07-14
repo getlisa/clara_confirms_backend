@@ -114,30 +114,50 @@ async function resolveTargets(companyId, callType, scheduledCall) {
   if (callType === "customer_confirmation" || callType === "technician_confirmation") {
     // Appointment (entityType 16), via scheduled_calls.appointment_id.
     const apptCfg = await entityTypesDb.getByKey("appointment");
-    if (apptCfg && scheduledCall.appointment_id) {
+    if (!apptCfg) {
+      logger.warn("servicetrade comment[resolve]: no 'appointment' entity-type config seeded", { companyId });
+    } else if (!scheduledCall.appointment_id) {
+      logger.info("servicetrade comment[resolve]: no appointment_id on scheduled_call — skipping appointment target", { companyId, jobId: scheduledCall.job_id });
+    } else {
       const { rows } = await db.query(
-        `SELECT external_ref FROM appointments
-         WHERE id = $1 AND company_id = $2 AND source = 'servicetrade'`,
+        `SELECT external_ref, source FROM appointments
+         WHERE id = $1 AND company_id = $2`,
         [scheduledCall.appointment_id, companyId]
       );
-      const ref = rows[0]?.external_ref;
-      if (isNumericRef(ref)) {
-        targets.push({ entityKey: "appointment", entityType: apptCfg.servicetrade_entity_type, entityIds: [String(ref)] });
+      const row = rows[0];
+      if (!row) {
+        logger.info("servicetrade comment[resolve]: appointment row not found", { companyId, appointmentId: scheduledCall.appointment_id });
+      } else if (row.source !== "servicetrade") {
+        logger.info("servicetrade comment[resolve]: appointment not from servicetrade — skipping", { companyId, appointmentId: scheduledCall.appointment_id, source: row.source });
+      } else if (!isNumericRef(row.external_ref)) {
+        logger.info("servicetrade comment[resolve]: appointment external_ref not numeric — skipping", { companyId, appointmentId: scheduledCall.appointment_id, external_ref: row.external_ref });
+      } else {
+        targets.push({ entityKey: "appointment", entityType: apptCfg.servicetrade_entity_type, entityIds: [String(row.external_ref)] });
       }
     }
 
     // Parent Job (entityType 3), via scheduled_calls.job_id (a real platform job id string).
     const jobCfg = await entityTypesDb.getByKey("job");
     const jobKey = scheduledCall.job_id || "";
-    if (jobCfg && /^\d+$/.test(jobKey)) {
+    if (!jobCfg) {
+      logger.warn("servicetrade comment[resolve]: no 'job' entity-type config seeded", { companyId });
+    } else if (!/^\d+$/.test(jobKey)) {
+      logger.info("servicetrade comment[resolve]: job_id is not a numeric platform id — skipping job target", { companyId, jobId: jobKey });
+    } else {
       const { rows } = await db.query(
-        `SELECT external_ref FROM jobs
-         WHERE id = $1 AND company_id = $2 AND source = 'servicetrade'`,
+        `SELECT external_ref, source FROM jobs
+         WHERE id = $1 AND company_id = $2`,
         [Number(jobKey), companyId]
       );
-      const ref = rows[0]?.external_ref;
-      if (isNumericRef(ref)) {
-        targets.push({ entityKey: "job", entityType: jobCfg.servicetrade_entity_type, entityIds: [String(ref)] });
+      const row = rows[0];
+      if (!row) {
+        logger.info("servicetrade comment[resolve]: job row not found", { companyId, jobId: jobKey });
+      } else if (row.source !== "servicetrade") {
+        logger.info("servicetrade comment[resolve]: job not from servicetrade — skipping", { companyId, jobId: jobKey, source: row.source });
+      } else if (!isNumericRef(row.external_ref)) {
+        logger.info("servicetrade comment[resolve]: job external_ref not numeric — skipping", { companyId, jobId: jobKey, external_ref: row.external_ref });
+      } else {
+        targets.push({ entityKey: "job", entityType: jobCfg.servicetrade_entity_type, entityIds: [String(row.external_ref)] });
       }
     }
     return targets;
@@ -146,21 +166,39 @@ async function resolveTargets(companyId, callType, scheduledCall) {
   if (callType === "service_opportunity_followup") {
     const cfg = await entityTypesDb.getByKey("service_request");
     const jobId = scheduledCall.job_id || "";
-    if (!cfg || !jobId.startsWith("service_opportunity:")) return targets;
+    if (!cfg) {
+      logger.warn("servicetrade comment[resolve]: no 'service_request' entity-type config seeded", { companyId });
+      return targets;
+    }
+    if (!jobId.startsWith("service_opportunity:")) {
+      logger.info("servicetrade comment[resolve]: job_id is not a service_opportunity key — skipping", { companyId, jobId });
+      return targets;
+    }
     const soIds = jobId
       .slice("service_opportunity:".length)
       .split("-")
       .map(Number)
       .filter((n) => Number.isInteger(n));
-    if (soIds.length === 0) return targets;
+    if (soIds.length === 0) {
+      logger.info("servicetrade comment[resolve]: no service_opportunity ids parsed from job_id", { companyId, jobId });
+      return targets;
+    }
     const { rows } = await db.query(
-      `SELECT external_ref FROM service_opportunities
-       WHERE id = ANY($1::int[]) AND company_id = $2 AND source = 'servicetrade'`,
+      `SELECT id, external_ref, source FROM service_opportunities
+       WHERE id = ANY($1::int[]) AND company_id = $2`,
       [soIds, companyId]
     );
-    const entityIds = rows.map((r) => r.external_ref).filter(isNumericRef).map(String);
+    logger.info("servicetrade comment[resolve]: service_opportunity rows", {
+      companyId, requestedIds: soIds,
+      found: rows.map((r) => ({ id: r.id, source: r.source, external_ref: r.external_ref })),
+    });
+    const entityIds = rows
+      .filter((r) => r.source === "servicetrade" && isNumericRef(r.external_ref))
+      .map((r) => String(r.external_ref));
     if (entityIds.length > 0) {
       targets.push({ entityKey: "service_request", entityType: cfg.servicetrade_entity_type, entityIds });
+    } else {
+      logger.info("servicetrade comment[resolve]: no eligible servicetrade service_requests (need source='servicetrade' + numeric external_ref) — skipping", { companyId, jobId });
     }
     return targets;
   }
@@ -205,24 +243,44 @@ async function alreadyPosted(provider, companyId, entityType, entityId, retellCa
  */
 async function postCallComment({ companyId, scheduledCall, outcome, custom, callSummary, retellCallId, callId = null }) {
   const callType = scheduledCall?.call_type;
-  if (!appliesToCallType(callType)) return;
+  logger.info("servicetrade comment: begin", {
+    companyId, callType, retellCallId,
+    jobId: scheduledCall?.job_id, appointmentId: scheduledCall?.appointment_id,
+  });
 
-  if (!(await isCommentWritebackEnabled(companyId))) {
-    logger.debug("servicetrade comment: write-back disabled for company; skipping", { companyId, callType, retellCallId });
+  if (!appliesToCallType(callType)) {
+    logger.info("servicetrade comment: call_type not eligible for write-back; skipping", { companyId, callType, retellCallId });
+    return;
+  }
+
+  const enabled = await isCommentWritebackEnabled(companyId);
+  if (!enabled) {
+    logger.info("servicetrade comment: crm_comment_writeback_enabled is FALSE for company; skipping", { companyId, callType, retellCallId });
     return;
   }
 
   const label = deriveLabel(callType, outcome, custom);
   if (!label) {
-    logger.debug("servicetrade comment: no reportable outcome; skipping", { companyId, callType, retellCallId });
+    logger.info("servicetrade comment: no reportable outcome; skipping", {
+      companyId, callType, retellCallId,
+      appointmentConfirmed: outcome?.appointmentConfirmed,
+      cancellationRequested: outcome?.cancellationRequested,
+      rescheduleRequested: outcome?.rescheduleRequested,
+      bookingOutcome: custom?.booking_outcome ?? null,
+    });
     return;
   }
+  logger.info("servicetrade comment: outcome label resolved", { companyId, callType, retellCallId, label });
 
   const targets = await resolveTargets(companyId, callType, scheduledCall);
   if (targets.length === 0) {
-    logger.debug("servicetrade comment: no servicetrade entity to comment on; skipping", { companyId, callType, retellCallId });
+    logger.warn("servicetrade comment: no servicetrade entity resolved to comment on; skipping (see [resolve] logs above for reason)", { companyId, callType, retellCallId });
     return;
   }
+  logger.info("servicetrade comment: resolved targets", {
+    companyId, callType, retellCallId,
+    targets: targets.map((t) => ({ entityKey: t.entityKey, entityType: t.entityType, entityIds: t.entityIds })),
+  });
 
   const provider = getProvider("servicetrade");
   const content = buildCommentContent(label, callSummary, retellCallId);
@@ -233,6 +291,7 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
     t.entityIds.map((entityId) => ({ entityKey: t.entityKey, entityType: t.entityType, entityId }))
   );
 
+  logger.info("servicetrade comment: posting", { companyId, retellCallId, count: posts.length, entities: posts.map((p) => `${p.entityKey}:${p.entityId}`) });
   for (const { entityKey, entityType, entityId } of posts) {
     try {
       if (await alreadyPosted(provider, companyId, entityType, entityId, retellCallId)) {
@@ -240,11 +299,12 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
         continue;
       }
       const body = buildCommentBody({ entityId, entityType, content });
+      logger.info("servicetrade comment: POST /comment", { companyId, entityKey, entityType, entityId, contentPreview: content.slice(0, 80) });
       const res = await provider.request(companyId, "POST", "/comment", { body });
       if (!res.ok) {
-        logger.error("servicetrade comment: POST failed", { companyId, entityKey, entityId, status: res.status, messages: res.messages });
+        logger.error("servicetrade comment: POST failed", { companyId, entityKey, entityId, status: res.status, messages: res.messages, data: res.data });
       } else {
-        logger.info("servicetrade comment: posted", { companyId, entityKey, entityId, retellCallId });
+        logger.info("servicetrade comment: posted OK", { companyId, entityKey, entityId, retellCallId, commentId: res.data?.id ?? null });
       }
       await callLogsDb
         .insert({
