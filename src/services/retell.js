@@ -2,6 +2,8 @@ const Retell = require("retell-sdk");
 const config = require("../config");
 const db = require("../db");
 const logger = require("../utils/logger");
+const { parsePhoneNumberFromString } = require("libphonenumber-js");
+
 
 let _client = null;
 
@@ -54,9 +56,12 @@ async function createCall({ fromNumber, toNumber, companyId, callType, dynamicVa
   const resolvedFromNumber = fromNumber || company.retell_phone_number;
   if (!resolvedFromNumber) throw new Error(`No from_number available for company ${companyId} — set retell_phone_number on the company`);
 
+  const toPhoneNumber = parsePhoneNumberFromString(toNumber, "US");
+  console.log("---------toPhoneNumber----------------:", toPhoneNumber.number);
+
   const callParams = {
     from_number: resolvedFromNumber,
-    to_number: toNumber,
+    to_number: toPhoneNumber.number.toString(),
     override_agent_id: agentId,
     retell_llm_dynamic_variables: {
       call_type: callType || "",
