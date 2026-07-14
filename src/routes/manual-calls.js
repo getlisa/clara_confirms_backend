@@ -7,6 +7,7 @@
  *     appointment_id?: number,  // for scheduled_unconfirmed / technician_unconfirmed
  *     job_id?:         string|number,  // for open_job_due_soon
  *     quotation_id?:   number,  // for quotation_pending
+ *     phone_number?:   string,  // optional manual override; dials this number (normalized to E.164) instead of the target's on-file number
  *     immediate?:      boolean (default true),
  *     force?:          boolean (default false),
  *     scheduled_at?:   string (ISO; ignored when immediate=true)
@@ -35,6 +36,7 @@ router.post("/", async (req, res) => {
       appointmentId: req.body?.appointment_id != null ? Number(req.body.appointment_id) : undefined,
       jobId:         req.body?.job_id != null ? String(req.body.job_id) : undefined,
       quotationId:   req.body?.quotation_id != null ? Number(req.body.quotation_id) : undefined,
+      phoneNumber:   req.body?.phone_number != null ? String(req.body.phone_number) : undefined,
       immediate:     req.body?.immediate !== false,         // default true
       force:         req.body?.force === true,              // default false
       scheduledAt:   req.body?.scheduled_at || null,
