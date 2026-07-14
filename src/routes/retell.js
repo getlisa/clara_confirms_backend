@@ -5,6 +5,7 @@ const callLogsDb = require("../db/call-logs");
 const callSettingsDb = require("../db/call-settings");
 const todosDb = require("../db/todos");
 const scheduledCallsDb = require("../db/scheduled-calls");
+const stComments = require("../services/servicetrade-comments");
 const db = require("../db");
 const { getNextWindowStart } = require("../services/scheduler");
 const { parseCallbackTime } = require("../services/callback-time");
@@ -298,6 +299,27 @@ async function handleCallAnalyzed(callData) {
         logger.info("Service opportunity escalation todo created", { callId: call_id, companyId, bookingOutcome });
       }
     }
+  }
+
+  // ── ServiceTrade comment write-back ───────────────────────────────────────
+  // For ANSWERED calls only (voicemail/no-answer excluded), post a comment onto
+  // the underlying ServiceTrade entity summarizing the outcome. Fire-and-forget;
+  // gated internally by the SERVICETRADE_COMMENT_WRITEBACK flag + source guards.
+  if (!inVoicemail && !isNoAnswer && stComments.isCommentWritebackEnabled()) {
+    db.query(`SELECT * FROM scheduled_calls WHERE retell_call_id = $1 LIMIT 1`, [call_id])
+      .then(({ rows }) => {
+        if (!rows[0]) return;
+        return stComments.postCallComment({
+          companyId,
+          scheduledCall: rows[0],
+          outcome,
+          custom,
+          callSummary: outcome.callSummary,
+          retellCallId: call_id,
+          callId,
+        });
+      })
+      .catch((err) => logger.error("servicetrade comment write-back failed", { error: err.message, callId: call_id }));
   }
 
   logger.info("Call analyzed — outcome saved", {

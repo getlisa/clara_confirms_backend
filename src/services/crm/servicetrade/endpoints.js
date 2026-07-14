@@ -7,4 +7,5 @@ module.exports = {
   customers:   "/company",                 // ST "company" = end-customer
   jobs:        "/job",                     // appointments embedded inline
   technicians: "/user?isTech=true",
+  comments:    "/comment",                 // write-back: POST a comment onto an entity
 };
