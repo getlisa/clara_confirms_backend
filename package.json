@@ -27,6 +27,7 @@
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
+    "libphonenumber-js": "^1.13.8",
     "pg": "^8.18.0",
     "retell-sdk": "^5.19.0",
     "zod": "^3.24.1"
