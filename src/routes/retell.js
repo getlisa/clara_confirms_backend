@@ -114,15 +114,21 @@ router.post("/webhook", async (req, res) => {
     signatureValid: valid,
   });
 
+  // NOTE: these handlers MUST be awaited before responding. On Vercel serverless
+  // the function is frozen/killed once the response is sent, which would cut off
+  // any post-response async work — including the ServiceTrade comment write-back
+  // (a network POST that runs at the tail of handleCallAnalyzed). Awaiting keeps
+  // the function alive until the work completes. Handlers are idempotent
+  // (upserts + the [clara-call:...] comment marker), so a Retell retry is safe.
   if (eventType === "call_ended") {
-    handleCallEnded(callData).catch((err) =>
+    await handleCallEnded(callData).catch((err) =>
       logger.error("call_ended handler failed", { error: err.message, callId: callData?.call_id })
     );
     return res.sendStatus(204);
   }
 
   if (eventType === "call_analyzed") {
-    handleCallAnalyzed(callData).catch((err) =>
+    await handleCallAnalyzed(callData).catch((err) =>
       logger.error("call_analyzed handler failed", { error: err.message, callId: callData?.call_id })
     );
     return res.sendStatus(204);
