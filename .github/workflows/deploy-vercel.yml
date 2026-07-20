@@ -24,25 +24,31 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     if: github.actor != 'getlisa'
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      # Production base URL the post-deploy sync hits. Override with a repo secret
+      # if the production domain changes.
+      PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
     steps:
       - name: Deploy to Vercel
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
         run: |
           set -euo pipefail
 
           TARGET="${{ github.event.inputs.environment || 'production' }}"
           BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
           echo "Deploying branch '$BRANCH' to $TARGET..."
+          echo "TARGET=$TARGET" >> "$GITHUB_ENV"
 
           if [ -z "${VERCEL_TEAM_ID:-}" ]; then
-            DEPLOY_URL="https://api.vercel.com/v13/deployments"
+            TEAM_Q=""
           else
-            DEPLOY_URL="https://api.vercel.com/v13/deployments?teamId=${VERCEL_TEAM_ID}"
+            TEAM_Q="?teamId=${VERCEL_TEAM_ID}"
           fi
+          echo "TEAM_Q=$TEAM_Q" >> "$GITHUB_ENV"
 
-          RESPONSE="$(curl -sS -X POST "$DEPLOY_URL" \
+          RESPONSE="$(curl -sS -X POST "https://api.vercel.com/v13/deployments${TEAM_Q}" \
             -H "Authorization: Bearer $VERCEL_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{
@@ -61,24 +67,68 @@ jobs:
 
           export RESPONSE_JSON="$RESPONSE"
           python3 - <<'PY'
-          import json
-          import os
-          import sys
-
+          import json, os, sys
           data = json.loads(os.environ.get("RESPONSE_JSON", "{}"))
           error = data.get("error")
           if error:
-              if isinstance(error, dict):
-                  message = error.get("message", str(error))
-              else:
-                  message = str(error)
+              message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
               print(f"Vercel deploy failed: {message}")
               sys.exit(1)
-
+          dep_id = data.get("id")
           url = data.get("url")
-          if not url:
-              print("Vercel deploy failed: missing deployment URL")
+          if not url or not dep_id:
+              print("Vercel deploy failed: missing deployment id/URL")
               sys.exit(1)
-
+          print(f"Deployment id: {dep_id}")
           print(f"Deployment URL: https://{url}")
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              fh.write(f"DEPLOY_ID={dep_id}\n")
           PY
+
+      - name: Wait for deployment to be READY
+        run: |
+          set -euo pipefail
+          echo "Polling deployment $DEPLOY_ID until READY..."
+          for i in $(seq 1 90); do
+            STATE="$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v13/deployments/${DEPLOY_ID}${TEAM_Q}" \
+              | python3 -c "import sys,json;print(json.load(sys.stdin).get('readyState',''))")"
+            echo "readyState=$STATE"
+            case "$STATE" in
+              READY) echo "Deployment is live."; exit 0 ;;
+              ERROR|CANCELED) echo "Deployment ended in state $STATE"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "Timed out waiting for deployment to be READY"; exit 1
+
+      - name: Post-deploy sync (tools + flows) — production only
+        if: env.TARGET == 'production'
+        run: |
+          set -euo pipefail
+          BASE="${PROD_BASE_URL:-https://clara-confirms-backend.vercel.app}"
+          BASE="${BASE%/}"
+          if [ -z "${CRON_SECRET:-}" ]; then
+            echo "CRON_SECRET not set — skipping post-deploy sync. Add it as a repo secret to enable."
+            exit 0
+          fi
+
+          sync() {
+            local path="$1"
+            for attempt in 1 2; do
+              echo "POST $BASE$path (attempt $attempt)"
+              if curl -fsS -X POST "$BASE$path" -H "Authorization: Bearer $CRON_SECRET"; then
+                echo; return 0
+              fi
+              echo "…retrying in 10s"; sleep 10
+            done
+            echo "sync failed: $path"; return 1
+          }
+
+          # Reseeds the tool/dynamic-var/entity-type catalogs and registers tools
+          # on every company's flow, then rebuilds each flow (prompt-from-DB +
+          # extract vars + tools). NOTE: does NOT reset prompts — sync-prompts?reset
+          # is intentionally left manual so hand-tuned prompts are never overwritten.
+          sync "/admin/sync-tools"
+          sync "/admin/sync-flows"
+          echo "Post-deploy sync complete."
