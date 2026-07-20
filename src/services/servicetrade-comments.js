@@ -16,7 +16,7 @@
  */
 
 const db = require("../db");
-const { getProvider } = require("./crm");
+const { stLoggedRequest } = require("./servicetrade-api");
 const entityTypesDb = require("../db/servicetrade-entity-types");
 const callSettingsDb = require("../db/call-settings");
 const callLogsDb = require("../db/call-logs");
@@ -211,12 +211,13 @@ async function resolveTargets(companyId, callType, scheduledCall) {
  * posted one for this call (marker match). Fails open (returns false) so a read
  * error never blocks a legitimate write.
  */
-async function alreadyPosted(provider, companyId, entityType, entityId, retellCallId) {
+async function alreadyPosted(companyId, entityType, entityId, retellCallId) {
   try {
-    const res = await provider.request(
+    const res = await stLoggedRequest(
       companyId,
       "GET",
-      `/comment?entityId=${encodeURIComponent(entityId)}&entityType=${encodeURIComponent(entityType)}`
+      `/comment?entityId=${encodeURIComponent(entityId)}&entityType=${encodeURIComponent(entityType)}`,
+      { context: "comment.get" }
     );
     if (!res.ok) return false;
     const list = Array.isArray(res.data) ? res.data : res.data?.comments || [];
@@ -282,7 +283,6 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
     targets: targets.map((t) => ({ entityKey: t.entityKey, entityType: t.entityType, entityIds: t.entityIds })),
   });
 
-  const provider = getProvider("servicetrade");
   const content = buildCommentContent(label, callSummary, retellCallId);
 
   // Flatten to (entityKey, entityType, entityId) so we post one comment per
@@ -294,13 +294,12 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
   logger.info("servicetrade comment: posting", { companyId, retellCallId, count: posts.length, entities: posts.map((p) => `${p.entityKey}:${p.entityId}`) });
   for (const { entityKey, entityType, entityId } of posts) {
     try {
-      if (await alreadyPosted(provider, companyId, entityType, entityId, retellCallId)) {
+      if (await alreadyPosted(companyId, entityType, entityId, retellCallId)) {
         logger.info("servicetrade comment: already posted for this call; skipping", { companyId, entityKey, entityId, retellCallId });
         continue;
       }
       const body = buildCommentBody({ entityId, entityType, content });
-      logger.info("servicetrade comment: POST /comment", { companyId, entityKey, entityType, entityId, contentPreview: content.slice(0, 80) });
-      const res = await provider.request(companyId, "POST", "/comment", { body });
+      const res = await stLoggedRequest(companyId, "POST", "/comment", { body, context: "comment.post" });
       if (!res.ok) {
         logger.error("servicetrade comment: POST failed", { companyId, entityKey, entityId, status: res.status, messages: res.messages, data: res.data });
       } else {

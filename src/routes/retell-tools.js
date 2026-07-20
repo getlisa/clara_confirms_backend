@@ -10,6 +10,8 @@ const db = require("../db");
 const jobsDb = require("../db/jobs");
 const scheduledCallsDb = require("../db/scheduled-calls");
 const serviceOpportunitiesDb = require("../db/service-opportunities");
+const serviceLink = require("../services/servicetrade-service-link");
+const serviceLinkMessagesDb = require("../db/service-link-messages");
 const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
 const { parseCallbackTime } = require("../services/callback-time");
@@ -557,6 +559,92 @@ router.post("/schedule_callback", async (req, res) => {
   } catch (err) {
     logger.error("Tool schedule_callback failed", { error: err.message });
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Service Link: contact search + recipient recording ───────────────────────
+// Resolve the confirmation call's job → customer/location ServiceTrade ids so a
+// new contact can be linked correctly and the service link points at the job.
+async function resolveConfirmationRefs(companyId, retellCallId) {
+  const { rows } = await db.query(
+    `SELECT sc.id AS scheduled_call_id, sc.job_id,
+            j.external_ref AS job_ref, j.source AS job_source,
+            cu.external_ref AS customer_ref
+       FROM scheduled_calls sc
+       LEFT JOIN jobs j       ON j.id::text = sc.job_id AND j.company_id = sc.company_id
+       LEFT JOIN customers cu ON cu.id = j.customer_id
+      WHERE sc.retell_call_id = $1 AND sc.company_id = $2 LIMIT 1`,
+    [retellCallId, companyId]
+  );
+  return rows[0] || null;
+}
+
+async function resolveJobLocationId(companyId, jobRef) {
+  if (!jobRef) return null;
+  const { rows } = await db.query(
+    `SELECT payload->'location'->>'id' AS loc FROM servicetrade_jobs WHERE company_id = $1 AND servicetrade_id = $2 LIMIT 1`,
+    [companyId, jobRef]
+  );
+  return rows[0]?.loc || null;
+}
+
+// POST /retell/tools/search_contact — find an existing contact (read-only).
+router.post("/search_contact", async (req, res) => {
+  try {
+    if (!verifyToolSecret(req, res)) return;
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(400).json({ error: "company_id missing" });
+    const { query } = getArgs(req);
+    if (!query) return res.status(400).json({ error: "query is required" });
+    const contacts = await serviceLink.searchContacts(companyId, query);
+    return res.json({ success: true, count: contacts.length, contacts });
+  } catch (err) {
+    logger.error("Tool search_contact failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to search contacts" });
+  }
+});
+
+// POST /retell/tools/create_contact — record the service-link recipient (reuse an
+// existing contact or create a new one). The email itself is sent post-call.
+router.post("/create_contact", async (req, res) => {
+  try {
+    if (!verifyToolSecret(req, res)) return;
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(400).json({ error: "company_id missing" });
+    const retellCallId = req.body?.call?.call_id;
+    if (!retellCallId) return res.status(400).json({ error: "call.call_id missing from request" });
+    const { email, existing_contact_id, first_name, last_name, phone, role } = getArgs(req);
+    if (!email) return res.status(400).json({ error: "email is required" });
+
+    const refs = await resolveConfirmationRefs(companyId, retellCallId);
+    if (!refs) return res.status(404).json({ error: "No scheduled call found for this call" });
+
+    let contactId = existing_contact_id || null;
+    if (!contactId) {
+      const companyIds = /^\d+$/.test(String(refs.customer_ref)) ? [Number(refs.customer_ref)] : [];
+      const locRaw = await resolveJobLocationId(companyId, refs.job_ref);
+      const locationIds = locRaw && /^\d+$/.test(String(locRaw)) ? [Number(locRaw)] : [];
+      const created = await serviceLink.createContact(companyId, {
+        firstName: first_name, lastName: last_name, email, phone, role, companyIds, locationIds,
+      });
+      if (!created) return res.status(502).json({ error: "Failed to create contact in ServiceTrade" });
+      contactId = created.id;
+    }
+
+    await serviceLinkMessagesDb.setRecipient({
+      companyId,
+      scheduledCallId: refs.scheduled_call_id,
+      retellCallId,
+      jobExternalRef: refs.job_ref || null,
+      contactId: String(contactId),
+      email,
+    });
+
+    logger.info("Tool create_contact: recipient recorded", { companyId, retellCallId, contactId: String(contactId), reused: !!existing_contact_id });
+    return res.json({ success: true, contact_id: String(contactId), email, message: "Recipient saved — the service link will be emailed after the call." });
+  } catch (err) {
+    logger.error("Tool create_contact failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to set service link recipient" });
   }
 });
 

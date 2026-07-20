@@ -17,6 +17,7 @@ const DEFAULTS = {
   auto_schedule_enabled:   true,
   auto_dispatch_enabled:   true,
   crm_comment_writeback_enabled: false,
+  service_link_enabled:    false,
 };
 
 function rowToSettings(row) {
@@ -27,6 +28,7 @@ function rowToSettings(row) {
     auto_schedule_enabled:  row.auto_schedule_enabled ?? true,
     auto_dispatch_enabled:  row.auto_dispatch_enabled ?? true,
     crm_comment_writeback_enabled: row.crm_comment_writeback_enabled ?? false,
+    service_link_enabled:   row.service_link_enabled ?? false,
   };
 }
 
@@ -35,7 +37,7 @@ const SELECT_COLS = `
   voicemail_behavior, include_weekends, alert_days_before,
   voicemail_message, agent_can_make_changes,
   auto_schedule_enabled, auto_dispatch_enabled,
-  crm_comment_writeback_enabled
+  crm_comment_writeback_enabled, service_link_enabled
 `;
 
 async function getByCompanyId(companyId) {
@@ -52,7 +54,7 @@ async function upsert(companyId, fields) {
     "voicemail_behavior", "include_weekends", "alert_days_before",
     "voicemail_message", "agent_can_make_changes",
     "auto_schedule_enabled", "auto_dispatch_enabled",
-    "crm_comment_writeback_enabled",
+    "crm_comment_writeback_enabled", "service_link_enabled",
   ];
   const keys = Object.keys(fields).filter((k) => allowed.includes(k));
   if (keys.length === 0) return getByCompanyId(companyId);

@@ -8,4 +8,7 @@ module.exports = {
   jobs:        "/job",                     // appointments embedded inline
   technicians: "/user?isTech=true",
   comments:    "/comment",                 // write-back: POST a comment onto an entity
+  messages:    "/message",                 // write-back: POST a templated message (e.g. service link)
+  contacts:    "/contact",                 // GET (search) + POST (create) recipient contacts
+  contactTypes: "/contacttype",            // GET available types + POST a custom type
 };
