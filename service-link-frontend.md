@@ -16,6 +16,26 @@ The whole thing is **off by default per company** and gated by a new setting.
 
 ---
 
+## Scope — what the frontend needs to build
+
+**Required (small):**
+- **One toggle** on the Call Settings page for `service_link_enabled` (§1). This is the only thing needed to turn the feature on.
+
+**Optional (nice-to-have):**
+- A **status list** from `GET /service-link-messages` to surface links that didn't send (§2).
+- A **`SERVICE_LINK` todo** branch in the Todos UI (§3).
+- Show the new `service_link_requested` / `service_link_email` variables in call history (§4).
+
+**NOT needed — handled entirely server-side / by the voice agent:**
+- Searching or creating ServiceTrade contacts (the agent does this live via tools during the call).
+- Choosing the contact type (the agent asks the customer and maps/creates it).
+- Sending the email (the backend does it after the call).
+- Anything about the ServiceTrade message template.
+
+So the minimum viable frontend change is **the one toggle**; the rest is reporting/visibility.
+
+---
+
 ## 1. New setting — `service_link_enabled` (Call Settings)
 
 A new boolean on the existing Call Settings object, sitting alongside
