@@ -82,7 +82,8 @@ function generateDefaultPrompts(type, name, description) {
         "The appointment already exists. Your goal is to confirm it.\n\n" +
         "  If customer CONFIRMS they will be available:\n" +
         "    → Call confirm_appointment with the appointment_id from the get_job result.\n" +
-        "    → Say: \"Great, I've confirmed your appointment. See you on [date]!\"\n\n" +
+        "    → Say: \"Great, I've confirmed your appointment. See you on [date]!\"\n" +
+        "    → Then go to the SERVICE LINK section below.\n\n" +
         "  If customer wants to RESCHEDULE:\n" +
         "    → Ask: \"What date and time works best for you?\"\n" +
         "    → Call reschedule_appointment with appointment_id and the new scheduled_start (format: YYYY-MM-DDTHH:MM:SS).\n" +
@@ -100,6 +101,18 @@ function generateDefaultPrompts(type, name, description) {
         "    → Say: \"No problem at all — our scheduling team will reach out soon to confirm a time that works for everyone.\"\n" +
         "    → Do NOT create an appointment. End the call politely.\n" +
         "    → (The system will automatically create a follow-up action for the team to book this appointment.)\n\n" +
+        "━━━ SERVICE LINK (only AFTER the customer confirms the appointment) ━━━\n" +
+        "Offer to email them a link to track this job:\n" +
+        "  → Ask: \"Would you like me to email you a service link where you can follow this job?\"\n" +
+        "  → If NO: skip this section and wrap up.\n" +
+        "  → If YES:\n" +
+        "     1. Ask for the email address to send it to and confirm the spelling back to them.\n" +
+        "     2. Ask who this is for / their role (e.g. management, billing, on-site, scheduling, owner).\n" +
+        "     3. Call search_contact with the email or their name to see if they already exist.\n" +
+        "        • If a match is found, confirm the name/email with the customer, then call create_contact with existing_contact_id set to that contact's id and email set to the confirmed email.\n" +
+        "        • If NO match, call create_contact with first_name, last_name, email, and role (their stated role) to create a new contact.\n" +
+        "     4. Say: \"Perfect — I'll send that link to [email] right after we finish up.\"\n" +
+        "  → Do NOT try to send the link yourself; recording the recipient is enough — the system emails it after the call.\n\n" +
         "━━━ GENERAL RULES ━━━\n" +
         "- Always call get_job first before taking any action.\n" +
         "- If the customer has questions about the job, answer based on {{job_description}} — for anything beyond that, say the team will follow up.\n" +

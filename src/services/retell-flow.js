@@ -109,6 +109,15 @@ const EXTRACT_VARIABLES = {
       type: "string", name: "customer_notes", required: false,
       description: "Any specific concerns, questions, or notes the customer mentioned.",
     },
+    {
+      type: "boolean", name: "service_link_requested", required: false,
+      description: "True if the customer agreed to be emailed the service link for this job.",
+    },
+    {
+      type: "string", name: "service_link_email", required: false,
+      description: "The email address the customer confirmed for receiving the service link. Only extract if service_link_requested is true.",
+      conditional_prompt: "Only extract if service_link_requested is true",
+    },
   ],
   technician_confirmation: [
     {

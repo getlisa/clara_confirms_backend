@@ -6,6 +6,7 @@ const callSettingsDb = require("../db/call-settings");
 const todosDb = require("../db/todos");
 const scheduledCallsDb = require("../db/scheduled-calls");
 const stComments = require("../services/servicetrade-comments");
+const stServiceLink = require("../services/servicetrade-service-link");
 const db = require("../db");
 const { getNextWindowStart } = require("../services/scheduler");
 const { parseCallbackTime } = require("../services/callback-time");
@@ -307,35 +308,39 @@ async function handleCallAnalyzed(callData) {
     }
   }
 
-  // ── ServiceTrade comment write-back ───────────────────────────────────────
-  // For ANSWERED calls only (voicemail/no-answer excluded), post a comment onto
-  // the underlying ServiceTrade entity summarizing the outcome. Fire-and-forget;
-  // gated internally by the per-company crm_comment_writeback_enabled setting +
-  // source guards. The call-type pre-gate avoids a scheduled_calls lookup for
-  // call types that never write back.
-  const stWritebackEligible = !inVoicemail && !isNoAnswer && stComments.appliesToCallType(metadata?.call_type);
-  logger.info("servicetrade comment: gate", {
-    callId: call_id, companyId, callType: metadata?.call_type,
-    inVoicemail, isNoAnswer, eligible: stWritebackEligible,
+  // ── Post-call ServiceTrade write-backs (comment + service link) ────────────
+  // For ANSWERED calls only (voicemail/no-answer excluded). AWAITED (not
+  // fire-and-forget) so the network POSTs complete before this handler returns —
+  // on Vercel the function is frozen once the webhook responds, which would cut
+  // off any still-pending async work (this was the root cause of comments not
+  // posting). Each action is internally gated by its own per-company toggle.
+  const callType = metadata?.call_type;
+  const wantsComment = !inVoicemail && !isNoAnswer && stComments.appliesToCallType(callType);
+  const wantsServiceLink = !inVoicemail && !isNoAnswer && callType === "customer_confirmation";
+  logger.info("servicetrade post-call: gate", {
+    callId: call_id, companyId, callType, inVoicemail, isNoAnswer, wantsComment, wantsServiceLink,
   });
-  if (stWritebackEligible) {
-    db.query(`SELECT * FROM scheduled_calls WHERE retell_call_id = $1 LIMIT 1`, [call_id])
-      .then(({ rows }) => {
-        if (!rows[0]) {
-          logger.warn("servicetrade comment: no scheduled_calls row for retell_call_id; cannot resolve entity", { callId: call_id, companyId });
-          return;
+  if (wantsComment || wantsServiceLink) {
+    try {
+      const { rows: scRows } = await db.query(`SELECT * FROM scheduled_calls WHERE retell_call_id = $1 LIMIT 1`, [call_id]);
+      const sc = scRows[0];
+      if (!sc) {
+        logger.warn("servicetrade post-call: no scheduled_calls row for retell_call_id; cannot resolve entity", { callId: call_id, companyId });
+      } else {
+        if (wantsComment) {
+          await stComments
+            .postCallComment({ companyId, scheduledCall: sc, outcome, custom, callSummary: outcome.callSummary, retellCallId: call_id, callId })
+            .catch((err) => logger.error("servicetrade comment write-back failed", { error: err.message, callId: call_id }));
         }
-        return stComments.postCallComment({
-          companyId,
-          scheduledCall: rows[0],
-          outcome,
-          custom,
-          callSummary: outcome.callSummary,
-          retellCallId: call_id,
-          callId,
-        });
-      })
-      .catch((err) => logger.error("servicetrade comment write-back failed", { error: err.message, callId: call_id }));
+        if (wantsServiceLink) {
+          await stServiceLink
+            .postCallServiceLink({ companyId, scheduledCall: sc, outcome, retellCallId: call_id, callId })
+            .catch((err) => logger.error("servicetrade service-link failed", { error: err.message, callId: call_id }));
+        }
+      }
+    } catch (err) {
+      logger.error("servicetrade post-call: scheduled_calls lookup failed", { error: err.message, callId: call_id });
+    }
   }
 
   logger.info("Call analyzed — outcome saved", {
