@@ -257,7 +257,27 @@ async function handleCallAnalyzed(callData) {
     customerOutcome: custom.customer_outcome ?? null,
   });
 
-  if (todoType) {
+  // If the agent already cancelled the appointment/job LIVE via the
+  // cancel_appointment tool during this call (marked with
+  // additional_information.cancelled_by_agent_call_id), the ASKED_FOR_CANCELLATION
+  // escalation would be redundant — the tool already raised its own low-priority
+  // APPOINTMENT_CANCELLED FYI todo. Suppress only that case.
+  let suppressCancellationTodo = false;
+  if (todoType === todosDb.TODO_TYPES.ASKED_FOR_CANCELLATION) {
+    const { rows: cancelledCheck } = await db.query(
+      `SELECT 1 FROM appointments WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
+       UNION ALL
+       SELECT 1 FROM jobs WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
+       LIMIT 1`,
+      [companyId, call_id]
+    );
+    suppressCancellationTodo = cancelledCheck.length > 0;
+    if (suppressCancellationTodo) {
+      logger.info("Cancellation already actioned live via cancel_appointment tool; skipping ASKED_FOR_CANCELLATION todo", { callId: call_id, companyId });
+    }
+  }
+
+  if (todoType && !suppressCancellationTodo) {
     await todosDb.create({
       companyId,
       callId,

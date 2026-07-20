@@ -12,6 +12,7 @@ const TODO_TYPES = {
   SERVICE_OPPORTUNITY: "SERVICE_OPPORTUNITY",
   SERVICE_LINK: "SERVICE_LINK",
   CRM_SYNC: "CRM_SYNC",
+  APPOINTMENT_CANCELLED: "APPOINTMENT_CANCELLED",
 };
 
 /**
@@ -78,11 +79,14 @@ function deriveTodoType({ inVoicemail, disconnectionReason, appointmentConfirmed
  * and to check whether this todo type is enabled at all.
  * Returns null (and creates nothing) if the company has disabled this todo type.
  */
-async function create({ companyId, callId, type, metadata, isTest = false }) {
-  // Look up company-configured priority + enabled flag
+async function create({ companyId, callId, type, metadata, isTest = false, priority: priorityOverride = null }) {
+  // Look up company-configured priority + enabled flag. `priorityOverride` wins
+  // when given — used for todo types outside the configurable call-outcome set
+  // (e.g. the low-priority APPOINTMENT_CANCELLED FYI) that don't have a
+  // call_analysis_configs row to look up.
   const priorityMap = await callAnalysisConfigsDb.getPriorityMap(companyId);
   const cfg = priorityMap[type];
-  const priority = cfg?.priority ?? "medium";
+  const priority = priorityOverride ?? cfg?.priority ?? "medium";
   const enabled  = cfg?.enabled ?? true;
 
   if (!enabled) return null; // company opted out of this todo type

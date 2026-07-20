@@ -13,6 +13,7 @@ const serviceOpportunitiesDb = require("../db/service-opportunities");
 const serviceLink = require("../services/servicetrade-service-link");
 const serviceLinkMessagesDb = require("../db/service-link-messages");
 const stAppointments = require("../services/servicetrade-appointments");
+const todosDb = require("../db/todos");
 const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
 const { parseCallbackTime } = require("../services/callback-time");
@@ -340,6 +341,85 @@ router.post("/reschedule_job", async (req, res) => {
     return res.json({ success: true, job: { job_id: job.id, title: job.title, new_scheduled_date: dateOnly } });
   } catch (err) {
     logger.error("Tool reschedule_job failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── CANCEL APPOINTMENT ────────────────────────────────────────────────────────
+// Full cancel: platform (source of truth) first, then mirror to ServiceTrade
+// best-effort. Cancelling is fully actioned here (not escalated) — a low-priority
+// APPOINTMENT_CANCELLED FYI todo is raised immediately so the team is aware.
+// (handleCallAnalyzed suppresses the redundant ASKED_FOR_CANCELLATION todo for
+// this call once it sees the cancelled_by_agent_call_id marker set below.)
+
+router.post("/cancel_appointment", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    const { appointment_id, scope, reason } = getArgs(req);
+    if (!companyId || !appointment_id || !scope || !reason)
+      return res.status(400).json({ error: "company_id, appointment_id, scope and reason are required" });
+    if (!["appointment_only", "entire_job"].includes(scope))
+      return res.status(400).json({ error: "scope must be 'appointment_only' or 'entire_job'" });
+
+    const retellCallId = req.body?.call?.call_id || null;
+
+    const existing = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
+    if (!existing) return res.status(404).json({ error: "Appointment not found" });
+
+    // ── Platform write (source of truth) ───────────────────────────────────
+    const appointment = await jobsDb.updateAppointment(Number(appointment_id), companyId, {
+      status: "cancelled",
+      cancellation_reason: reason,
+    });
+    await db.query(
+      `UPDATE appointments
+          SET additional_information = COALESCE(additional_information, '{}'::jsonb)
+                || jsonb_build_object('cancelled_by_agent_call_id', $1::text, 'cancellation_scope', $2::text),
+              updated_at = NOW()
+        WHERE id = $3 AND company_id = $4`,
+      [retellCallId, scope, appointment.id, companyId]
+    );
+
+    let job = null;
+    if (scope === "entire_job") {
+      job = await jobsDb.updateJob(existing.job_id, companyId, { status: "cancelled" });
+      await db.query(
+        `UPDATE jobs
+            SET additional_information = COALESCE(additional_information, '{}'::jsonb)
+                  || jsonb_build_object('cancelled_by_agent_call_id', $1::text)
+          WHERE id = $2 AND company_id = $3`,
+        [retellCallId, existing.job_id, companyId]
+      );
+    }
+
+    // ── Mirror to ServiceTrade (best-effort; awaited; never fails the tool) ──
+    await stAppointments
+      .mirrorCancelAppointment(companyId, appointment, { retellCallId })
+      .catch((err) => logger.error("crm-sync cancel_appointment mirror failed", { error: err.message, companyId }));
+    if (scope === "entire_job") {
+      const { rows: jobRows } = await db.query(`SELECT external_ref, source FROM jobs WHERE id = $1 AND company_id = $2`, [existing.job_id, companyId]);
+      await stAppointments
+        .mirrorCancelJob(companyId, jobRows[0], { retellCallId })
+        .catch((err) => logger.error("crm-sync cancel_job mirror failed", { error: err.message, companyId }));
+    }
+
+    // ── Low-priority FYI todo — this call is fully actioned, not escalated ───
+    await todosDb
+      .create({
+        companyId,
+        callId: null, // no `calls` row exists yet mid-call; retell_call_id is in metadata
+        type: todosDb.TODO_TYPES.APPOINTMENT_CANCELLED,
+        isTest: false,
+        priority: "low",
+        metadata: { retell_call_id: retellCallId, appointment_id: String(appointment.id), job_id: String(existing.job_id), scope, reason },
+      })
+      .catch((err) => logger.warn("Failed to raise APPOINTMENT_CANCELLED todo", { error: err.message, companyId }));
+
+    logger.info("Tool: cancel_appointment", { companyId, appointment_id, scope, reason });
+    return res.json({ success: true, appointment, job, scope });
+  } catch (err) {
+    logger.error("Tool cancel_appointment failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });

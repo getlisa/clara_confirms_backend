@@ -88,9 +88,11 @@ function generateDefaultPrompts(type, name, description) {
         "    → Ask: \"What date and time works best for you?\"\n" +
         "    → Call reschedule_appointment with appointment_id and the new scheduled_start (format: YYYY-MM-DDTHH:MM:SS).\n" +
         "    → Confirm the new time back to the customer.\n\n" +
-        "  If customer wants to CANCEL:\n" +
-        "    → Acknowledge and say a team member will follow up to discuss.\n" +
-        "    → Do NOT cancel anything yourself.\n\n" +
+        "  If customer wants to CANCEL outright (not reschedule):\n" +
+        "    → Ask: \"Just to confirm — would you like to cancel just this appointment, or do you not need this job at all anymore?\"\n" +
+        "    → Ask: \"Can I ask why you'd like to cancel?\" and note their reason.\n" +
+        "    → Call cancel_appointment with the appointment_id, scope ('appointment_only' or 'entire_job' based on their answer), and reason.\n" +
+        "    → Confirm back: \"No problem, that's cancelled for you.\"\n\n" +
         "── CASE B: No active appointment (has_active_appointment = false) ──────────────────\n" +
         "No appointment has been booked yet. Your goal is to schedule one.\n\n" +
         "  Ask the customer: \"We'd like to get that scheduled for you — do you have a preferred date and time for the {{job_name}}?\"\n\n" +
