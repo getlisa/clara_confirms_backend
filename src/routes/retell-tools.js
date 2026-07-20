@@ -12,6 +12,7 @@ const scheduledCallsDb = require("../db/scheduled-calls");
 const serviceOpportunitiesDb = require("../db/service-opportunities");
 const serviceLink = require("../services/servicetrade-service-link");
 const serviceLinkMessagesDb = require("../db/service-link-messages");
+const stAppointments = require("../services/servicetrade-appointments");
 const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
 const { parseCallbackTime } = require("../services/callback-time");
@@ -258,6 +259,12 @@ router.post("/reschedule_appointment", async (req, res) => {
     });
     if (!appointment) return res.status(404).json({ error: "Appointment not found" });
 
+    // Mirror to ServiceTrade (best-effort; platform is source of truth). Awaited
+    // so serverless doesn't freeze before the PUT completes; never fails the tool.
+    await stAppointments
+      .mirrorRescheduleAppointment(companyId, appointment, { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: req.body?.call?.call_id || null })
+      .catch((err) => logger.error("crm-sync reschedule_appointment mirror failed", { error: err.message, companyId }));
+
     logger.info("Tool: reschedule_appointment", { companyId, appointment_id, scheduled_start, startUTC, tz });
     return res.json({ success: true, appointment });
   } catch (err) {
@@ -293,6 +300,12 @@ router.post("/create_appointment", async (req, res) => {
       [job_id, companyId]
     );
 
+    // Mirror to ServiceTrade: create the appointment there and stamp the id back.
+    // Best-effort, awaited; never fails the tool (platform is source of truth).
+    await stAppointments
+      .mirrorCreateAppointment(companyId, appointment, Number(job_id), { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: req.body?.call?.call_id || null })
+      .catch((err) => logger.error("crm-sync create_appointment mirror failed", { error: err.message, companyId }));
+
     logger.info("Tool: create_appointment", { companyId, job_id, scheduled_start, startUTC, tz });
     return res.status(201).json({ success: true, appointment });
   } catch (err) {
@@ -317,6 +330,11 @@ router.post("/reschedule_job", async (req, res) => {
 
     const job = await jobsDb.updateJob(Number(job_id), companyId, { scheduled_date: dateOnly });
     if (!job) return res.status(404).json({ error: "Job not found" });
+
+    // Mirror the new scheduled date to ServiceTrade (best-effort; awaited).
+    await stAppointments
+      .mirrorRescheduleJob(companyId, job, { scheduledDate: dateOnly, retellCallId: req.body?.call?.call_id || null })
+      .catch((err) => logger.error("crm-sync reschedule_job mirror failed", { error: err.message, companyId }));
 
     logger.info("Tool: reschedule_job", { companyId, job_id, new_scheduled_date: dateOnly });
     return res.json({ success: true, job: { job_id: job.id, title: job.title, new_scheduled_date: dateOnly } });
