@@ -51,6 +51,7 @@ const TOOL_SEEDS = [
     speak_after_execution: false,
     execution_message_description: "Let me look that contact up.",
     is_write_tool: false,
+    gated_by_setting: "service_link_enabled",
     sort_order: 20,
     parameters: {
       type: "object",
@@ -69,6 +70,7 @@ const TOOL_SEEDS = [
     speak_after_execution: true,
     execution_message_description: "Let me set that up.",
     is_write_tool: true,
+    gated_by_setting: "service_link_enabled",
     sort_order: 21,
     parameters: {
       type: "object",
@@ -308,8 +310,8 @@ async function seedAll() {
       `INSERT INTO tool_definitions
          (call_type, name, description, endpoint, speak_during_execution,
           speak_after_execution, execution_message_description, is_write_tool,
-          sort_order, parameters)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          gated_by_setting, sort_order, parameters)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        ON CONFLICT (call_type, name) DO UPDATE SET
          description                   = EXCLUDED.description,
          endpoint                      = EXCLUDED.endpoint,
@@ -317,6 +319,7 @@ async function seedAll() {
          speak_after_execution         = EXCLUDED.speak_after_execution,
          execution_message_description = EXCLUDED.execution_message_description,
          is_write_tool                 = EXCLUDED.is_write_tool,
+         gated_by_setting              = EXCLUDED.gated_by_setting,
          sort_order                    = EXCLUDED.sort_order,
          parameters                    = EXCLUDED.parameters,
          updated_at                    = NOW()`,
@@ -324,6 +327,7 @@ async function seedAll() {
         t.call_type, t.name, t.description, t.endpoint,
         t.speak_during_execution, t.speak_after_execution,
         t.execution_message_description ?? null, t.is_write_tool,
+        t.gated_by_setting ?? null,
         t.sort_order, JSON.stringify(t.parameters ?? {}),
       ]
     );
