@@ -7,6 +7,13 @@
  *
  * - is_write_tool = false  → always registered (read-only: get_job, get_quotation…)
  * - is_write_tool = true   → only registered when agent_can_make_changes = true
+ * - gated_by_setting = '<call_settings column>' → only registered when that
+ *   company's call_settings column is true (e.g. search_contact/create_contact
+ *   require service_link_enabled). Combines with the is_write_tool gate — both
+ *   must pass. `maybeResyncToolsAfterSettingsChange` below re-registers tools
+ *   whenever a gating setting changes, so the two-way sync (setting ↔ tools) is
+ *   always run through it rather than the caller remembering to call
+ *   registerToolsForCompany itself.
  */
 const retell = require("./retell");
 const db = require("../db");
@@ -83,8 +90,12 @@ async function registerToolsForCompany(companyId) {
     return;
   }
 
-  // Load all enabled tools from DB, filtered by write permission
-  const allToolRows = await toolDefsDb.getAll({ writeToolsEnabled: canMakeChanges });
+  // Load all enabled tools from DB, filtered by write permission, then by any
+  // additional feature-flag gate (e.g. search_contact/create_contact require
+  // service_link_enabled — no point offering contact search/creation when the
+  // company has that feature off). `settings` is already loaded above.
+  const allToolRows = (await toolDefsDb.getAll({ writeToolsEnabled: canMakeChanges }))
+    .filter((t) => !t.gated_by_setting || settings[t.gated_by_setting] === true);
 
   // Split into universal vs per-call-type. Universal tools (call_type='_universal')
   // attach to every subagent node regardless of the company's call types — used
@@ -173,4 +184,36 @@ async function registerToolsForAllCompanies() {
   return { total };
 }
 
-module.exports = { registerToolsForCompany, registerToolsForAllCompanies, getBaseUrl };
+// call_settings columns that affect which tools get attached to the agent —
+// changing any of these must re-register tools. Kept as one list so every
+// caller that updates call_settings (REST route, copilot tool, future ones)
+// can trigger the same re-registration by calling the helper below instead of
+// each re-implementing its own "did a tool-relevant field change" check.
+const TOOL_AFFECTING_SETTINGS = ["agent_can_make_changes", "service_link_enabled"];
+
+/**
+ * Re-register a company's Retell tools if any changed field affects tool
+ * attachment (agent_can_make_changes, or a gated_by_setting column like
+ * service_link_enabled). Best-effort — logs and swallows errors, since a
+ * failed re-registration should never fail the settings update itself.
+ *
+ * @param {number|string} companyId
+ * @param {string[]} changedFieldNames — keys actually written by the update
+ */
+async function maybeResyncToolsAfterSettingsChange(companyId, changedFieldNames = []) {
+  const affected = changedFieldNames.some((f) => TOOL_AFFECTING_SETTINGS.includes(f));
+  if (!affected) return;
+  try {
+    await registerToolsForCompany(companyId);
+  } catch (err) {
+    logger.warn("maybeResyncToolsAfterSettingsChange: re-registration failed", { companyId, error: err.message });
+  }
+}
+
+module.exports = {
+  registerToolsForCompany,
+  registerToolsForAllCompanies,
+  maybeResyncToolsAfterSettingsChange,
+  TOOL_AFFECTING_SETTINGS,
+  getBaseUrl,
+};

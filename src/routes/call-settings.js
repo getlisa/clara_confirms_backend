@@ -121,13 +121,13 @@ router.patch("/", async (req, res) => {
       syncVoicemailToRetell(companyId, settings).catch(() => {});
     }
 
-    // Re-register Retell tools when agent_can_make_changes changes (adds/removes write tools)
-    if (fields.agent_can_make_changes !== undefined) {
-      const { registerToolsForCompany } = require("../services/retell-tools");
-      registerToolsForCompany(companyId).catch((err) => {
-        logger.warn("Tool re-registration failed after agent_can_make_changes update", { error: err.message });
-      });
-    }
+    // Re-register Retell tools when a tool-affecting setting changes
+    // (agent_can_make_changes, service_link_enabled, …) — adds/removes the
+    // matching tools from the live agent. See TOOL_AFFECTING_SETTINGS.
+    const { maybeResyncToolsAfterSettingsChange } = require("../services/retell-tools");
+    maybeResyncToolsAfterSettingsChange(companyId, Object.keys(fields)).catch((err) => {
+      logger.warn("Tool re-registration failed after call-settings update", { error: err.message });
+    });
 
     // No side effect needed for crm_comment_writeback_enabled — it's read live
     // per-company at call-analyzed time by the write-back service.

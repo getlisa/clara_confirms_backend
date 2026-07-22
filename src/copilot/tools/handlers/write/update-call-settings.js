@@ -1,6 +1,8 @@
 const { z } = require("zod");
 const { interrupt } = require("@langchain/langgraph");
 const callSettingsDb = require("../../../../db/call-settings");
+const { maybeResyncToolsAfterSettingsChange } = require("../../../../services/retell-tools");
+const logger = require("../../../../utils/logger");
 
 const FIELDS = [
   "agent_can_make_changes",
@@ -53,6 +55,13 @@ async function run(args, config) {
   const fields = {};
   for (const c of changes) fields[c.field] = c.to;
   const updated = await callSettingsDb.upsert(ctx.companyId, fields);
+
+  // Re-register Retell tools when a tool-affecting setting changed (this path
+  // bypasses the REST route, which already has its own copy of this call).
+  maybeResyncToolsAfterSettingsChange(ctx.companyId, Object.keys(fields)).catch((err) => {
+    logger.warn("Tool re-registration failed after copilot call-settings update", { error: err.message });
+  });
+
   return JSON.stringify({ status: "done", applied: fields, settings: updated });
 }
 
