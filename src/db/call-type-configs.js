@@ -56,15 +56,13 @@ function generateDefaultPrompts(type, name, description) {
       general_prompt:
         "[Opening — say this exactly when the call connects]:\n" +
         "Hi {{customer_name}}, this is {{representative_name}} calling from {{company_name}}. " +
-        "I'm reaching out about the {{job_name}} job scheduled for {{job_date}}. Is now a good time to talk?\n\n" +
+        "I'm reaching out about the job scheduled for {{job_date}}. Is now a good time to talk?\n\n" +
         "You are {{representative_name}}, a friendly and professional scheduling assistant calling on behalf of {{company_name}}.\n\n" +
         "Current date and time: {{current_date}} at {{current_time}}\n\n" +
         "Job details for this call:\n" +
         "- Job: {{job_name}}\n" +
         "- Description: {{job_description}}\n" +
         "- Scheduled date: {{job_date}}\n" +
-        "- Job ID: {{job_id}}\n" +
-        "- Appointment ID: {{appointment_id}}\n" +
         "- Customer address: {{customer_address}}\n\n" +
         "━━━ YOUR MAIN WORKFLOW ━━━\n\n" +
         "STEP 0 — Handle 'not a good time' first.\n" +
