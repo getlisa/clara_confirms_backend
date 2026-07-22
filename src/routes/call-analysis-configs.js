@@ -2,6 +2,7 @@ const express = require("express");
 const callAnalysisConfigsDb = require("../db/call-analysis-configs");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localizeRows, localizeFields } = require("../utils/timezone");
 
 const router = express.Router();
 router.use(authenticate);
@@ -13,7 +14,8 @@ router.get("/", async (req, res) => {
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
     const configs = await callAnalysisConfigsDb.getByCompanyId(companyId);
-    return res.json({ call_analysis_configs: configs });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ call_analysis_configs: localizeRows(configs, tz, ["updated_at"]) });
   } catch (err) {
     logger.error("GET /call-analysis-configs failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load configs" });
@@ -34,7 +36,8 @@ router.patch("/:type", async (req, res) => {
       return res.status(400).json({ error: "enabled must be a boolean" });
 
     const updated = await callAnalysisConfigsDb.upsert(companyId, req.params.type, { priority, enabled });
-    return res.json({ call_analysis_config: updated });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ call_analysis_config: localizeFields(updated, tz, ["updated_at"]) });
   } catch (err) {
     if (err.status === 400) return res.status(400).json({ error: err.message });
     logger.error("PATCH /call-analysis-configs/:type failed", { error: err.message });

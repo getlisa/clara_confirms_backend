@@ -2,10 +2,14 @@ const express = require("express");
 const todosDb = require("../db/todos");
 const { authenticate, getCompanyId, getUserId, requireRole } = require("../auth");
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localizeRows, localizeFields } = require("../utils/timezone");
 
 const router = express.Router();
 
 router.use(authenticate);
+
+const TODO_TZ_FIELDS     = ["created_at", "updated_at", "resolved_at"];
+const TODO_LOG_TZ_FIELDS = ["created_at"];
 
 /**
  * GET /todos
@@ -25,7 +29,8 @@ router.get("/", async (req, res) => {
       offset: offset ? Number(offset) : 0,
       isTest: is_test === "true",
     });
-    return res.json({ todos });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ todos: localizeRows(todos, tz, TODO_TZ_FIELDS) });
   } catch (err) {
     logger.error("GET /todos failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load todos" });
@@ -53,7 +58,8 @@ router.patch("/:id/status", async (req, res) => {
       actorId: getUserId(req),
     });
     if (!todo) return res.status(404).json({ error: "Todo not found" });
-    return res.json({ todo });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ todo: localizeFields(todo, tz, TODO_TZ_FIELDS) });
   } catch (err) {
     logger.error("PATCH /todos/:id/status failed", { error: err.message });
     return res.status(500).json({ error: "Failed to update todo" });
@@ -78,7 +84,8 @@ router.patch("/:id/assign", requireRole("admin"), async (req, res) => {
       actorId: getUserId(req),
     });
     if (!todo) return res.status(404).json({ error: "Todo not found" });
-    return res.json({ todo });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ todo: localizeFields(todo, tz, TODO_TZ_FIELDS) });
   } catch (err) {
     logger.error("PATCH /todos/:id/assign failed", { error: err.message });
     return res.status(500).json({ error: "Failed to assign todo" });
@@ -94,7 +101,8 @@ router.get("/:id/logs", async (req, res) => {
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
     const logs = await todosDb.getLogs(Number(req.params.id), companyId);
-    return res.json({ logs });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ logs: localizeRows(logs, tz, TODO_LOG_TZ_FIELDS) });
   } catch (err) {
     logger.error("GET /todos/:id/logs failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load todo logs" });

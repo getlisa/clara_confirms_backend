@@ -4,9 +4,12 @@ const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const db = require("../db");
 const retell = require("../services/retell");
+const { getCompanyTimezone, localizeFields } = require("../utils/timezone");
 
 const router = express.Router();
 router.use(authenticate);
+
+const CALL_SETTINGS_TZ_FIELDS = ["created_at", "updated_at"];
 
 /**
  * Push voicemail_message to the company's Retell agent after call settings change.
@@ -48,7 +51,8 @@ router.get("/", async (req, res) => {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
     const settings = await callSettingsDb.getByCompanyId(companyId);
-    return res.json({ call_settings: settings });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ call_settings: localizeFields(settings, tz, CALL_SETTINGS_TZ_FIELDS) });
   } catch (err) {
     logger.error("GET /call-settings failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load call settings" });
@@ -132,7 +136,8 @@ router.patch("/", async (req, res) => {
     // No side effect needed for crm_comment_writeback_enabled — it's read live
     // per-company at call-analyzed time by the write-back service.
 
-    return res.json({ call_settings: settings });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ call_settings: localizeFields(settings, tz, CALL_SETTINGS_TZ_FIELDS) });
   } catch (err) {
     logger.error("PATCH /call-settings failed", { error: err.message });
     return res.status(500).json({ error: "Failed to update call settings" });

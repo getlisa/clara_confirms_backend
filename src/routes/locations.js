@@ -9,9 +9,12 @@ const express = require("express");
 const locationsDb = require("../db/locations");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localizeRows, localizeFields } = require("../utils/timezone");
 
 const router = express.Router();
 router.use(authenticate);
+
+const LOCATION_TZ_FIELDS = ["created_at", "updated_at"];
 
 /**
  * GET /locations
@@ -34,8 +37,9 @@ router.get("/", async (req, res) => {
       offset:     offsetNum,
     });
 
+    const tz = await getCompanyTimezone(companyId);
     return res.json({
-      locations,
+      locations: localizeRows(locations, tz, LOCATION_TZ_FIELDS),
       pagination: { total, limit: limitNum, offset: offsetNum, totalPages: Math.max(Math.ceil(total / limitNum), 1) },
     });
   } catch (err) {
@@ -56,7 +60,8 @@ router.get("/:id", async (req, res) => {
     const location = await locationsDb.getById(Number(req.params.id), companyId);
     if (!location) return res.status(404).json({ error: "Location not found" });
 
-    return res.json({ location });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ location: localizeFields(location, tz, LOCATION_TZ_FIELDS) });
   } catch (err) {
     logger.error("GET /locations/:id failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load location" });

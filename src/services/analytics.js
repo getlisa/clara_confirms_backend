@@ -5,6 +5,7 @@
  */
 
 const db = require("./../db");
+const { getCompanyTimezone, toOffsetISOString } = require("../utils/timezone");
 
 function getPeriodStart(period) {
   switch (period) {
@@ -180,9 +181,10 @@ async function getStats(companyId, periodInput) {
   const queueByCallType = {};
   queueByType.rows.forEach((r) => { queueByCallType[r.call_type] = Number(r.cnt); });
 
+  const tz = await getCompanyTimezone(companyId);
   return {
     period,
-    generated_at: new Date().toISOString(),
+    generated_at: toOffsetISOString(new Date(), tz),
     calls: {
       total:             Number(c.total),
       analyzed:          Number(c.analyzed),

@@ -9,6 +9,7 @@
  */
 
 const db = require("../../../../db");
+const { getCompanyTimezone } = require("../../../../utils/timezone");
 
 const TARGET_FIELD = {
   scheduled_unconfirmed: "appointment_id",
@@ -69,13 +70,8 @@ async function summarizeTarget(companyId, triggerType, args) {
   return base;
 }
 
-async function companyTimezone(companyId) {
-  try {
-    const r = await db.query(`SELECT default_timezone FROM companies WHERE id = $1`, [companyId]);
-    return r.rows[0]?.default_timezone || "America/New_York";
-  } catch {
-    return "America/New_York";
-  }
-}
+// Kept as a re-export for existing callers (src/copilot/tools/handlers/write/schedule-call.js) —
+// canonical implementation now lives in src/utils/timezone.js.
+const companyTimezone = getCompanyTimezone;
 
 module.exports = { TARGET_FIELD, targetIdFor, summarizeTarget, companyTimezone };

@@ -12,6 +12,7 @@ const logger = require("../utils/logger");
 const { authenticate, requireRole } = require("../auth/auth.middleware");
 const { sendMail, buildEmailTemplate } = require("../utils/email");
 const companySettings = require("../db/company-settings");
+const { getCompanyTimezone, toOffsetISOString } = require("../utils/timezone");
 
 const router = express.Router();
 
@@ -29,6 +30,7 @@ router.get("/", authenticate, async (req, res) => {
       [req.user.companyId]
     );
 
+    const tz = await getCompanyTimezone(req.user.companyId);
     const users = result.rows.map((row) => ({
       id: row.id,
       email: row.email,
@@ -37,8 +39,8 @@ router.get("/", authenticate, async (req, res) => {
       name: [row.first_name, row.last_name].filter(Boolean).join(" ").trim(),
       role: row.role,
       active: row.is_active,
-      created_at: row.created_at,
-      last_login: row.last_login,
+      created_at: toOffsetISOString(row.created_at, tz),
+      last_login: toOffsetISOString(row.last_login, tz),
     }));
 
     return res.json({ users });
@@ -151,6 +153,7 @@ router.post("/invite", authenticate, requireRole("admin"), async (req, res) => {
       companyId: req.user.companyId,
     });
 
+    const tz = await getCompanyTimezone(req.user.companyId);
     return res.status(201).json({
       message: "Invitation sent",
       user: {
@@ -161,7 +164,7 @@ router.post("/invite", authenticate, requireRole("admin"), async (req, res) => {
         name: [newUser.first_name, newUser.last_name].filter(Boolean).join(" ").trim(),
         role: newUser.role,
         active: newUser.is_active,
-        created_at: newUser.created_at,
+        created_at: toOffsetISOString(newUser.created_at, tz),
       },
     });
   } catch (err) {
@@ -243,6 +246,7 @@ router.patch("/:id", authenticate, requireRole("admin"), async (req, res) => {
       updates: { role, active },
     });
 
+    const tz = await getCompanyTimezone(req.user.companyId);
     return res.json({
       user: {
         id: updatedUser.id,
@@ -252,8 +256,8 @@ router.patch("/:id", authenticate, requireRole("admin"), async (req, res) => {
         name: [updatedUser.first_name, updatedUser.last_name].filter(Boolean).join(" ").trim(),
         role: updatedUser.role,
         active: updatedUser.is_active,
-        created_at: updatedUser.created_at,
-        last_login: updatedUser.last_login,
+        created_at: toOffsetISOString(updatedUser.created_at, tz),
+        last_login: toOffsetISOString(updatedUser.last_login, tz),
       },
     });
   } catch (err) {

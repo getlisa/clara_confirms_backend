@@ -18,6 +18,9 @@ const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
 const { parseCallbackTime } = require("../services/callback-time");
 const { authenticate, getCompanyId: getCompanyIdFromToken } = require("../auth");
+const {
+  getCompanyTimezone, localToUTC, formatSpokenDate, formatSpokenDateTime, formatSpokenDateOnly,
+} = require("../utils/timezone");
 
 const router = express.Router();
 
@@ -83,65 +86,49 @@ router.use((req, _res, next) => {
 });
 
 // ── Timezone helpers ──────────────────────────────────────────────────────────
+// getCompanyTimezone/localToUTC/formatSpokenDate/formatSpokenDateTime now live
+// in src/utils/timezone.js (single source of truth — see that file's header).
 
 /**
- * Convert a naive local datetime string (no timezone suffix) from a given
- * timezone to a UTC ISO string.
- *
- * e.g. "2026-05-28T10:00:00" in "America/New_York" → "2026-05-28T14:00:00.000Z"
- *
- * Uses an iterative correction approach so DST transitions are handled correctly.
+ * Replace every raw UTC timestamp on an `apptRow`-shaped object with a
+ * human-readable, company/CRM-timezone-localized spoken string — used by
+ * every tool response that echoes an appointment back to the voice agent, so
+ * a raw ISO timestamp never leaks (the agent should always speak a formatted
+ * time, never both a raw and formatted version of the same field).
  */
-function localToUTC(dateTimeStr, timezone) {
-  // Normalise: ensure we have seconds, strip any existing Z/offset
-  const clean = dateTimeStr.replace(/Z$|[+-]\d{2}:?\d{2}$/, "").padEnd(19, ":00").slice(0, 19);
-
-  // Treat as UTC initially
-  const naive = new Date(clean + "Z");
-
-  const fmt = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: timezone,
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-    hour12: false,
-  });
-
-  // Iterate up to 3 times — converges in 1 pass for standard offsets, 2 at DST boundary
-  let u = naive;
-  for (let i = 0; i < 3; i++) {
-    const localOfU = new Date(fmt.format(u) + "Z");
-    const diff = naive.getTime() - localOfU.getTime();
-    if (Math.abs(diff) < 1000) break;
-    u = new Date(u.getTime() + diff);
-  }
-  return u.toISOString();
+function localizeAppointmentForAgent(appointment, tz) {
+  if (!appointment) return appointment;
+  const {
+    scheduled_start, scheduled_end, customer_confirmed_at, technician_confirmed_at,
+    rescheduled_to, created_at, updated_at, ...rest
+  } = appointment;
+  return {
+    ...rest,
+    scheduled_start: formatSpokenDateTime(scheduled_start, tz),
+    scheduled_end: formatSpokenDateTime(scheduled_end, tz),
+    customer_confirmed_at: formatSpokenDateTime(customer_confirmed_at, tz),
+    technician_confirmed_at: formatSpokenDateTime(technician_confirmed_at, tz),
+    rescheduled_to: formatSpokenDateTime(rescheduled_to, tz),
+    created_at: formatSpokenDateTime(created_at, tz),
+    updated_at: formatSpokenDateTime(updated_at, tz),
+  };
 }
 
-async function getCompanyTimezone(companyId) {
-  const { rows } = await db.query(
-    "SELECT default_timezone FROM companies WHERE id = $1",
-    [companyId]
-  );
-  return rows[0]?.default_timezone || "America/New_York";
+/** Same idea as localizeAppointmentForAgent, for a `jobRow`-shaped object. */
+function localizeJobForAgent(job, tz) {
+  if (!job) return job;
+  const { scheduled_date, scheduled_window_start, scheduled_window_end, created_at, updated_at, ...rest } = job;
+  return {
+    ...rest,
+    scheduled_date: formatSpokenDateOnly(scheduled_date),
+    scheduled_window_start: formatSpokenDateTime(scheduled_window_start, tz),
+    scheduled_window_end: formatSpokenDateTime(scheduled_window_end, tz),
+    created_at: formatSpokenDateTime(created_at, tz),
+    updated_at: formatSpokenDateTime(updated_at, tz),
+  };
 }
 
 // ── GET JOB ───────────────────────────────────────────────────────────────────
-
-/**
- * Both take a required `tz` (IANA zone, e.g. from getCompanyTimezone) so the
- * agent always reads out times in the company's/CRM's timezone — previously
- * these used no timeZone option at all and silently rendered in the server
- * process's local time, which could state the wrong time to a customer.
- */
-function formatDate(iso, tz) {
-  if (!iso) return null;
-  return new Date(iso).toLocaleDateString("en-US", { timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric" });
-}
-
-function formatDateTime(iso, tz) {
-  if (!iso) return null;
-  return new Date(iso).toLocaleString("en-US", { timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" });
-}
 
 /**
  * Real service(s) this job/appointment is for, from the synced ServiceTrade
@@ -205,7 +192,7 @@ function buildJobSummary(job, tz) {
     description: job.description,
     job_type: job.job_type,
     status: job.status,
-    scheduled_date: formatDate(job.scheduled_date, tz),
+    scheduled_date: formatSpokenDateOnly(job.scheduled_date),
 
     customer: {
       name: c.full_name,
@@ -221,8 +208,8 @@ function buildJobSummary(job, tz) {
 
     active_appointment: activeAppointment ? {
       appointment_id: activeAppointment.id,
-      scheduled_start: formatDateTime(activeAppointment.scheduled_start, tz),
-      scheduled_end: formatDateTime(activeAppointment.scheduled_end, tz),
+      scheduled_start: formatSpokenDateTime(activeAppointment.scheduled_start, tz),
+      scheduled_end: formatSpokenDateTime(activeAppointment.scheduled_end, tz),
       customer_confirmed: activeAppointment.customer_confirmed ?? false,
       technician_confirmed: activeAppointment.technician_confirmed ?? false,
       technician: activeAppointment.technician_name || null,
@@ -278,12 +265,7 @@ router.post("/get_appointment", async (req, res) => {
     logger.info("Tool: get_appointment", { companyId, appointment_id, serviceCount: services.length, tz });
     return res.json({
       appointment: {
-        ...appointment,
-        // Human-readable, company/CRM-timezone-localized versions of the raw
-        // UTC scheduled_start/end above — this is what the agent should read
-        // aloud, since a raw ISO timestamp is easy to misstate.
-        scheduled_start_formatted: formatDateTime(appointment.scheduled_start, tz),
-        scheduled_end_formatted: formatDateTime(appointment.scheduled_end, tz),
+        ...localizeAppointmentForAgent(appointment, tz),
         job_title: jobInfo.title ?? null,
         job_description: jobInfo.description ?? null,
         job_type: jobInfo.job_type ?? null,
@@ -310,8 +292,9 @@ router.post("/confirm_appointment", async (req, res) => {
     });
     if (!appointment) return res.status(404).json({ error: "Appointment not found" });
 
+    const tz = await getCompanyTimezone(companyId);
     logger.info("Tool: confirm_appointment", { companyId, appointment_id });
-    return res.json({ success: true, appointment });
+    return res.json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
   } catch (err) {
     logger.error("Tool confirm_appointment failed", { error: err.message });
     return res.status(500).json({ error: err.message });
@@ -347,7 +330,7 @@ router.post("/reschedule_appointment", async (req, res) => {
       .catch((err) => logger.error("crm-sync reschedule_appointment mirror failed", { error: err.message, companyId }));
 
     logger.info("Tool: reschedule_appointment", { companyId, appointment_id, scheduled_start, startUTC, tz });
-    return res.json({ success: true, appointment });
+    return res.json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
   } catch (err) {
     logger.error("Tool reschedule_appointment failed", { error: err.message });
     return res.status(500).json({ error: err.message });
@@ -388,7 +371,7 @@ router.post("/create_appointment", async (req, res) => {
       .catch((err) => logger.error("crm-sync create_appointment mirror failed", { error: err.message, companyId }));
 
     logger.info("Tool: create_appointment", { companyId, job_id, scheduled_start, startUTC, tz });
-    return res.status(201).json({ success: true, appointment });
+    return res.status(201).json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
   } catch (err) {
     logger.error("Tool create_appointment failed", { error: err.message });
     return res.status(500).json({ error: err.message });
@@ -496,8 +479,14 @@ router.post("/cancel_appointment", async (req, res) => {
       })
       .catch((err) => logger.warn("Failed to raise APPOINTMENT_CANCELLED todo", { error: err.message, companyId }));
 
+    const tz = await getCompanyTimezone(companyId);
     logger.info("Tool: cancel_appointment", { companyId, appointment_id, scope, reason });
-    return res.json({ success: true, appointment, job, scope });
+    return res.json({
+      success: true,
+      appointment: localizeAppointmentForAgent(appointment, tz),
+      job: localizeJobForAgent(job, tz),
+      scope,
+    });
   } catch (err) {
     logger.error("Tool cancel_appointment failed", { error: err.message });
     return res.status(500).json({ error: err.message });
@@ -518,8 +507,9 @@ router.post("/confirm_appointment_technician", async (req, res) => {
     });
     if (!appointment) return res.status(404).json({ error: "Appointment not found" });
 
+    const tz = await getCompanyTimezone(companyId);
     logger.info("Tool: confirm_appointment_technician", { companyId, appointment_id });
-    return res.json({ success: true, appointment });
+    return res.json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
   } catch (err) {
     logger.error("Tool confirm_appointment_technician failed", { error: err.message });
     return res.status(500).json({ error: err.message });
@@ -547,8 +537,16 @@ router.post("/get_quotation", async (req, res) => {
 
     if (rows.length === 0) return res.status(404).json({ error: "Quotation not found for this job" });
 
+    const tz = await getCompanyTimezone(companyId);
+    const { valid_until, created_at, ...restQuote } = rows[0];
     logger.info("Tool: get_quotation", { companyId, job_id });
-    return res.json({ quotation: rows[0] });
+    return res.json({
+      quotation: {
+        ...restQuote,
+        valid_until: formatSpokenDateOnly(valid_until), // DATE column — no time-of-day/tz component
+        created_at: formatSpokenDateTime(created_at, tz),
+      },
+    });
   } catch (err) {
     logger.error("Tool get_quotation failed", { error: err.message });
     return res.status(500).json({ error: err.message });
@@ -601,6 +599,7 @@ router.post("/get_service_opportunities", async (req, res) => {
       return res.json({ service_opportunities: [], count: 0 });
     }
 
+    const tz = await getCompanyTimezone(companyId);
     const rows = await serviceOpportunitiesDb.listByIdsForScheduling(companyId, ids);
     const serviceOpportunities = rows.map((r) => ({
       id: r.id,
@@ -609,8 +608,9 @@ router.post("/get_service_opportunities", async (req, res) => {
       why_recommended: [r.deficiency_name, r.deficiency_description].filter(Boolean).join(" — ") || null,
       estimated_price: r.estimated_price != null ? `$${r.estimated_price}` : null,
       recurring_service: recurrencePhrase(r.recurrence_frequency, r.recurrence_interval),
+      // Human-readable, company/CRM-timezone-localized — the agent reads this aloud.
       requested_window: r.window_start
-        ? { start: r.window_start, end: r.window_end }
+        ? { start: formatSpokenDateTime(r.window_start, tz), end: formatSpokenDateTime(r.window_end, tz) }
         : null,
     }));
 

@@ -12,9 +12,23 @@ const express = require("express");
 const customersDb = require("../db/customers");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localizeFields, localizeRows } = require("../utils/timezone");
 
 const router = express.Router();
 router.use(authenticate);
+
+const CUSTOMER_TZ_FIELDS = ["created_at", "updated_at"];
+// scheduled_date/valid_until are DATE-only columns — never passed through these.
+const CUSTOMER_JOB_TZ_FIELDS  = ["scheduled_window_start", "scheduled_window_end", "created_at", "updated_at", "scheduled_start", "scheduled_end"];
+const CUSTOMER_QUOTE_TZ_FIELDS = ["created_at"];
+
+function localizeCustomer(customer, tz) {
+  if (!customer) return customer;
+  const out = localizeFields(customer, tz, CUSTOMER_TZ_FIELDS);
+  if (Array.isArray(customer.jobs))       out.jobs       = localizeRows(customer.jobs, tz, CUSTOMER_JOB_TZ_FIELDS);
+  if (Array.isArray(customer.quotations)) out.quotations = localizeRows(customer.quotations, tz, CUSTOMER_QUOTE_TZ_FIELDS);
+  return out;
+}
 
 /**
  * GET /customers
@@ -36,8 +50,9 @@ router.get("/", async (req, res) => {
       offset:   offsetNum,
     });
 
+    const tz = await getCompanyTimezone(companyId);
     return res.json({
-      customers,
+      customers: localizeRows(customers, tz, CUSTOMER_TZ_FIELDS),
       pagination: { total, limit: limitNum, offset: offsetNum, totalPages: Math.max(Math.ceil(total / limitNum), 1) },
     });
   } catch (err) {
@@ -58,7 +73,8 @@ router.get("/:id", async (req, res) => {
     const customer = await customersDb.getById(Number(req.params.id), companyId);
     if (!customer) return res.status(404).json({ error: "Customer not found" });
 
-    return res.json({ customer });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ customer: localizeCustomer(customer, tz) });
   } catch (err) {
     logger.error("GET /customers/:id failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load customer" });
@@ -82,7 +98,8 @@ router.post("/", async (req, res) => {
     }
 
     const customer = await customersDb.create(companyId, req.body);
-    return res.status(201).json({ customer });
+    const tz = await getCompanyTimezone(companyId);
+    return res.status(201).json({ customer: localizeFields(customer, tz, CUSTOMER_TZ_FIELDS) });
   } catch (err) {
     if (err.code === "23505") {
       return res.status(409).json({ error: "A customer with this phone number already exists" });
@@ -108,7 +125,8 @@ router.patch("/:id", async (req, res) => {
     const customer = await customersDb.update(Number(req.params.id), companyId, req.body);
     if (!customer) return res.status(404).json({ error: "Customer not found" });
 
-    return res.json({ customer });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ customer: localizeFields(customer, tz, CUSTOMER_TZ_FIELDS) });
   } catch (err) {
     logger.error("PATCH /customers/:id failed", { error: err.message });
     return res.status(500).json({ error: "Failed to update customer" });

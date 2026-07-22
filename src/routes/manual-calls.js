@@ -21,9 +21,13 @@ const express = require("express");
 const { authenticate, getCompanyId } = require("../auth");
 const manualCall = require("../services/manual-call");
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localizeFields } = require("../utils/timezone");
 
 const router = express.Router();
 router.use(authenticate);
+
+// job_date is a DATE-only column — never passed through this.
+const SCHEDULED_CALL_TZ_FIELDS = ["scheduled_at", "last_attempted_at", "created_at", "updated_at", "callback_requested_at"];
 
 router.post("/", async (req, res) => {
   try {
@@ -42,6 +46,10 @@ router.post("/", async (req, res) => {
       scheduledAt:   req.body?.scheduled_at || null,
     });
 
+    if (result.scheduledCall) {
+      const tz = await getCompanyTimezone(companyId);
+      result.scheduledCall = localizeFields(result.scheduledCall, tz, SCHEDULED_CALL_TZ_FIELDS);
+    }
     return res.status(result.status || (result.ok ? 201 : 400)).json(result);
   } catch (err) {
     logger.error("POST /calls/manual failed", { error: err.message, stack: err.stack });
