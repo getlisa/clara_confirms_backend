@@ -9,9 +9,12 @@ const express = require("express");
 const triggerDb = require("../db/call-trigger-configs");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localizeFields, localizeRows } = require("../utils/timezone");
 
 const router = express.Router();
 router.use(authenticate);
+
+const TRIGGER_TZ_FIELDS = ["created_at", "updated_at"];
 
 /**
  * GET /call-triggers
@@ -23,7 +26,8 @@ router.get("/", async (req, res) => {
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
     const triggers = await triggerDb.getAllByCompanyId(companyId);
-    return res.json({ call_triggers: triggers });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ call_triggers: localizeRows(triggers, tz, TRIGGER_TZ_FIELDS) });
   } catch (err) {
     logger.error("GET /call-triggers failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load call triggers" });
@@ -55,7 +59,8 @@ router.patch("/:type", async (req, res) => {
     }
 
     const trigger = await triggerDb.upsert(companyId, type, req.body);
-    return res.json({ call_trigger: trigger });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ call_trigger: localizeFields(trigger, tz, TRIGGER_TZ_FIELDS) });
   } catch (err) {
     if (err.status === 400) return res.status(400).json({ error: err.message });
     logger.error("PATCH /call-triggers/:type failed", { error: err.message });

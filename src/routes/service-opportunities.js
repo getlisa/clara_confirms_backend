@@ -15,12 +15,15 @@ const db = require("../db");
 const { toE164 } = require("../utils/phone");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localizeRows, localizeFields } = require("../utils/timezone");
 
 const isDev = process.env.NODE_ENV === "development";
 const SERVICE_OPPORTUNITY_CALL_TYPE = "service_opportunity_followup";
 
 const router = express.Router();
 router.use(authenticate);
+
+const OPPORTUNITY_TZ_FIELDS = ["window_start", "window_end", "closed_on", "created_at", "updated_at"];
 
 /**
  * GET /service-opportunities
@@ -46,8 +49,9 @@ router.get("/", async (req, res) => {
       offset:        offsetNum,
     });
 
+    const tz = await getCompanyTimezone(companyId);
     return res.json({
-      service_opportunities: serviceOpportunities,
+      service_opportunities: localizeRows(serviceOpportunities, tz, OPPORTUNITY_TZ_FIELDS),
       pagination: { total, limit: limitNum, offset: offsetNum, totalPages: Math.max(Math.ceil(total / limitNum), 1) },
     });
   } catch (err) {
@@ -225,7 +229,8 @@ router.get("/:id", async (req, res) => {
     const opportunity = await serviceOpportunitiesDb.getById(Number(req.params.id), companyId);
     if (!opportunity) return res.status(404).json({ error: "Service opportunity not found" });
 
-    return res.json({ service_opportunity: opportunity });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ service_opportunity: localizeFields(opportunity, tz, OPPORTUNITY_TZ_FIELDS) });
   } catch (err) {
     logger.error("GET /service-opportunities/:id failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load service opportunity" });

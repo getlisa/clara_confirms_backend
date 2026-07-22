@@ -2,9 +2,12 @@ const express = require("express");
 const callsDb = require("../db/calls");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localizeRows, localizeFields } = require("../utils/timezone");
 
 const router = express.Router();
 router.use(authenticate);
+
+const CALL_TZ_FIELDS = ["created_at", "updated_at"];
 
 /**
  * GET /calls
@@ -23,7 +26,8 @@ router.get("/", async (req, res) => {
       offset: offset ? Number(offset) : 0,
       isTest: is_test === "true",
     });
-    return res.json({ calls });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ calls: localizeRows(calls, tz, CALL_TZ_FIELDS) });
   } catch (err) {
     logger.error("GET /calls failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load calls" });
@@ -40,7 +44,8 @@ router.get("/:id", async (req, res) => {
 
     const call = await callsDb.getById(Number(req.params.id), companyId);
     if (!call) return res.status(404).json({ error: "Call not found" });
-    return res.json({ call });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ call: localizeFields(call, tz, CALL_TZ_FIELDS) });
   } catch (err) {
     logger.error("GET /calls/:id failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load call" });

@@ -13,9 +13,13 @@ const callSettingsDb = require("../db/call-settings");
 const scheduledCallsDb = require("../db/scheduled-calls");
 const { CUSTOMER_CALL_TYPES } = scheduledCallsDb;
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localToUTC, toOffsetISOString, localizeFields, localizeRows } = require("../utils/timezone");
 
 const router = express.Router();
 router.use(authenticate);
+
+// job_date is a DATE-only column — never passed through these.
+const SCHEDULED_CALL_TZ_FIELDS = ["scheduled_at", "last_attempted_at", "created_at", "updated_at", "callback_requested_at"];
 
 /**
  * GET /scheduled-calls
@@ -70,7 +74,8 @@ router.get("/", async (req, res) => {
       values
     );
 
-    return res.json({ scheduled_calls: result.rows });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ scheduled_calls: localizeRows(result.rows, tz, SCHEDULED_CALL_TZ_FIELDS) });
   } catch (err) {
     logger.error("GET /scheduled-calls failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load scheduled calls" });
@@ -115,7 +120,7 @@ router.post("/", async (req, res) => {
     if (!scheduled_at) {
       fireAt = getNextWindowStart(callSettings, tz);
     } else {
-      const requested = new Date(scheduled_at);
+      const requested = new Date(localToUTC(scheduled_at, tz));
       fireAt = isWithinActiveHours(callSettings, tz, requested)
         ? requested
         : getNextWindowStart(callSettings, tz, requested);
@@ -149,8 +154,8 @@ router.post("/", async (req, res) => {
     logger.info("Manual call scheduled", { companyId, callType: call_type, phone: phone_number, scheduledAt: fireAt });
 
     return res.status(201).json({
-      scheduled_call: row,
-      scheduled_at:   fireAt.toISOString(),
+      scheduled_call: localizeFields(row, tz, SCHEDULED_CALL_TZ_FIELDS),
+      scheduled_at:   toOffsetISOString(fireAt, tz),
     });
   } catch (err) {
     logger.error("POST /scheduled-calls failed", { error: err.message });

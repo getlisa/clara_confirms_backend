@@ -8,6 +8,7 @@ const express = require("express");
 const serviceLinkMessagesDb = require("../db/service-link-messages");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
+const { getCompanyTimezone, localizeRows } = require("../utils/timezone");
 
 const router = express.Router();
 router.use(authenticate);
@@ -22,7 +23,8 @@ router.get("/", async (req, res) => {
       limit: limit ? Math.min(Number(limit), 200) : 50,
       offset: offset ? Number(offset) : 0,
     });
-    return res.json({ service_link_messages: rows });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json({ service_link_messages: localizeRows(rows, tz, ["created_at", "updated_at"]) });
   } catch (err) {
     logger.error("GET /service-link-messages failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load service link messages" });

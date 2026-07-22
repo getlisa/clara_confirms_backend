@@ -21,6 +21,7 @@ const callSettingsDb = require("../db/call-settings");
 const scheduler = require("./scheduler");
 const db = require("../db");
 const { toE164 } = require("../utils/phone");
+const { localToUTC } = require("../utils/timezone");
 const logger = require("../utils/logger");
 
 const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
@@ -131,7 +132,8 @@ async function triggerManualCall({
   } else {
     const { rows: co } = await db.query(`SELECT default_timezone FROM companies WHERE id = $1`, [companyId]);
     const tz = co[0]?.default_timezone || "America/New_York";
-    const requested = scheduledAt ? new Date(scheduledAt) : new Date();
+    // scheduledAt, if provided, is a naive wall-clock string meant in the company's timezone.
+    const requested = scheduledAt ? new Date(localToUTC(scheduledAt, tz)) : new Date();
     fireAt = scheduler.isWithinActiveHours(callSettings, tz, requested)
       ? requested
       : scheduler.getNextWindowStart(callSettings, tz, requested);
