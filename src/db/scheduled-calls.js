@@ -199,7 +199,7 @@ async function claimPending(batchSize = 10, { companyId = null, respectAutoFlag 
   const inWindow    = [];
   const outOfWindow = [];
   for (const co of candidates) {
-    if (co.business_hours_start && isWithinActiveHours(co, co.tz || "UTC", now)) {
+    if (co.business_hours_start && isWithinActiveHours(co, co.tz || "America/New_York", now)) {
       inWindow.push(co.company_id);
     } else {
       outOfWindow.push(co);
@@ -214,7 +214,7 @@ async function claimPending(batchSize = 10, { companyId = null, respectAutoFlag 
       logger.info("Dispatcher: tenant has no business_hours — pending rows will not dispatch", { companyId: co.company_id });
       continue;
     }
-    const nextAt = getNextWindowStart(co, co.tz || "UTC", now);
+    const nextAt = getNextWindowStart(co, co.tz || "America/New_York", now);
     const updRes = await db.query(
       `UPDATE scheduled_calls
           SET scheduled_at = $2, updated_at = NOW()

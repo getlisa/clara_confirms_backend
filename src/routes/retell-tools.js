@@ -127,14 +127,20 @@ async function getCompanyTimezone(companyId) {
 
 // ── GET JOB ───────────────────────────────────────────────────────────────────
 
-function formatDate(iso) {
+/**
+ * Both take a required `tz` (IANA zone, e.g. from getCompanyTimezone) so the
+ * agent always reads out times in the company's/CRM's timezone — previously
+ * these used no timeZone option at all and silently rendered in the server
+ * process's local time, which could state the wrong time to a customer.
+ */
+function formatDate(iso, tz) {
   if (!iso) return null;
-  return new Date(iso).toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+  return new Date(iso).toLocaleDateString("en-US", { timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric" });
 }
 
-function formatDateTime(iso) {
+function formatDateTime(iso, tz) {
   if (!iso) return null;
-  return new Date(iso).toLocaleString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return new Date(iso).toLocaleString("en-US", { timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
 /**
@@ -185,7 +191,7 @@ async function fetchServicesForJob(companyId, jobId) {
   }));
 }
 
-function buildJobSummary(job) {
+function buildJobSummary(job, tz) {
   const c = job.customer || {};
   const t = job.technician || {};
 
@@ -199,7 +205,7 @@ function buildJobSummary(job) {
     description: job.description,
     job_type: job.job_type,
     status: job.status,
-    scheduled_date: formatDate(job.scheduled_date),
+    scheduled_date: formatDate(job.scheduled_date, tz),
 
     customer: {
       name: c.full_name,
@@ -215,8 +221,8 @@ function buildJobSummary(job) {
 
     active_appointment: activeAppointment ? {
       appointment_id: activeAppointment.id,
-      scheduled_start: formatDateTime(activeAppointment.scheduled_start),
-      scheduled_end: formatDateTime(activeAppointment.scheduled_end),
+      scheduled_start: formatDateTime(activeAppointment.scheduled_start, tz),
+      scheduled_end: formatDateTime(activeAppointment.scheduled_end, tz),
       customer_confirmed: activeAppointment.customer_confirmed ?? false,
       technician_confirmed: activeAppointment.technician_confirmed ?? false,
       technician: activeAppointment.technician_name || null,
@@ -236,10 +242,11 @@ router.post("/get_job", async (req, res) => {
     const job = await jobsDb.getJobById(Number(job_id), companyId);
     if (!job) return res.status(404).json({ error: "Job not found" });
 
+    const tz = await getCompanyTimezone(companyId);
     const services = await fetchServicesForJob(companyId, job.id);
 
-    logger.info("Tool: get_job", { companyId, job_id, serviceCount: services.length });
-    return res.json({ job: { ...buildJobSummary(job), services } });
+    logger.info("Tool: get_job", { companyId, job_id, serviceCount: services.length, tz });
+    return res.json({ job: { ...buildJobSummary(job, tz), services } });
   } catch (err) {
     logger.error("Tool get_job failed", { error: err.message });
     return res.status(500).json({ error: err.message });
@@ -265,12 +272,18 @@ router.post("/get_appointment", async (req, res) => {
       [appointment.job_id, companyId]
     );
     const jobInfo = jobRows[0] || {};
+    const tz = await getCompanyTimezone(companyId);
     const services = await fetchServicesForAppointment(companyId, appointment.id);
 
-    logger.info("Tool: get_appointment", { companyId, appointment_id, serviceCount: services.length });
+    logger.info("Tool: get_appointment", { companyId, appointment_id, serviceCount: services.length, tz });
     return res.json({
       appointment: {
         ...appointment,
+        // Human-readable, company/CRM-timezone-localized versions of the raw
+        // UTC scheduled_start/end above — this is what the agent should read
+        // aloud, since a raw ISO timestamp is easy to misstate.
+        scheduled_start_formatted: formatDateTime(appointment.scheduled_start, tz),
+        scheduled_end_formatted: formatDateTime(appointment.scheduled_end, tz),
         job_title: jobInfo.title ?? null,
         job_description: jobInfo.description ?? null,
         job_type: jobInfo.job_type ?? null,
