@@ -137,6 +137,54 @@ function formatDateTime(iso) {
   return new Date(iso).toLocaleString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+/**
+ * Real service(s) this job/appointment is for, from the synced ServiceTrade
+ * appointment detail (see migrations/065_appointment_services.sql) — a
+ * confirmed GET /appointment/{id} response carries `serviceRequests[]` with a
+ * full serviceLine object, which is a materially better call-context signal
+ * than a bare job number. Empty array when nothing resolved (e.g. no service
+ * request was ever attached, or the sync hasn't picked it up yet) — callers
+ * fall back to the job's own title/description/job_type in that case.
+ */
+async function fetchServicesForAppointment(companyId, appointmentId) {
+  const { rows } = await db.query(
+    `SELECT aps.description, aps.status, aps.completion, aps.estimated_price, aps.duration,
+            sl.name AS service_line_name, sl.trade AS service_line_trade
+       FROM appointment_services aps
+       LEFT JOIN service_lines sl ON sl.id = aps.service_line_id
+      WHERE aps.company_id = $1 AND aps.appointment_id = $2`,
+    [companyId, appointmentId]
+  );
+  return rows.map((r) => ({
+    service_line: [r.service_line_name, r.service_line_trade].filter(Boolean).join(" / ") || null,
+    description: r.description || null,
+    status: r.status || null,
+    completion: r.completion || null,
+    estimated_price: r.estimated_price ?? null,
+    duration: r.duration ?? null,
+  }));
+}
+
+/** Same as fetchServicesForAppointment but aggregated across every appointment on the job. */
+async function fetchServicesForJob(companyId, jobId) {
+  const { rows } = await db.query(
+    `SELECT aps.description, aps.status, aps.completion, aps.estimated_price, aps.duration,
+            sl.name AS service_line_name, sl.trade AS service_line_trade
+       FROM appointment_services aps
+       LEFT JOIN service_lines sl ON sl.id = aps.service_line_id
+      WHERE aps.company_id = $1 AND aps.job_id = $2`,
+    [companyId, jobId]
+  );
+  return rows.map((r) => ({
+    service_line: [r.service_line_name, r.service_line_trade].filter(Boolean).join(" / ") || null,
+    description: r.description || null,
+    status: r.status || null,
+    completion: r.completion || null,
+    estimated_price: r.estimated_price ?? null,
+    duration: r.duration ?? null,
+  }));
+}
+
 function buildJobSummary(job) {
   const c = job.customer || {};
   const t = job.technician || {};
@@ -188,8 +236,10 @@ router.post("/get_job", async (req, res) => {
     const job = await jobsDb.getJobById(Number(job_id), companyId);
     if (!job) return res.status(404).json({ error: "Job not found" });
 
-    logger.info("Tool: get_job", { companyId, job_id });
-    return res.json({ job: buildJobSummary(job) });
+    const services = await fetchServicesForJob(companyId, job.id);
+
+    logger.info("Tool: get_job", { companyId, job_id, serviceCount: services.length });
+    return res.json({ job: { ...buildJobSummary(job), services } });
   } catch (err) {
     logger.error("Tool get_job failed", { error: err.message });
     return res.status(500).json({ error: err.message });
@@ -208,8 +258,25 @@ router.post("/get_appointment", async (req, res) => {
     const appointment = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
     if (!appointment) return res.status(404).json({ error: "Appointment not found" });
 
-    logger.info("Tool: get_appointment", { companyId, appointment_id });
-    return res.json({ appointment });
+    // getAppointmentById doesn't carry job context — pull the parent job's
+    // title/description/job_type as the fallback when no service resolves below.
+    const { rows: jobRows } = await db.query(
+      `SELECT title, description, job_type FROM jobs WHERE id = $1 AND company_id = $2`,
+      [appointment.job_id, companyId]
+    );
+    const jobInfo = jobRows[0] || {};
+    const services = await fetchServicesForAppointment(companyId, appointment.id);
+
+    logger.info("Tool: get_appointment", { companyId, appointment_id, serviceCount: services.length });
+    return res.json({
+      appointment: {
+        ...appointment,
+        job_title: jobInfo.title ?? null,
+        job_description: jobInfo.description ?? null,
+        job_type: jobInfo.job_type ?? null,
+        services,
+      },
+    });
   } catch (err) {
     logger.error("Tool get_appointment failed", { error: err.message });
     return res.status(500).json({ error: err.message });

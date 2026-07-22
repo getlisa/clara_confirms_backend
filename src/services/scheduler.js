@@ -312,7 +312,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
     `SELECT DISTINCT ON (j.id)
             j.id AS job_id, j.scheduled_date, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
-            a.status AS appointment_status,
+            a.id AS appointment_id, a.status AS appointment_status,
             c.phone AS customer_phone, c.full_name AS customer_name,
             c.address_line1, c.city, c.state
      FROM jobs j
