@@ -511,11 +511,11 @@ async function upsertServiceRequestsBatch(companyId, rows) {
     let idx = 0;
     chunk.forEach((r) => {
       values.push(
-        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}::jsonb, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}::jsonb, $${++idx}::jsonb, NOW())`
+        `($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}::jsonb, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, $${++idx}::jsonb, $${++idx}::jsonb, NOW())`
       );
       params.push(
-        companyId, r.servicetrade_id, r.status ?? null, r.description ?? null,
-        r.servicetrade_service_line_id ?? null, r.servicetrade_job_id ?? null,
+        companyId, r.servicetrade_id, r.status ?? null, r.completion ?? null, r.description ?? null,
+        r.servicetrade_service_line_id ?? null, r.servicetrade_job_id ?? null, r.servicetrade_appointment_id ?? null,
         r.servicetrade_deficiency_id ?? null, r.servicetrade_change_order_id ?? null,
         r.servicetrade_contract_id ?? null, r.servicetrade_location_id ?? null, r.servicetrade_recurrence_id ?? null,
         r.asset ? JSON.stringify(r.asset) : null,
@@ -529,17 +529,23 @@ async function upsertServiceRequestsBatch(companyId, rows) {
     });
     await db.query(
       `INSERT INTO servicetrade_service_requests
-         (company_id, servicetrade_id, status, description,
-          servicetrade_service_line_id, servicetrade_job_id, servicetrade_deficiency_id,
+         (company_id, servicetrade_id, status, completion, description,
+          servicetrade_service_line_id, servicetrade_job_id, servicetrade_appointment_id, servicetrade_deficiency_id,
           servicetrade_change_order_id, servicetrade_contract_id, servicetrade_location_id, servicetrade_recurrence_id,
           asset, budget, window_start, window_end, closed_on,
           estimated_price, duration, preferred_start_time, preferred_vendor, visibility, payload, updated_at)
        VALUES ${values.join(", ")}
        ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
          status                       = EXCLUDED.status,
+         completion                   = COALESCE(EXCLUDED.completion, servicetrade_service_requests.completion),
          description                  = EXCLUDED.description,
          servicetrade_service_line_id = EXCLUDED.servicetrade_service_line_id,
          servicetrade_job_id          = EXCLUDED.servicetrade_job_id,
+         -- Two sync paths write this row: the /servicerequest list (never sets
+         -- an appointment) and the /appointment/{id} detail fetch (always sets
+         -- one). Whichever runs last must not clobber a known appointment link
+         -- back to null.
+         servicetrade_appointment_id  = COALESCE(EXCLUDED.servicetrade_appointment_id, servicetrade_service_requests.servicetrade_appointment_id),
          servicetrade_deficiency_id   = EXCLUDED.servicetrade_deficiency_id,
          servicetrade_change_order_id = EXCLUDED.servicetrade_change_order_id,
          servicetrade_contract_id     = EXCLUDED.servicetrade_contract_id,

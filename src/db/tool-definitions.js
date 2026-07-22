@@ -159,6 +159,26 @@ const TOOL_SEEDS = [
       required: ["job_id", "scheduled_start"],
     },
   },
+  {
+    call_type: "customer_confirmation",
+    name: "cancel_appointment",
+    description: "Cancel the appointment when the customer explicitly wants to cancel outright (not reschedule). Before calling this you MUST ask the customer two things: (1) do they want to cancel just this appointment, or the entire job because they no longer need the service at all, and (2) the reason for cancelling.",
+    endpoint: "/retell/tools/cancel_appointment",
+    speak_during_execution: true,
+    speak_after_execution: true,
+    execution_message_description: "Let me take care of that cancellation.",
+    is_write_tool: true,
+    sort_order: 7,
+    parameters: {
+      type: "object",
+      properties: {
+        appointment_id: { type: "string", description: "The appointment ID for this call. You were given this value at the start of the call — use that exact numeric ID." },
+        scope: { type: "string", enum: ["appointment_only", "entire_job"], description: "Whether the customer wants to cancel just this appointment or the entire job. You must ask this explicitly before calling the tool." },
+        reason: { type: "string", description: "The reason the customer gave for cancelling." },
+      },
+      required: ["appointment_id", "scope", "reason"],
+    },
+  },
   // ── technician_confirmation ─────────────────────────────────────────────────
   {
     call_type: "technician_confirmation",

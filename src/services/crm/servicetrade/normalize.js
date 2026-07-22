@@ -359,6 +359,44 @@ function normalizeServiceOpportunity(row, {
   };
 }
 
+/**
+ * servicetrade_service_requests → platform `appointment_services`.
+ * Only called for requests that came from an appointment DETAIL fetch
+ * (servicetrade_appointment_id IS NOT NULL) — the caller resolves all FK ids
+ * via their external_ref lookups. `appointment_id` is NOT NULL on the platform
+ * table, so this returns null if unresolved (mirrors normalizeServiceOpportunity's
+ * location_id-required pattern).
+ */
+function normalizeAppointmentService(row, { companyId, appointmentId, jobId, serviceLineId }) {
+  if (!row) return null;
+  const warnings = [];
+  if (!appointmentId) {
+    warnings.push({ code: "unresolved_appointment", message: `Could not match ServiceTrade appointment ${row.servicetrade_appointment_id} to a platform appointment.` });
+    return null; // appointment_id is NOT NULL — nothing to insert without it
+  }
+  return {
+    companyId,
+    appointmentId,
+    jobId:          jobId || null,
+    serviceLineId:  serviceLineId || null,
+    externalRef:    String(row.servicetrade_id),
+    source:         "servicetrade",
+    status:         row.status,
+    completion:     row.completion,
+    description:    row.description,
+    windowStart:    row.window_start,
+    windowEnd:      row.window_end,
+    duration:       row.duration,
+    estimatedPrice: row.estimated_price,
+    asset:          row.asset,
+    additionalInformation: {
+      servicetrade_service_request_id: row.servicetrade_id,
+      servicetrade_appointment_id: row.servicetrade_appointment_id,
+      warnings,
+    },
+  };
+}
+
 // ── Status mappers ──────────────────────────────────────────────────────────
 
 function mapJobStatus(s) {
@@ -405,6 +443,7 @@ module.exports = {
   normalizeContract,
   normalizeServiceRecurrence,
   normalizeServiceOpportunity,
+  normalizeAppointmentService,
   mapJobStatus,
   mapAppointmentStatus,
 };

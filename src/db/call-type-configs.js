@@ -76,24 +76,31 @@ function generateDefaultPrompts(type, name, description) {
         "  → The system will automatically schedule a callback at the time they mentioned.\n" +
         "  → If they decline to give a specific time but want a callback later, treat as 'call back later' — say\n" +
         "    \"Our team will reach out again at a better time\" and end the call.\n\n" +
-        "STEP 1 — Call the get_job tool with job_id={{job_id}} to check the current appointment status.\n\n" +
+        "STEP 1 — Call the get_job tool with job_id={{job_id}} to check the current appointment status.\n" +
+        "  → If {{appointment_id}} is provided above, ALSO call get_appointment with appointment_id={{appointment_id}} for the most precise service details tied to that specific appointment (a job can have more than one appointment/service).\n\n" +
+        "STEP 1b — Use the `services` field from the tool result(s) to know what this call is actually about.\n" +
+        "  → Each entry has service_line (e.g. \"Sprinkler / Fire Protection\") and description (e.g. \"Fix the broken flanges\").\n" +
+        "  → When you have a resolved service, refer to it SPECIFICALLY when talking with the customer — e.g. \"your Sprinkler inspection\" or \"the fix for the broken flanges\" — instead of just a bare job number or generic job title.\n" +
+        "  → If `services` is empty, fall back to {{job_name}} / {{job_description}} as before.\n\n" +
         "STEP 2 — Based on the result:\n\n" +
         "── CASE A: Job has an active appointment (has_active_appointment = true) ──────────\n" +
         "The appointment already exists. Your goal is to confirm it.\n\n" +
         "  If customer CONFIRMS they will be available:\n" +
         "    → Call confirm_appointment with the appointment_id from the get_job result.\n" +
-        "    → Say: \"Great, I've confirmed your appointment. See you on [date]!\"\n" +
+        "    → Say: \"Great, I've confirmed your [specific service, e.g. Sprinkler inspection] for [date]!\" — reference the resolved service from STEP 1b when you have one.\n" +
         "    → Then go to the SERVICE LINK section below.\n\n" +
         "  If customer wants to RESCHEDULE:\n" +
         "    → Ask: \"What date and time works best for you?\"\n" +
         "    → Call reschedule_appointment with appointment_id and the new scheduled_start (format: YYYY-MM-DDTHH:MM:SS).\n" +
         "    → Confirm the new time back to the customer.\n\n" +
-        "  If customer wants to CANCEL:\n" +
-        "    → Acknowledge and say a team member will follow up to discuss.\n" +
-        "    → Do NOT cancel anything yourself.\n\n" +
+        "  If customer wants to CANCEL outright (not reschedule):\n" +
+        "    → Ask: \"Just to confirm — would you like to cancel just this appointment, or do you not need this job at all anymore?\"\n" +
+        "    → Ask: \"Can I ask why you'd like to cancel?\" and note their reason.\n" +
+        "    → Call cancel_appointment with the appointment_id, scope ('appointment_only' or 'entire_job' based on their answer), and reason.\n" +
+        "    → Confirm back: \"No problem, that's cancelled for you.\"\n\n" +
         "── CASE B: No active appointment (has_active_appointment = false) ──────────────────\n" +
         "No appointment has been booked yet. Your goal is to schedule one.\n\n" +
-        "  Ask the customer: \"We'd like to get that scheduled for you — do you have a preferred date and time for the {{job_name}}?\"\n\n" +
+        "  Ask the customer: \"We'd like to get that scheduled for you — do you have a preferred date and time for [the specific service from STEP 1b, or {{job_name}} if none resolved]?\"\n\n" +
         "  If customer GIVES a time preference:\n" +
         "    → Call create_appointment with job_id={{job_id}} and their preferred scheduled_start (format: YYYY-MM-DDTHH:MM:SS, in the customer's local time).\n" +
         "    → Confirm back: \"I've scheduled your appointment for [date and time]. Our team will be there!\"\n\n" +

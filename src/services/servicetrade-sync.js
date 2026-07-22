@@ -99,6 +99,26 @@ async function fetchAllPages(companyId, pathPrefix, listKey, credentials, params
   return { rows: all, complete };
 }
 
+/**
+ * Run `fn` over `items` with at most `limit` in flight at once. Used for
+ * per-id detail fetches (e.g. GET /appointment/{id}) where there's no bulk
+ * list endpoint — bounds concurrent requests instead of firing them all at
+ * once or running them one at a time.
+ */
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 // ── Entity mappers (raw API row → DB row) ───────────────────────────────────
 
 function mapCustomerRow(c) {
@@ -296,14 +316,26 @@ function mapLocationStubRow(l) {
   };
 }
 
-function mapServiceRequestRow(r) {
+/**
+ * `opts.appointmentId`/`opts.jobId` are set when this row comes from an
+ * appointment DETAIL fetch (GET /appointment/{id}) rather than the /servicerequest
+ * list — those nested serviceRequests[] entries have no `job` field of their own,
+ * so the parent appointment's job id is passed in explicitly. An options OBJECT
+ * (not a positional param) is used deliberately: the existing
+ * `serviceRequests.map(mapServiceRequestRow)` call site implicitly passes
+ * (row, index, array) — destructuring a number as `{appointmentId} = index`
+ * safely yields `undefined`, so that call site stays correct without change.
+ */
+function mapServiceRequestRow(r, { appointmentId = null, jobId = null } = {}) {
   const toIso = (unixSeconds) => (unixSeconds ? new Date(unixSeconds * 1000).toISOString() : null);
   return {
     servicetrade_id:               Number(r.id),
     status:                        r.status ?? null,
+    completion:                    r.completion ?? null,
     description:                   r.description ?? null,
     servicetrade_service_line_id:  r.serviceLine?.id ?? null,
-    servicetrade_job_id:           r.job?.id ?? null,
+    servicetrade_job_id:           r.job?.id ?? jobId ?? null,
+    servicetrade_appointment_id:   appointmentId,
     servicetrade_deficiency_id:    r.deficiency?.id ?? null,
     servicetrade_change_order_id:  r.changeOrder?.id ?? null,
     servicetrade_contract_id:      r.contract?.id ?? null,
@@ -360,6 +392,7 @@ async function runSync(companyId, options = {}) {
   const counts = {
     customers: 0, jobs: 0, appointments: 0, technicians: 0, locations: 0, contacts: 0, offices: 0, tags: 0,
     serviceRequests: 0, serviceLines: 0, deficiencies: 0, changeOrders: 0, contracts: 0, serviceRecurrences: 0,
+    appointmentServiceLines: 0, appointmentServiceRequests: 0,
   };
   // Tracks which entities' fetches ran to completion this pass — an entity's
   // cursor only advances if its own fetch was complete (see fetchAllPages doc).
@@ -473,6 +506,72 @@ async function runSync(companyId, options = {}) {
     if (engine) {
       await engine.emit("fetched", { entity: "jobs", count: counts.jobs });
       await engine.emit("fetched", { entity: "appointments", count: counts.appointments });
+    }
+
+    // --- Appointment details (/appointment/{id}) — service context ---------
+    // The thin appointment stub embedded on /job has no service info. A
+    // standalone GET /appointment/{id} (confirmed via a real captured request)
+    // returns `serviceRequests[]` (each with a full serviceLine object) and a
+    // `job` summary — exactly what's needed to tell the agent what service an
+    // appointment/job is actually for, instead of just a bare job title/number.
+    // No bulk/list endpoint is confirmed, so this fetches per-id with bounded
+    // concurrency, and only for appointments in a near-term window (recent
+    // past → ~45 days out) so a sync doesn't re-fetch full detail for the
+    // entire historical appointment set every run.
+    if (jobs.length) {
+      const HORIZON_MS = 45 * 24 * 60 * 60 * 1000;
+      const RECENT_MS  = 2  * 24 * 60 * 60 * 1000;
+      const nowMs = Date.now();
+      const apptIdsToDetail = [];
+      for (const j of jobs) {
+        for (const a of Array.isArray(j.appointments) ? j.appointments : []) {
+          if (!a || a.id == null || !a.windowStart) continue;
+          const t = a.windowStart * 1000;
+          if (t >= nowMs - RECENT_MS && t <= nowMs + HORIZON_MS) apptIdsToDetail.push(Number(a.id));
+        }
+      }
+      if (apptIdsToDetail.length) {
+        if (engine) await engine.transition("fetching_appointment_details", { count: apptIdsToDetail.length });
+        logger.info("ServiceTrade sync: fetching appointment details", { companyId, count: apptIdsToDetail.length });
+        const detailResults = await mapWithConcurrency(apptIdsToDetail, 5, async (apptId) => {
+          const res = await requestWithRetry(companyId, "GET", `/appointment/${apptId}`, {}, credentials);
+          return res.ok ? res.data : null;
+        });
+        const fullDetails = detailResults.filter(Boolean);
+
+        if (fullDetails.length) {
+          // Re-upsert with the FULL detail payload (payload column now carries
+          // serviceRequests[]/job/location/techs — no schema change needed there).
+          const fullApptRows = fullDetails.map((a) =>
+            mapAppointmentRow(a, a.job?.id != null ? Number(a.job.id) : null)
+          );
+          await syncDb.upsertAppointmentsBatch(companyId, fullApptRows);
+
+          const apptServiceLinesById = new Map();
+          const apptServiceRequestRows = [];
+          for (const a of fullDetails) {
+            const jobId = a.job?.id != null ? Number(a.job.id) : null;
+            for (const r of Array.isArray(a.serviceRequests) ? a.serviceRequests : []) {
+              if (r?.id == null) continue;
+              if (r.serviceLine?.id != null) apptServiceLinesById.set(r.serviceLine.id, r.serviceLine);
+              apptServiceRequestRows.push(mapServiceRequestRow(r, { appointmentId: Number(a.id), jobId }));
+            }
+          }
+          if (apptServiceLinesById.size) {
+            await syncDb.upsertServiceLinesBatch(companyId, Array.from(apptServiceLinesById.values()).map(mapServiceLineRow));
+            counts.appointmentServiceLines = apptServiceLinesById.size;
+          }
+          if (apptServiceRequestRows.length) {
+            await syncDb.upsertServiceRequestsBatch(companyId, apptServiceRequestRows);
+            counts.appointmentServiceRequests = apptServiceRequestRows.length;
+          }
+        }
+        logger.info("ServiceTrade sync: wrote appointment details", {
+          companyId, fetched: fullDetails.length, requested: apptIdsToDetail.length,
+          appointmentServiceLines: counts.appointmentServiceLines, appointmentServiceRequests: counts.appointmentServiceRequests,
+        });
+        if (engine) await engine.emit("fetched", { entity: "appointment_service_requests", count: counts.appointmentServiceRequests });
+      }
     }
 
     // --- Service requests + embedded sub-objects (/servicerequest) ---------

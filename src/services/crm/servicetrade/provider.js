@@ -88,6 +88,7 @@ class ServiceTradeProvider extends CrmProvider {
     const counts = {
       customers: 0, technicians: 0, jobs: 0, appointments: 0, contacts: 0, offices: 0, tags: 0, locations: 0,
       serviceLines: 0, deficiencies: 0, changeOrders: 0, contracts: 0, serviceRecurrences: 0, serviceOpportunities: 0,
+      appointmentServices: 0,
     };
 
     counts.customers   = await this._normalizeCustomers(companyId, engine);
@@ -140,6 +141,9 @@ class ServiceTradeProvider extends CrmProvider {
     if (engine) await engine.emit("entity_done", { entity: "service_opportunities", count: counts.serviceOpportunities });
 
     await this._normalizeServiceOpportunityPreferredTechs(companyId);
+
+    counts.appointmentServices = await this._normalizeAppointmentServices(companyId, engine);
+    if (engine) await engine.emit("entity_done", { entity: "appointment_services", count: counts.appointmentServices });
 
     return counts;
   }
@@ -435,6 +439,37 @@ class ServiceTradeProvider extends CrmProvider {
   }
 
   /**
+   * servicetrade_service_requests (the subset attached to an appointment, i.e.
+   * servicetrade_appointment_id IS NOT NULL) → platform `appointment_services`.
+   * Distinct from _normalizeServiceOpportunities (job-less only, sales-pipeline
+   * semantics) — this covers the OPPOSITE case: requests that DO have a job/
+   * appointment, whose service/service-line context would otherwise never
+   * reach any platform table.
+   */
+  async _normalizeAppointmentServices(companyId, engine = null) {
+    const { rows: raw } = await db.query(
+      "SELECT * FROM servicetrade_service_requests WHERE company_id = $1 AND servicetrade_appointment_id IS NOT NULL",
+      [companyId]
+    );
+    const [appointmentsMap, jobsMap, serviceLinesMap] = await Promise.all([
+      db.fetchExternalRefMap(companyId, "appointments"),
+      db.fetchExternalRefMap(companyId, "jobs"),
+      db.fetchExternalRefMap(companyId, "service_lines"),
+    ]);
+    const argsList = raw
+      .map((row) => {
+        const appointmentId = row.servicetrade_appointment_id != null ? (appointmentsMap.get(String(row.servicetrade_appointment_id)) ?? null) : null;
+        const jobId         = row.servicetrade_job_id          != null ? (jobsMap.get(String(row.servicetrade_job_id))                   ?? null) : null;
+        const serviceLineId = row.servicetrade_service_line_id != null ? (serviceLinesMap.get(String(row.servicetrade_service_line_id))  ?? null) : null;
+        return normalize.normalizeAppointmentService(row, { companyId, appointmentId, jobId, serviceLineId });
+      })
+      .filter(Boolean);
+    await db.bulkUpsertByExternalRef("appointment_services", APPOINTMENT_SERVICE_FIELDS, argsList);
+    logger.info("ServiceTradeProvider: normalized appointment services", { companyId, count: argsList.length });
+    return argsList.length;
+  }
+
+  /**
    * Junction: service_opportunity ↔ preferred technicians. Reads
    * `preferredTechs[]` already embedded in servicetrade_service_requests.payload
    * — no extra API call.
@@ -478,6 +513,7 @@ class ServiceTradeProvider extends CrmProvider {
   normalizeContract(raw, ctx)            { return normalize.normalizeContract(raw, ctx); }
   normalizeServiceRecurrence(raw, ctx)   { return normalize.normalizeServiceRecurrence(raw, ctx); }
   normalizeServiceOpportunity(raw, ctx)  { return normalize.normalizeServiceOpportunity(raw, ctx); }
+  normalizeAppointmentService(raw, ctx)  { return normalize.normalizeAppointmentService(raw, ctx); }
 }
 
 /**
@@ -640,6 +676,20 @@ const SERVICE_OPPORTUNITY_FIELDS = [
   { column: "preferred_vendor", key: "preferredVendor", jsonb: true },
   { column: "asset", key: "asset", jsonb: true },
   { column: "visibility", key: "visibility", jsonb: true },
+];
+
+const APPOINTMENT_SERVICE_FIELDS = [
+  { column: "appointment_id", key: "appointmentId" },
+  { column: "job_id", key: "jobId" },
+  { column: "service_line_id", key: "serviceLineId" },
+  { column: "status", key: "status" },
+  { column: "completion", key: "completion" },
+  { column: "description", key: "description" },
+  { column: "window_start", key: "windowStart" },
+  { column: "window_end", key: "windowEnd" },
+  { column: "duration", key: "duration" },
+  { column: "estimated_price", key: "estimatedPrice" },
+  { column: "asset", key: "asset", jsonb: true },
 ];
 
 /**

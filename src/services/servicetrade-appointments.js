@@ -12,7 +12,8 @@
  *
  * Scope: reschedule appointment (PUT /appointment/{id}), create appointment
  * (POST /appointment → stamp the returned id back), reschedule job
- * (PUT /job/{id}). Confirm is handled by the comment + service link, not here.
+ * (PUT /job/{id}), cancel appointment/job (PUT .../{id} status). Confirm is
+ * handled by the comment + service link, not here.
  */
 
 const db = require("../db");
@@ -31,6 +32,14 @@ function toEpochSeconds(value) {
 function isNumericRef(v) {
   return v != null && v !== "" && /^\d+$/.test(String(v));
 }
+
+// ServiceTrade's real status enum uses American spelling — confirmed from real
+// synced data (servicetrade_appointments.status includes "canceled_by_vendor").
+// "canceled_by_customer" for the appointment and "canceled" for the job are
+// inferred from that pattern, not a captured cancel request — this constant is
+// the one place to fix them once confirmed.
+const ST_APPOINTMENT_CANCELED_STATUS = process.env.SERVICETRADE_APPOINTMENT_CANCELED_STATUS || "canceled_by_customer";
+const ST_JOB_CANCELED_STATUS = process.env.SERVICETRADE_JOB_CANCELED_STATUS || "canceled";
 
 async function agentCanMakeChanges(companyId) {
   const cs = await callSettingsDb.getByCompanyId(companyId).catch(() => null);
@@ -59,6 +68,52 @@ function buildAppointmentWindowBody({ scheduledStart, scheduledEnd }) {
   return body;
 }
 
+// ── Shared PUT helpers (guard + call + log + CRM_SYNC-on-failure, once) ──────
+
+/** Guarded PUT against a ServiceTrade appointment. Returns a uniform result shape. */
+async function putAppointment(companyId, apptRow, body, { action, retellCallId = null } = {}) {
+  if (!(await agentCanMakeChanges(companyId))) return { skipped: "agent_can_make_changes=false" };
+  if (!apptRow || apptRow.source !== "servicetrade" || !isNumericRef(apptRow.external_ref)) {
+    logger.info(`crm-sync[${action}]: not a servicetrade appointment; skipping`, { companyId, apptId: apptRow?.id, source: apptRow?.source, external_ref: apptRow?.external_ref });
+    return { skipped: "not_servicetrade" };
+  }
+  const ref = String(apptRow.external_ref);
+  try {
+    const res = await stLoggedRequest(companyId, "PUT", `/appointment/${encodeURIComponent(ref)}`, { body, context: "appointment.update" });
+    if (!res.ok) {
+      await raiseCrmSyncTodo(companyId, { action, entity: "appointment", entityId: ref, error: JSON.stringify(res.messages || res.status), retellCallId });
+      return { ok: false, status: res.status };
+    }
+    logger.info(`crm-sync[${action}]: updated in ServiceTrade`, { companyId, ref });
+    return { ok: true };
+  } catch (err) {
+    await raiseCrmSyncTodo(companyId, { action, entity: "appointment", entityId: ref, error: err.message, retellCallId });
+    return { ok: false, error: err.message };
+  }
+}
+
+/** Guarded PUT against a ServiceTrade job. Returns a uniform result shape. */
+async function putJob(companyId, jobRow, body, { action, retellCallId = null } = {}) {
+  if (!(await agentCanMakeChanges(companyId))) return { skipped: "agent_can_make_changes=false" };
+  if (!jobRow || jobRow.source !== "servicetrade" || !isNumericRef(jobRow.external_ref)) {
+    logger.info(`crm-sync[${action}]: not a servicetrade job; skipping`, { companyId, jobId: jobRow?.id, source: jobRow?.source });
+    return { skipped: "not_servicetrade" };
+  }
+  const ref = String(jobRow.external_ref);
+  try {
+    const res = await stLoggedRequest(companyId, "PUT", `/job/${encodeURIComponent(ref)}`, { body, context: "job.update" });
+    if (!res.ok) {
+      await raiseCrmSyncTodo(companyId, { action, entity: "job", entityId: ref, error: JSON.stringify(res.messages || res.status), retellCallId });
+      return { ok: false, status: res.status };
+    }
+    logger.info(`crm-sync[${action}]: updated in ServiceTrade`, { companyId, ref });
+    return { ok: true };
+  } catch (err) {
+    await raiseCrmSyncTodo(companyId, { action, entity: "job", entityId: ref, error: err.message, retellCallId });
+    return { ok: false, error: err.message };
+  }
+}
+
 // ── Mirrors ─────────────────────────────────────────────────────────────────
 
 /**
@@ -66,25 +121,15 @@ function buildAppointmentWindowBody({ scheduledStart, scheduledEnd }) {
  * @param {object} apptRow  platform appointments row (has external_ref, source)
  */
 async function mirrorRescheduleAppointment(companyId, apptRow, { scheduledStart, scheduledEnd, retellCallId = null } = {}) {
-  if (!(await agentCanMakeChanges(companyId))) return { skipped: "agent_can_make_changes=false" };
-  if (!apptRow || apptRow.source !== "servicetrade" || !isNumericRef(apptRow.external_ref)) {
-    logger.info("crm-sync[reschedule_appt]: not a servicetrade appointment; skipping", { companyId, apptId: apptRow?.id, source: apptRow?.source, external_ref: apptRow?.external_ref });
-    return { skipped: "not_servicetrade" };
-  }
-  const ref = String(apptRow.external_ref);
-  const body = buildAppointmentWindowBody({ scheduledStart, scheduledEnd });
-  try {
-    const res = await stLoggedRequest(companyId, "PUT", `/appointment/${encodeURIComponent(ref)}`, { body, context: "appointment.update" });
-    if (!res.ok) {
-      await raiseCrmSyncTodo(companyId, { action: "reschedule_appointment", entity: "appointment", entityId: ref, error: JSON.stringify(res.messages || res.status), retellCallId });
-      return { ok: false, status: res.status };
-    }
-    logger.info("crm-sync[reschedule_appt]: updated in ServiceTrade", { companyId, ref });
-    return { ok: true };
-  } catch (err) {
-    await raiseCrmSyncTodo(companyId, { action: "reschedule_appointment", entity: "appointment", entityId: ref, error: err.message, retellCallId });
-    return { ok: false, error: err.message };
-  }
+  return putAppointment(companyId, apptRow, buildAppointmentWindowBody({ scheduledStart, scheduledEnd }), { action: "reschedule_appointment", retellCallId });
+}
+
+/**
+ * Cancel: PUT the ServiceTrade appointment's status to canceled.
+ * @param {object} apptRow  platform appointments row (has external_ref, source)
+ */
+async function mirrorCancelAppointment(companyId, apptRow, { retellCallId = null } = {}) {
+  return putAppointment(companyId, apptRow, { status: ST_APPOINTMENT_CANCELED_STATUS }, { action: "cancel_appointment", retellCallId });
 }
 
 /**
@@ -140,25 +185,16 @@ async function mirrorCreateAppointment(companyId, apptRow, platformJobId, { sche
  * @param {string} scheduledDate  "YYYY-MM-DD"
  */
 async function mirrorRescheduleJob(companyId, jobRow, { scheduledDate, retellCallId = null } = {}) {
-  if (!(await agentCanMakeChanges(companyId))) return { skipped: "agent_can_make_changes=false" };
-  if (!jobRow || jobRow.source !== "servicetrade" || !isNumericRef(jobRow.external_ref)) {
-    logger.info("crm-sync[reschedule_job]: not a servicetrade job; skipping", { companyId, jobId: jobRow?.id, source: jobRow?.source });
-    return { skipped: "not_servicetrade" };
-  }
-  const ref = String(jobRow.external_ref);
-  const body = { scheduledDate: toEpochSeconds(scheduledDate) };
-  try {
-    const res = await stLoggedRequest(companyId, "PUT", `/job/${encodeURIComponent(ref)}`, { body, context: "job.update" });
-    if (!res.ok) {
-      await raiseCrmSyncTodo(companyId, { action: "reschedule_job", entity: "job", entityId: ref, error: JSON.stringify(res.messages || res.status), retellCallId });
-      return { ok: false, status: res.status };
-    }
-    logger.info("crm-sync[reschedule_job]: updated in ServiceTrade", { companyId, ref });
-    return { ok: true };
-  } catch (err) {
-    await raiseCrmSyncTodo(companyId, { action: "reschedule_job", entity: "job", entityId: ref, error: err.message, retellCallId });
-    return { ok: false, error: err.message };
-  }
+  return putJob(companyId, jobRow, { scheduledDate: toEpochSeconds(scheduledDate) }, { action: "reschedule_job", retellCallId });
+}
+
+/**
+ * Cancel the job itself: PUT /job/{id} status → canceled. Used for the
+ * "entire_job" cancellation scope (not just the one appointment).
+ * @param {object} jobRow  platform jobs row (has external_ref, source)
+ */
+async function mirrorCancelJob(companyId, jobRow, { retellCallId = null } = {}) {
+  return putJob(companyId, jobRow, { status: ST_JOB_CANCELED_STATUS }, { action: "cancel_job", retellCallId });
 }
 
 module.exports = {
@@ -168,4 +204,6 @@ module.exports = {
   mirrorRescheduleAppointment,
   mirrorCreateAppointment,
   mirrorRescheduleJob,
+  mirrorCancelAppointment,
+  mirrorCancelJob,
 };
