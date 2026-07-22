@@ -59,6 +59,16 @@ class ServiceTradeProvider extends CrmProvider {
         return { ok: false, counts: rawResult.counts || {}, error: rawResult.error };
       }
 
+      // Keep companies.default_timezone in sync with the CRM's account timezone
+      // on every sync (self-healing; a single cheap unpaginated request — unlike
+      // the paginated entity fetches above). Best-effort, never blocks normalize.
+      // Required lazily (not at module top) — servicetrade-account.js pulls in
+      // servicetrade-api.js -> crm/index.js, which requires this very file,
+      // creating a load-time circular require if imported at the top.
+      require("../../servicetrade-account").syncAccountTimezone(companyId).catch((err) => {
+        logger.warn("ServiceTradeProvider.syncAll: account timezone sync failed", { companyId, error: err.message });
+      });
+
       if (engine) await engine.transition("normalizing", {});
       logger.info("ServiceTradeProvider: normalizing raw data into platform tables", { companyId, rawCounts: rawResult.counts });
       const normResult = await this.normalizeAll(companyId, { engine });

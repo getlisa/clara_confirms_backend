@@ -13,6 +13,7 @@ const engineToken = require("../engines/core/token");
 const enginesDb = require("../engines/core/db");
 const credentialsDb = require("../db/servicetrade-credentials");
 const syncDb = require("../db/servicetrade-sync");
+const { syncAccountTimezone } = require("../services/servicetrade-account");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -45,6 +46,13 @@ router.post("/credentials", async (req, res) => {
     // Store the full Cookie header value (e.g. "PHPSESSID=abc") in auth_code.
     // This survives indefinitely until ServiceTrade invalidates the session.
     await credentialsDb.upsert(companyId, username.trim(), result.cookie, metadata);
+
+    // Best-effort: adopt the CRM's own timezone as this company's default_timezone
+    // so all scheduling/dispatch calculations use it. Never fails the connect request.
+    syncAccountTimezone(companyId).catch((err) => {
+      logger.warn("ServiceTrade connect: account timezone sync failed", { companyId, error: err.message });
+    });
+
     return res.json({
       connected: true,
       user: result.user,
