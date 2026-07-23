@@ -34,6 +34,7 @@ const adminRoutes = require("./routes/admin");
 const enginesRoutes = require("./routes/engines");
 const manualCallsRoutes = require("./routes/manual-calls");
 const serviceLinkMessagesRoutes = require("./routes/service-link-messages");
+const chatLinksRoutes = require("./routes/chat-links");
 const copilotRoutes = require("./routes/copilot");
 
 const app = express();
@@ -185,6 +186,9 @@ app.use("/calls/manual", manualCallsRoutes);
 
 // Service-link email attempts — status list so the UI can surface non-sent ones.
 app.use("/service-link-messages", serviceLinkMessagesRoutes);
+
+// Shareable chat-widget links — generate (staff) + resolve (public, token-authed).
+app.use("/chat-links", chatLinksRoutes);
 
 // AI Copilot — embedded assistant. JWT for control endpoints, signed
 // query-string token for the SSE turn stream.
