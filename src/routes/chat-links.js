@@ -64,4 +64,54 @@ router.get("/:token", openCors, async (req, res) => {
   }
 });
 
+// ── SSE message send ─────────────────────────────────────────────────────────
+// Retell's chat completion has no token-level streaming — this simulates a
+// typing feel: a `typing` event immediately, then the real (multi-second,
+// tool-calling) completion round-trip, then the resulting text revealed in
+// small chunks, then a `done` event carrying the updated state/input_hint.
+const CHUNK_SIZE = 12; // characters per message_delta tick — small enough to feel like typing
+
+function sseSend(res, event, data) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+router.options("/:token/messages", openCors);
+router.post("/:token/messages", openCors, async (req, res) => {
+  const content = req.body?.content;
+  if (typeof content !== "string" || !content.trim()) {
+    return res.status(400).json({ error: "content is required" });
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  try {
+    sseSend(res, "typing", {});
+
+    const result = await chatLinksService.sendChatMessage(req.params.token, content);
+    if (!result.ok) {
+      sseSend(res, "error", { error: result.error });
+      return res.end();
+    }
+
+    for (const message of result.messages) {
+      const text = message.content || "";
+      for (let i = 0; i < text.length; i += CHUNK_SIZE) {
+        sseSend(res, "message_delta", { role: message.role, chunk: text.slice(i, i + CHUNK_SIZE) });
+      }
+      sseSend(res, "message_complete", message);
+    }
+
+    sseSend(res, "done", { state: result.state, input_hint: result.input_hint });
+    return res.end();
+  } catch (err) {
+    logger.error("POST /chat-links/:token/messages failed", { error: err.message });
+    sseSend(res, "error", { error: "Failed to send message" });
+    return res.end();
+  }
+});
+
 module.exports = router;

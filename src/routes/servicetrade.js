@@ -45,7 +45,10 @@ router.post("/credentials", async (req, res) => {
     }
     // Store the full Cookie header value (e.g. "PHPSESSID=abc") in auth_code.
     // This survives indefinitely until ServiceTrade invalidates the session.
-    await credentialsDb.upsert(companyId, username.trim(), result.cookie, metadata);
+    // Also capture the ServiceTrade user id — needed to mint a service-link
+    // token via GET /api/token?jobId=&userId= (see chat-links get_service_link tool).
+    const mergedMetadata = { ...(metadata || {}), servicetrade_user_id: result.user?.id ?? null };
+    await credentialsDb.upsert(companyId, username.trim(), result.cookie, mergedMetadata);
 
     // Best-effort: adopt the CRM's own timezone as this company's default_timezone
     // so all scheduling/dispatch calculations use it. Never fails the connect request.

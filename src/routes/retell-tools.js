@@ -14,6 +14,7 @@ const serviceLink = require("../services/servicetrade-service-link");
 const serviceLinkMessagesDb = require("../db/service-link-messages");
 const stAppointments = require("../services/servicetrade-appointments");
 const todosDb = require("../db/todos");
+const chatLinksDb = require("../db/chat-links");
 const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
 const { parseCallbackTime } = require("../services/callback-time");
@@ -45,6 +46,17 @@ function getCompanyId(req) {
   const fromBody = req.body?.call?.metadata?.company_id ?? req.body?.chat?.metadata?.company_id;
   if (fromBody) return Number(fromBody);
   return null;
+}
+
+/**
+ * The Retell conversation identifier for this request — a real call_id for
+ * voice/SMS, or a chat_id for a web-chat-link conversation. Used generically
+ * both for CRM-mirror bookkeeping (works today for either) and for
+ * chat_links state tracking (chatLinksDb.setState is a harmless no-op when
+ * this is actually a call_id, since it just won't match any chat_links row).
+ */
+function getConversationId(req) {
+  return req.body?.call?.call_id || req.body?.chat?.chat_id || null;
 }
 
 /**
@@ -294,6 +306,10 @@ router.post("/confirm_appointment", async (req, res) => {
     });
     if (!appointment) return res.status(404).json({ error: "Appointment not found" });
 
+    // Chat state tracking — harmless no-op for voice/SMS (getConversationId
+    // returns a call_id there, which won't match any chat_links row).
+    await chatLinksDb.setState(getConversationId(req), "confirmation_accepted").catch(() => {});
+
     const tz = await getCompanyTimezone(companyId);
     logger.info("Tool: confirm_appointment", { companyId, appointment_id });
     return res.json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
@@ -328,8 +344,11 @@ router.post("/reschedule_appointment", async (req, res) => {
     // Mirror to ServiceTrade (best-effort; platform is source of truth). Awaited
     // so serverless doesn't freeze before the PUT completes; never fails the tool.
     await stAppointments
-      .mirrorRescheduleAppointment(companyId, appointment, { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: req.body?.call?.call_id || null })
+      .mirrorRescheduleAppointment(companyId, appointment, { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: getConversationId(req) })
       .catch((err) => logger.error("crm-sync reschedule_appointment mirror failed", { error: err.message, companyId }));
+
+    // Chat state tracking — harmless no-op for voice/SMS.
+    await chatLinksDb.setState(getConversationId(req), "reschedule_pending_confirmation").catch(() => {});
 
     logger.info("Tool: reschedule_appointment", { companyId, appointment_id, scheduled_start, startUTC, tz });
     return res.json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
@@ -369,7 +388,7 @@ router.post("/create_appointment", async (req, res) => {
     // Mirror to ServiceTrade: create the appointment there and stamp the id back.
     // Best-effort, awaited; never fails the tool (platform is source of truth).
     await stAppointments
-      .mirrorCreateAppointment(companyId, appointment, Number(job_id), { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: req.body?.call?.call_id || null })
+      .mirrorCreateAppointment(companyId, appointment, Number(job_id), { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: getConversationId(req) })
       .catch((err) => logger.error("crm-sync create_appointment mirror failed", { error: err.message, companyId }));
 
     logger.info("Tool: create_appointment", { companyId, job_id, scheduled_start, startUTC, tz });
@@ -399,7 +418,7 @@ router.post("/reschedule_job", async (req, res) => {
 
     // Mirror the new scheduled date to ServiceTrade (best-effort; awaited).
     await stAppointments
-      .mirrorRescheduleJob(companyId, job, { scheduledDate: dateOnly, retellCallId: req.body?.call?.call_id || null })
+      .mirrorRescheduleJob(companyId, job, { scheduledDate: dateOnly, retellCallId: getConversationId(req) })
       .catch((err) => logger.error("crm-sync reschedule_job mirror failed", { error: err.message, companyId }));
 
     logger.info("Tool: reschedule_job", { companyId, job_id, new_scheduled_date: dateOnly });
@@ -427,7 +446,7 @@ router.post("/cancel_appointment", async (req, res) => {
     if (!["appointment_only", "entire_job"].includes(scope))
       return res.status(400).json({ error: "scope must be 'appointment_only' or 'entire_job'" });
 
-    const retellCallId = req.body?.call?.call_id || null;
+    const retellCallId = getConversationId(req);
 
     const existing = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
     if (!existing) return res.status(404).json({ error: "Appointment not found" });
@@ -480,6 +499,9 @@ router.post("/cancel_appointment", async (req, res) => {
         metadata: { retell_call_id: retellCallId, appointment_id: String(appointment.id), job_id: String(existing.job_id), scope, reason },
       })
       .catch((err) => logger.warn("Failed to raise APPOINTMENT_CANCELLED todo", { error: err.message, companyId }));
+
+    // Chat state tracking — harmless no-op for voice/SMS.
+    await chatLinksDb.setState(retellCallId, "canceled").catch(() => {});
 
     const tz = await getCompanyTimezone(companyId);
     logger.info("Tool: cancel_appointment", { companyId, appointment_id, scope, reason });
@@ -756,7 +778,22 @@ async function resolveConfirmationRefs(companyId, retellCallId) {
       WHERE sc.retell_call_id = $1 AND sc.company_id = $2 LIMIT 1`,
     [retellCallId, companyId]
   );
-  return rows[0] || null;
+  if (rows[0]) return rows[0];
+
+  // A web-chat-link conversation has no scheduled_calls row at all (it isn't
+  // dispatched via the scheduler — the customer opens a token-based link
+  // directly), so fall back to resolving job/customer context via chat_links.
+  const { rows: chatRows } = await db.query(
+    `SELECT NULL::int AS scheduled_call_id, cl.job_id::text AS job_id,
+            j.external_ref AS job_ref, j.source AS job_source,
+            cu.external_ref AS customer_ref
+       FROM chat_links cl
+       LEFT JOIN jobs j       ON j.id = cl.job_id AND j.company_id = cl.company_id
+       LEFT JOIN customers cu ON cu.id = j.customer_id
+      WHERE cl.retell_chat_id = $1 AND cl.company_id = $2 LIMIT 1`,
+    [retellCallId, companyId]
+  );
+  return chatRows[0] || null;
 }
 
 async function resolveJobLocationId(companyId, jobRef) {
@@ -777,6 +814,10 @@ router.post("/search_contact", async (req, res) => {
     const { query } = getArgs(req);
     if (!query) return res.status(400).json({ error: "query is required" });
     const contacts = await serviceLink.searchContacts(companyId, query);
+
+    // Chat state tracking — harmless no-op for voice/SMS.
+    await chatLinksDb.setState(getConversationId(req), "collecting_contact_info").catch(() => {});
+
     return res.json({ success: true, count: contacts.length, contacts });
   } catch (err) {
     logger.error("Tool search_contact failed", { error: err.message });
@@ -791,7 +832,7 @@ router.post("/create_contact", async (req, res) => {
     if (!verifyToolSecret(req, res)) return;
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(400).json({ error: "company_id missing" });
-    const retellCallId = req.body?.call?.call_id;
+    const retellCallId = getConversationId(req);
     if (!retellCallId) return res.status(400).json({ error: "call.call_id missing from request" });
     const { email, existing_contact_id, first_name, last_name, phone, role } = getArgs(req);
     if (!email) return res.status(400).json({ error: "email is required" });
@@ -820,11 +861,95 @@ router.post("/create_contact", async (req, res) => {
       email,
     });
 
+    // Chat state tracking — harmless no-op for voice/SMS.
+    await chatLinksDb.setState(retellCallId, "collecting_contact_info").catch(() => {});
+
     logger.info("Tool create_contact: recipient recorded", { companyId, retellCallId, contactId: String(contactId), reused: !!existing_contact_id });
     return res.json({ success: true, contact_id: String(contactId), email, message: "Recipient saved — the service link will be emailed after the call." });
   } catch (err) {
     logger.error("Tool create_contact failed", { error: err.message });
     return res.status(500).json({ error: "Failed to set service link recipient" });
+  }
+});
+
+// ── REPORT CUSTOMER INTENT (chat only — see chat-links state machine) ───────
+// Lets the agent signal a clear decision before the corresponding action tool
+// actually fires (e.g. "wants_reschedule" before a date is collected). Harmless
+// no-op for voice/SMS — chatLinksDb.setState just won't match any row there.
+router.post("/report_customer_intent", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    const { intent } = getArgs(req);
+    if (!companyId || !intent) return res.status(400).json({ error: "company_id and intent are required" });
+
+    const stateByIntent = {
+      wants_confirm: "confirmation_accepted",
+      wants_reschedule: "reschedule_needed",
+      wants_cancel: "canceled",
+    };
+    const state = stateByIntent[intent];
+    if (state) {
+      await chatLinksDb.setState(getConversationId(req), state).catch(() => {});
+    }
+
+    logger.info("Tool: report_customer_intent", { companyId, intent });
+    return res.json({ success: true });
+  } catch (err) {
+    logger.error("Tool report_customer_intent failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET SERVICE LINK (chat only) ─────────────────────────────────────────────
+// Fetch the live ServiceTrade service-link URL so the agent can paste it
+// directly into the chat, in addition to the existing post-call email.
+// URL mechanics (real captured values, per plan):
+//   token = GET /api/token?jobId=<servicetrade_job_id>&userId=<servicetrade_user_id>
+//   link  = https://app.servicetrade.com/customer/jobsummary?id=<token>
+router.post("/get_service_link", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(400).json({ error: "company_id is required" });
+    const conversationId = getConversationId(req);
+    if (!conversationId) return res.status(400).json({ error: "call/chat id missing from request" });
+
+    const refs = await resolveConfirmationRefs(companyId, conversationId);
+    if (!refs?.job_ref) {
+      return res.status(404).json({ error: "No ServiceTrade job found for this conversation" });
+    }
+
+    const { rows: credRows } = await db.query(
+      `SELECT metadata->>'servicetrade_user_id' AS user_id FROM servicetrade_integration WHERE company_id = $1`,
+      [companyId]
+    );
+    const stUserId = credRows[0]?.user_id;
+    if (!stUserId) {
+      return res.status(503).json({ error: "ServiceTrade user id not on file for this company — cannot mint a service-link token" });
+    }
+
+    const { stLoggedRequest } = require("../services/servicetrade-api");
+    const tokenRes = await stLoggedRequest(
+      companyId, "GET", `/token?jobId=${encodeURIComponent(refs.job_ref)}&userId=${encodeURIComponent(stUserId)}`,
+      { context: "serviceLink.token" }
+    );
+    const token = tokenRes.data?.token || tokenRes.data?.id || (typeof tokenRes.data === "string" ? tokenRes.data : null);
+    if (!tokenRes.ok || !token) {
+      logger.error("Tool get_service_link: token fetch failed", { companyId, status: tokenRes.status, messages: tokenRes.messages });
+      return res.status(502).json({ error: "Failed to mint a service-link token" });
+    }
+
+    const url = `https://app.servicetrade.com/customer/jobsummary?id=${encodeURIComponent(token)}`;
+
+    // Chat state tracking — harmless no-op for voice/SMS.
+    await chatLinksDb.setState(conversationId, "service_link_sent").catch(() => {});
+
+    logger.info("Tool: get_service_link", { companyId, jobRef: refs.job_ref });
+    return res.json({ success: true, url });
+  } catch (err) {
+    logger.error("Tool get_service_link failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 

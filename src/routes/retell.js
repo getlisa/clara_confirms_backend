@@ -457,7 +457,7 @@ async function handleChatEnded(chatData) {
     inVoicemail: false,
     metadata,
     isTest,
-    channel: "sms",
+    channel: metadata?.channel || "sms",
   });
 
   const callRow = await db.query(`SELECT id FROM calls WHERE retell_call_id = $1`, [chat_id]);
@@ -533,7 +533,7 @@ async function handleChatAnalyzed(chatData) {
     transcriptWithToolCalls: message_with_tool_calls,
     callCost: chat_cost,
     rawAnalysis: chat_analysis,
-    channel: "sms",
+    channel: metadata?.channel || "sms",
     ...outcome,
   });
 

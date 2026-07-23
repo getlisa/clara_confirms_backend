@@ -57,4 +57,34 @@ async function markOpened(id) {
   await db.query(`UPDATE chat_links SET last_opened_at = NOW() WHERE id = $1`, [id]);
 }
 
-module.exports = { findByAppointment, findByJob, create, getByToken, markOpened };
+async function getByRetellChatId(chatId) {
+  const result = await db.query(`SELECT * FROM chat_links WHERE retell_chat_id = $1`, [chatId]);
+  return result.rows[0] || null;
+}
+
+/**
+ * Atomically claim retell_chat_id for a link that doesn't have one yet.
+ * Returns the updated row if this call won the race, or null if another
+ * concurrent request already claimed it first (caller should then re-fetch
+ * by token and use whatever chat_id won).
+ */
+async function claimRetellChatId(id, chatId) {
+  const result = await db.query(
+    `UPDATE chat_links SET retell_chat_id = $1 WHERE id = $2 AND retell_chat_id IS NULL RETURNING *`,
+    [chatId, id]
+  );
+  return result.rows[0] || null;
+}
+
+async function setState(chatId, state) {
+  const result = await db.query(
+    `UPDATE chat_links SET state = $1 WHERE retell_chat_id = $2 RETURNING *`,
+    [state, chatId]
+  );
+  return result.rows[0] || null; // null is expected/harmless for voice/SMS calls (no matching row)
+}
+
+module.exports = {
+  findByAppointment, findByJob, create, getByToken, markOpened,
+  getByRetellChatId, claimRetellChatId, setState,
+};

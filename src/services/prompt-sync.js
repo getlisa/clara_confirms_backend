@@ -9,6 +9,7 @@ const db = require("../db");
 const retell = require("./retell");
 const callTypeConfigsDb = require("../db/call-type-configs");
 const logger = require("../utils/logger");
+const { CHAT_SESSION_INSTRUCTION } = require("./retell-flow");
 
 /**
  * Reset DB prompts for all built-in call types for a company back to the
@@ -96,7 +97,11 @@ async function syncPromptsForCompany(companyId, types = null) {
     const current = nodes[nodeIdx].instruction?.text || "";
     // Preserve any read-only mode note appended by registerToolsForCompany
     const readOnlyMatch = current.match(/\n\n\[IMPORTANT: You are in read-only mode[\s\S]*?\]/);
-    const newText = row.general_prompt + (readOnlyMatch ? readOnlyMatch[0] : "");
+    // customer_confirmation also carries the chat-session instruction (see
+    // retell-flow.js) — rebuilding from general_prompt alone would otherwise
+    // silently drop it on every prompt sync.
+    const chatInstruction = row.type === "customer_confirmation" ? `\n\n${CHAT_SESSION_INSTRUCTION.trim()}` : "";
+    const newText = row.general_prompt + chatInstruction + (readOnlyMatch ? readOnlyMatch[0] : "");
 
     if (newText === current) {
       logger.info("syncPrompts: no change", { type: row.type });

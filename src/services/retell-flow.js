@@ -210,12 +210,28 @@ const EXTRACT_VARIABLES = {
 
 function extractNodeId(type) { return `extract_${type}`; }
 
+// Chat-specific instruction, appended only to customer_confirmation — the only
+// call type the web-chat-link feature drives. Conditioned on the
+// {{is_chat_session}} dynamic variable (only set "true" for web-chat-link
+// sessions — src/services/chat-links.js) so voice/SMS calls never see or act
+// on it, avoiding any extra tool-call latency there.
+const CHAT_SESSION_INSTRUCTION =
+  "\n\n[If {{is_chat_session}} is true: this is a text chat, not a phone call — " +
+  "report the customer's decision immediately via report_customer_intent as soon " +
+  "as it becomes clear (wants_confirm / wants_reschedule / wants_cancel / other), " +
+  "even before you've completed the corresponding action (e.g. before you've " +
+  "collected a reschedule date). Call this silently — never mention the tool to " +
+  "the customer. If service_link_enabled tools are available and you reach the " +
+  "point of sending the service link, call get_service_link and paste the " +
+  "returned URL directly into your reply, in addition to it being emailed.]";
+
 function buildSubagentNode(callType) {
   const parts = [];
   if (callType.begin_message) {
     parts.push(`[Opening — send this exactly when the conversation starts]:\n${callType.begin_message}`);
   }
   if (callType.general_prompt) parts.push(callType.general_prompt);
+  if (callType.type === "customer_confirmation") parts.push(CHAT_SESSION_INSTRUCTION.trim());
 
   const extractId = extractNodeId(callType.type);
   const hasExtract = !!EXTRACT_VARIABLES[callType.type];
@@ -586,4 +602,4 @@ async function syncFlowForCompany(companyId) {
   return { flowId, agentId, phoneNumber: phoneNumber || null };
 }
 
-module.exports = { syncFlowForCompany };
+module.exports = { syncFlowForCompany, CHAT_SESSION_INSTRUCTION };
