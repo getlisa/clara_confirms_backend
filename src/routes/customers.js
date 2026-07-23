@@ -121,6 +121,10 @@ router.patch("/:id", async (req, res) => {
     if (Object.keys(req.body).length === 0) {
       return res.status(400).json({ error: "No fields to update" });
     }
+    if (req.body.preferred_channel !== undefined && req.body.preferred_channel !== null
+        && !["voice", "sms"].includes(req.body.preferred_channel)) {
+      return res.status(400).json({ error: "preferred_channel must be 'voice', 'sms', or null" });
+    }
 
     const customer = await customersDb.update(Number(req.params.id), companyId, req.body);
     if (!customer) return res.status(404).json({ error: "Customer not found" });

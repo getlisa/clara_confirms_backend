@@ -40,7 +40,9 @@ function verifyToolSecret(req, res) {
 function getCompanyId(req) {
   const fromQuery = req.query?.company_id;
   if (fromQuery) return Number(fromQuery);
-  const fromBody = req.body?.call?.metadata?.company_id;
+  // Chat/SMS tool-webhook calls nest their payload under "chat" instead of
+  // "call" — check both so every tool works identically regardless of channel.
+  const fromBody = req.body?.call?.metadata?.company_id ?? req.body?.chat?.metadata?.company_id;
   if (fromBody) return Number(fromBody);
   return null;
 }
@@ -58,7 +60,7 @@ function getArgs(req) {
     ? req.body.args
     : req.body || {};
 
-  const skip = new Set(["call", "execution_message", "name"]);
+  const skip = new Set(["call", "chat", "execution_message", "name"]);
   for (const [k, v] of Object.entries(source)) {
     if (skip.has(k)) continue;
     const snake = k.replace(/([A-Z])/g, "_$1").toLowerCase();

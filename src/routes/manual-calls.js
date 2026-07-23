@@ -43,6 +43,7 @@ router.post("/", async (req, res) => {
       phoneNumber:   req.body?.phone_number != null ? String(req.body.phone_number) : undefined,
       immediate:     req.body?.immediate !== false,         // default true
       force:         req.body?.force === true,              // default false
+      channel:       req.body?.channel === "sms" ? "sms" : req.body?.channel === "voice" ? "voice" : null, // "Call Now" vs "Text Now"
       scheduledAt:   req.body?.scheduled_at || null,
     });
 

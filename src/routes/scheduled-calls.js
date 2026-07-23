@@ -57,6 +57,7 @@ router.get("/", async (req, res) => {
          sc.status,
          sc.scheduled_at,
          sc.is_test,
+         sc.channel,
          sc.attempt_number,
          sc.max_attempts,
          sc.failure_reason,

@@ -14,9 +14,9 @@ function quotationDedupeKeys(quotationId, linkedJobId) {
   return [...new Set(keys)];
 }
 
-async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest = false, maxAttempts = 3, callPriority, bypassOfficeHours }) {
+async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest = false, maxAttempts = 3, callPriority, bypassOfficeHours, channel }) {
   try {
-    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest, maxAttempts, callPriority, bypassOfficeHours });
+    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest, maxAttempts, callPriority, bypassOfficeHours, channel });
   } catch (err) {
     if (err.code === "23505") {
       const dup = new Error("Duplicate active scheduled call");
@@ -33,7 +33,7 @@ async function insertScheduledCall({
   jobName, jobDescription, jobType, totalAmount, callContext,
   scheduledAt, isTest = false, maxAttempts = 3,
   callPriority = "normal", parentCallId = null, retryCount = 0,
-  bypassOfficeHours = false,
+  bypassOfficeHours = false, channel = "voice",
 }) {
   const result = await db.query(
     `INSERT INTO scheduled_calls
@@ -41,15 +41,15 @@ async function insertScheduledCall({
         customer_name, technician_name, customer_address,
         job_name, job_description, job_type, total_amount, call_context,
         scheduled_at, is_test, max_attempts,
-        call_priority, parent_call_id, retry_count, bypass_office_hours)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21)
+        call_priority, parent_call_id, retry_count, bypass_office_hours, channel)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21,$22)
      RETURNING *`,
     [companyId, callType, phoneNumber, jobId ?? null, jobDate ?? null, appointmentId ?? null,
      customerName ?? null, technicianName ?? null, customerAddress ?? null,
      jobName ?? null, jobDescription ?? null, jobType ?? null, totalAmount ?? null,
      callContext ? JSON.stringify(callContext) : null,
      scheduledAt, isTest, maxAttempts,
-     callPriority, parentCallId ?? null, retryCount, !!bypassOfficeHours]
+     callPriority, parentCallId ?? null, retryCount, !!bypassOfficeHours, channel || "voice"]
   );
   return result.rows[0];
 }
@@ -62,7 +62,7 @@ async function insertScheduledCall({
  *
  * Returns the new scheduled_call row, or null if retry not allowed.
  */
-async function scheduleRetry(originalRow, nextWindowAt, jobDueDate, maxRetries = 3, tz = null) {
+async function scheduleRetry(originalRow, nextWindowAt, jobDueDate, maxRetries = 3, tz = null, channel = null) {
   if (originalRow.retry_count >= maxRetries) return null;
   if (jobDueDate && new Date(nextWindowAt) >= new Date(jobDueDate)) return null;
 
@@ -90,6 +90,7 @@ async function scheduleRetry(originalRow, nextWindowAt, jobDueDate, maxRetries =
       callPriority,
       parentCallId:    originalRow.id,
       retryCount:      originalRow.retry_count + 1,
+      channel:         channel || originalRow.channel || "voice",
     });
   } catch (err) {
     if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return null;
@@ -101,7 +102,7 @@ async function scheduleRetry(originalRow, nextWindowAt, jobDueDate, maxRetries =
  * Schedule a callback at the time requested by the customer during the call.
  * callbackAt must be before jobDueDate.
  */
-async function scheduleCallback(originalRow, callbackAt, jobDueDate) {
+async function scheduleCallback(originalRow, callbackAt, jobDueDate, channel = null) {
   if (jobDueDate && new Date(callbackAt) >= new Date(jobDueDate)) return null;
 
   try {
@@ -125,6 +126,7 @@ async function scheduleCallback(originalRow, callbackAt, jobDueDate) {
       callPriority:    "callback",
       parentCallId:    originalRow.id,
       retryCount:      0,
+      channel:         channel || originalRow.channel || "voice",
     });
   } catch (err) {
     if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return null;

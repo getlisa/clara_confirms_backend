@@ -57,6 +57,30 @@ const POST_CALL_ANALYSIS_DATA = [
   },
 ];
 
+// Chat-agent mirror of POST_CALL_ANALYSIS_DATA — same custom fields, chat-specific
+// system-preset names ('chat_summary'/'chat_successful' instead of 'call_summary'/'call_successful').
+const POST_CHAT_ANALYSIS_DATA = [
+  { type: "system-presets", name: "chat_summary" },
+  { type: "system-presets", name: "chat_successful" },
+  { type: "system-presets", name: "user_sentiment" },
+  {
+    type: "enum",
+    name: "appointment_confirmed",
+    description: "Whether the customer confirmed their upcoming service appointment",
+    choices: ["yes", "no", "unclear"],
+  },
+  {
+    type: "boolean",
+    name: "reschedule_requested",
+    description: "Whether the customer asked to reschedule the appointment",
+  },
+  {
+    type: "boolean",
+    name: "cancellation_requested",
+    description: "Whether the customer asked to cancel the appointment outright",
+  },
+];
+
 // ── Flow node builders ─────────────────────────────────────────────────────────
 
 function buildBranchNode(callTypes) {
@@ -189,7 +213,7 @@ function extractNodeId(type) { return `extract_${type}`; }
 function buildSubagentNode(callType) {
   const parts = [];
   if (callType.begin_message) {
-    parts.push(`[Opening — say this exactly when the call connects]:\n${callType.begin_message}`);
+    parts.push(`[Opening — send this exactly when the conversation starts]:\n${callType.begin_message}`);
   }
   if (callType.general_prompt) parts.push(callType.general_prompt);
 
@@ -295,7 +319,8 @@ async function syncFlowForCompany(companyId) {
 
   const [companyResult, callTypesResult, agentSettingsResult] = await Promise.all([
     db.query(
-      `SELECT name, retell_agent_id, retell_conversation_flow_id, retell_phone_number, office_area_code
+      `SELECT name, retell_agent_id, retell_chat_agent_id, retell_conversation_flow_id,
+              retell_phone_number, office_area_code, sms_status
        FROM companies WHERE id = $1`,
       [companyId]
     ),
@@ -387,6 +412,39 @@ async function syncFlowForCompany(companyId) {
     logger.info("Retell Agent created", { companyId, agentId });
   }
 
+  // ── Step 2b: Chat Agent ─────────────────────────────────────────────────────
+  // Points at the SAME conversation flow as the voice Agent — this is what makes
+  // chat/SMS share identical dialogue logic with voice. Always provisioned
+  // (cheap, idempotent) regardless of sms_status, so the moment ops flips
+  // sms_status to 'live' everything is already wired; only the phone-number
+  // binding below and actual sending are gated on sms_status.
+  let chatAgentId = company.retell_chat_agent_id;
+
+  const chatAgentParams = {
+    response_engine: { type: "conversation-flow", conversation_flow_id: flowId },
+    agent_name: `CLARA_CHAT_${companyName.toUpperCase().replace(/[^A-Z0-9]+/g, "_").substring(0, 40)}`,
+    language:                 "en-US",
+    end_chat_after_silence_ms: 3600000,
+    post_chat_analysis_model:  "gpt-4.1-mini",
+    post_chat_analysis_data:   POST_CHAT_ANALYSIS_DATA,
+    ...(config.retell.webhookUrl ? { webhook_url: config.retell.webhookUrl } : {}),
+  };
+
+  try {
+    if (chatAgentId) {
+      await client.chatAgent.update(chatAgentId, chatAgentParams);
+      logger.info("Retell ChatAgent updated", { companyId, chatAgentId });
+    } else {
+      const chatAgent = await client.chatAgent.create(chatAgentParams);
+      chatAgentId = chatAgent.agent_id;
+      logger.info("Retell ChatAgent created", { companyId, chatAgentId });
+    }
+  } catch (err) {
+    // Non-fatal — chat is an additive channel; a failure here must not block
+    // voice provisioning (which the rest of this function still needs to do).
+    logger.warn("syncFlowForCompany: chat agent provisioning failed (non-fatal)", { companyId, error: err.message });
+  }
+
   // ── Step 3: Phone number ────────────────────────────────────────────────────
   let phoneNumber = company.retell_phone_number;
 
@@ -413,6 +471,23 @@ async function syncFlowForCompany(companyId) {
       logger.info("Retell phone number re-linked to agent", { companyId, phoneNumber, agentId });
     } catch (err) {
       logger.warn("Failed to re-link phone number to agent", { companyId, phoneNumber, error: err.message });
+    }
+  }
+
+  // ── Step 3b: Bind chat agent to the number's SMS side ──────────────────────
+  // Voice and SMS bind independently on the same PhoneNumber object
+  // (inbound_agents/outbound_agents vs inbound_sms_agents/outbound_sms_agents).
+  // Only bind once SMS is actually approved for this number (sms_status='live')
+  // — binding earlier would silently claim SMS capability the number doesn't have yet.
+  if (chatAgentId && phoneNumber && company.sms_status === "live") {
+    try {
+      await client.phoneNumber.update(phoneNumber, {
+        outbound_sms_agents: [{ agent_id: chatAgentId, weight: 1 }],
+        inbound_sms_agents:  [{ agent_id: chatAgentId, weight: 1 }],
+      });
+      logger.info("Retell phone number re-linked to chat agent (SMS)", { companyId, phoneNumber, chatAgentId });
+    } catch (err) {
+      logger.warn("Failed to re-link phone number to chat agent", { companyId, phoneNumber, error: err.message });
     }
   }
 
@@ -460,16 +535,18 @@ async function syncFlowForCompany(companyId) {
     `UPDATE companies
      SET retell_conversation_flow_id = $1,
          retell_agent_id             = $2,
+         retell_chat_agent_id        = COALESCE($3, retell_chat_agent_id),
          retell_llm_id               = $1,
-         retell_phone_number         = COALESCE($3, retell_phone_number),
-         retell_agent_snapshot       = $4,
-         retell_flow_snapshot        = $5,
+         retell_phone_number         = COALESCE($4, retell_phone_number),
+         retell_agent_snapshot       = $5,
+         retell_flow_snapshot        = $6,
          retell_last_synced_at       = NOW(),
          updated_at                  = NOW()
-     WHERE id = $6`,
+     WHERE id = $7`,
     [
       flowId,
       agentId,
+      chatAgentId || null,
       phoneNumber || null,
       agentSnapshot ? JSON.stringify(agentSnapshot) : null,
       flowSnapshot  ? JSON.stringify(flowSnapshot)  : null,

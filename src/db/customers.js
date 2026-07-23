@@ -17,6 +17,7 @@ function rowToObject(row) {
     country:                row.country ?? "US",
     is_active:              row.is_active,
     source:                 row.source ?? null,
+    preferred_channel:      row.preferred_channel ?? null,
     additional_information: row.additional_information ?? {},
     created_at:             row.created_at,
     updated_at:             row.updated_at,
@@ -125,6 +126,7 @@ async function update(id, companyId, fields) {
   const allowed = [
     "first_name", "last_name", "full_name", "email", "phone", "alternate_phone",
     "address_line1", "city", "state", "zipcode", "country", "is_active", "additional_information",
+    "preferred_channel",
   ];
   const provided = Object.keys(fields).filter((k) => allowed.includes(k) && k in fields);
   if (provided.length === 0) return getById(id, companyId);

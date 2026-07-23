@@ -123,7 +123,7 @@ async function list(companyId, { status, type, assignedTo, limit = 50, offset = 
     `SELECT t.*,
             u.first_name || ' ' || u.last_name AS assigned_to_name,
             c.retell_call_id, c.to_number, c.duration_ms, c.appointment_confirmed,
-            c.reschedule_requested, c.cancellation_requested, c.call_summary,
+            c.reschedule_requested, c.cancellation_requested, c.call_summary, c.channel,
             cu.id          AS customer_id,
             cu.full_name   AS customer_name,
             cu.email       AS customer_email,
