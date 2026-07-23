@@ -81,6 +81,43 @@ async function createCall({ fromNumber, toNumber, companyId, callType, dynamicVa
   return call;
 }
 
+/**
+ * Start an outbound SMS/chat conversation via the company's flow-backed Retell
+ * chat agent. Mirrors createCall() — same dynamic-variable/metadata contract,
+ * so the shared conversation flow sees an identical shape regardless of channel.
+ */
+async function createSmsChat({ toNumber, companyId, callType, dynamicVariables = {}, metadata = {} }) {
+  if (!callType) throw new Error("callType is required — the branch router needs it to route to the correct subagent");
+
+  const client = getClient();
+
+  const result = await db.query(
+    `SELECT retell_chat_agent_id, retell_phone_number FROM companies WHERE id = $1`,
+    [companyId]
+  );
+  const company = result.rows[0];
+  if (!company?.retell_chat_agent_id) throw new Error(`No Retell chat agent provisioned for company ${companyId}`);
+
+  const fromNumber = company.retell_phone_number;
+  if (!fromNumber) throw new Error(`No from_number available for company ${companyId} — set retell_phone_number on the company`);
+
+  const toPhoneNumber = parsePhoneNumberFromString(toNumber, "US");
+
+  const chat = await client.chat.createSMSChat({
+    from_number: fromNumber,
+    to_number: toPhoneNumber.number.toString(),
+    override_agent_id: company.retell_chat_agent_id,
+    retell_llm_dynamic_variables: {
+      call_type: callType || "",
+      ...dynamicVariables,
+    },
+    metadata: { company_id: String(companyId), call_type: callType || null, channel: "sms", ...metadata },
+  });
+
+  logger.info("Retell SMS chat initiated", { companyId, callType, chatId: chat.chat_id, toNumber });
+  return chat;
+}
+
 // ── Voices catalog ──────────────────────────────────────────────────────────
 // Retell's voice catalog changes rarely. Cache the list in-process for 5 min
 // so the Settings page can paginate/filter without round-tripping every render.
@@ -112,4 +149,4 @@ async function isVoiceIdValid(voiceId) {
   return list.some((v) => v.voice_id === voiceId);
 }
 
-module.exports = { verifyWebhookSignature, createCall, getClient, listVoices, isVoiceIdValid };
+module.exports = { verifyWebhookSignature, createCall, createSmsChat, getClient, listVoices, isVoiceIdValid };

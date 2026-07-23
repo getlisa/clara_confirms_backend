@@ -22,6 +22,7 @@ const scheduler = require("./scheduler");
 const db = require("../db");
 const { toE164 } = require("../utils/phone");
 const { localToUTC } = require("../utils/timezone");
+const { resolveOutboundChannel } = require("./channel-resolver");
 const logger = require("../utils/logger");
 
 const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
@@ -37,12 +38,15 @@ const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
  * @param {boolean} [args.immediate=true]
  * @param {boolean} [args.force=false]
  * @param {string}  [args.scheduledAt]
+ * @param {string}  [args.channel]                  — explicit 'voice'|'sms' override (e.g. the
+ *                                                     frontend's "Call Now" vs "Text Now" buttons).
+ *                                                     Omit to fall back to the company's channel strategy.
  * @returns {Promise<{ok:boolean, status:number, scheduledCall?, dialed?, retellCallId?, error?}>}
  */
 async function triggerManualCall({
   companyId, triggerType,
   appointmentId, jobId: rawJobId, quotationId, phoneNumber = null,
-  immediate = true, force = false, scheduledAt = null,
+  immediate = true, force = false, scheduledAt = null, channel = null,
 }) {
   // ── 1. Validate trigger_type and resolve the company's configured call_type ─
   if (!triggerType || !VALID_TRIGGER_TYPES.includes(triggerType)) {
@@ -126,17 +130,32 @@ async function triggerManualCall({
 
   // ── 4. Determine when ──────────────────────────────────────────────────────
   const callSettings = await callSettingsDb.getByCompanyId(companyId);
+  const { rows: co } = await db.query(`SELECT default_timezone, sms_status FROM companies WHERE id = $1`, [companyId]);
+  const smsLive = co[0]?.sms_status === "live";
+
   let fireAt;
   if (immediate) {
     fireAt = new Date(); // bypass office hours — user clicked Call Now.
   } else {
-    const { rows: co } = await db.query(`SELECT default_timezone FROM companies WHERE id = $1`, [companyId]);
     const tz = co[0]?.default_timezone || "America/New_York";
     // scheduledAt, if provided, is a naive wall-clock string meant in the company's timezone.
     const requested = scheduledAt ? new Date(localToUTC(scheduledAt, tz)) : new Date();
     fireAt = scheduler.isWithinActiveHours(callSettings, tz, requested)
       ? requested
       : scheduler.getNextWindowStart(callSettings, tz, requested);
+  }
+
+  // Explicit channel (e.g. "Text Now" button) wins; otherwise fall back to the
+  // company's channel strategy exactly like the scheduler does.
+  const resolvedChannel = channel || resolveOutboundChannel({ smsLive, channelStrategy: callSettings.channel_strategy });
+
+  // An explicit channel request still has to respect SMS readiness — unlike the
+  // automatic scheduler/retry paths (where resolveOutboundChannel's own smsLive
+  // check silently falls back to voice), a human explicitly asking for "Text Now"
+  // should get a clear error instead of a send attempt Retell would likely reject
+  // (or worse, a confusing silent no-op) against a not-yet-approved number.
+  if (resolvedChannel === "sms" && !smsLive) {
+    return { ok: false, status: 422, error: "SMS is not yet enabled for this company — it must reach 'live' status before texts can be sent." };
   }
 
   // ── 5. Insert ──────────────────────────────────────────────────────────────
@@ -155,6 +174,7 @@ async function triggerManualCall({
       maxAttempts:       callSettings.max_attempts ?? 3,
       callPriority:      "high",
       bypassOfficeHours: immediate === true,
+      channel:           resolvedChannel,
     });
   } catch (err) {
     if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") {

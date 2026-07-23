@@ -18,6 +18,7 @@ router.get("/", async (req, res) => {
     const result = await db.query(
       `SELECT id, name, default_timezone, address_line1, city, state, zipcode, country,
               office_area_code, retell_phone_number, retell_agent_id, retell_conversation_flow_id,
+              retell_chat_agent_id, sms_status,
               created_at, updated_at FROM companies WHERE id = $1`,
       [companyId]
     );
@@ -38,6 +39,8 @@ router.get("/", async (req, res) => {
         suggested_area_codes: row.state ? getAreaCodesForState(row.state) : [],
         retell_provisioned: !!(row.retell_agent_id && row.retell_conversation_flow_id),
         phone_number_set: !!row.retell_phone_number,
+        sms_status: row.sms_status || "not_configured",
+        chat_provisioned: !!row.retell_chat_agent_id,
       },
     });
   } catch (err) {
@@ -91,6 +94,7 @@ router.patch("/", async (req, res) => {
       zipcode,
       country,
       office_area_code,
+      sms_status,
     } = req.body;
 
     const updates = [];
@@ -122,6 +126,17 @@ router.patch("/", async (req, res) => {
       }
     }
 
+    // sms_status: ops-controlled — flipped once Retell confirms A2P approval for
+    // this company's number. Not something a regular company admin should self-serve;
+    // the frontend should gate this behind an internal/ops-only surface.
+    if (sms_status !== undefined) {
+      if (!["not_configured", "pending_approval", "live"].includes(sms_status)) {
+        return res.status(400).json({ error: "sms_status must be 'not_configured', 'pending_approval', or 'live'" });
+      }
+      updates.push(`sms_status = $${i++}`);
+      values.push(sms_status);
+    }
+
     if (updates.length === 0) return res.status(400).json({ error: "No fields to update" });
 
     values.push(companyId);
@@ -132,7 +147,7 @@ router.patch("/", async (req, res) => {
 
     const result = await db.query(
       `SELECT id, name, default_timezone, address_line1, city, state, zipcode, country,
-              office_area_code FROM companies WHERE id = $1`,
+              office_area_code, sms_status FROM companies WHERE id = $1`,
       [companyId]
     );
     const row = result.rows[0];
@@ -148,6 +163,7 @@ router.patch("/", async (req, res) => {
         country: row.country ?? "",
         office_area_code: row.office_area_code ?? null,
         suggested_area_codes: row.state ? getAreaCodesForState(row.state) : [],
+        sms_status: row.sms_status || "not_configured",
       },
     });
   } catch (err) {

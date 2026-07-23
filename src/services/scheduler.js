@@ -5,6 +5,7 @@ const callTypeConfigsDb = require("../db/call-type-configs");
 const scheduledCallsDb = require("../db/scheduled-calls");
 const todosDb = require("../db/todos");
 const { computeInitialPriority } = require("./call-priority");
+const { resolveOutboundChannel } = require("./channel-resolver");
 const retell = require("./retell");
 const logger = require("../utils/logger");
 
@@ -154,16 +155,26 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         .replace(/\{\{company_name\}\}/g,        co.company_name || "our company")
         .replace(/\{\{location_name\}\}/g,       (row.call_context && row.call_context.location_name) || "your location");
 
-      const call = await retell.createCall({
-        toNumber: row.phone_number,
-        companyId: row.company_id,
-        callType: row.call_type,
-        dynamicVariables: dynVars,
-        metadata: { scheduled_call_id: String(row.id), is_test: row.is_test },
-        voicemailMessage,
-      });
-      await scheduledCallsDb.markCompleted(row.id, call.call_id);
-      logger.info("Dispatcher: fired", { ...ctx, retellCallId: call.call_id });
+      const isSms = row.channel === "sms";
+      const call = isSms
+        ? await retell.createSmsChat({
+            toNumber: row.phone_number,
+            companyId: row.company_id,
+            callType: row.call_type,
+            dynamicVariables: dynVars,
+            metadata: { scheduled_call_id: String(row.id), is_test: row.is_test },
+          })
+        : await retell.createCall({
+            toNumber: row.phone_number,
+            companyId: row.company_id,
+            callType: row.call_type,
+            dynamicVariables: dynVars,
+            metadata: { scheduled_call_id: String(row.id), is_test: row.is_test },
+            voicemailMessage,
+          });
+      const externalId = call.call_id || call.chat_id;
+      await scheduledCallsDb.markCompleted(row.id, externalId);
+      logger.info("Dispatcher: fired", { ...ctx, channel: row.channel, retellCallId: externalId });
       fired++;
     } catch (err) {
       const st = await scheduledCallsDb.markFailedOrRetry(row.id, err.message);
@@ -202,8 +213,8 @@ async function runDailyJob({ companyId = null, respectAutoFlag = true, engine = 
 
   const { rows: companies } = await db.query(
     companyId
-      ? `SELECT id, default_timezone FROM companies WHERE id = $1 AND (is_active = true OR is_active IS NULL)`
-      : `SELECT id, default_timezone FROM companies WHERE is_active = true OR is_active IS NULL`,
+      ? `SELECT id, default_timezone, sms_status FROM companies WHERE id = $1 AND (is_active = true OR is_active IS NULL)`
+      : `SELECT id, default_timezone, sms_status FROM companies WHERE is_active = true OR is_active IS NULL`,
     companyId ? [companyId] : []
   );
   logger.info(`Daily job: processing ${companies.length} company(ies)`);
@@ -227,14 +238,15 @@ async function runDailyJob({ companyId = null, respectAutoFlag = true, engine = 
         continue;
       }
       const tz = co.default_timezone || "America/New_York";
+      const smsLive = co.sms_status === "live";
       logger.info(`Daily job: company has ${triggers.length} enabled trigger(s)`, {
-        companyId: co.id, tz, triggers: triggers.map(t => t.trigger_type),
+        companyId: co.id, tz, smsLive, triggers: triggers.map(t => t.trigger_type),
       });
 
       for (const trigger of triggers) {
         try {
           if (engine) await engine.transition("running_trigger", { trigger_type: trigger.trigger_type, company_id: co.id });
-          const { c, s } = await processTrigger(co.id, trigger, cs, tz);
+          const { c, s } = await processTrigger(co.id, trigger, cs, tz, smsLive);
           created += c; skipped += s;
           if (engine) await engine.emit("trigger_done", { trigger_type: trigger.trigger_type, company_id: co.id, scheduled: c, skipped: s });
           logger.info(`Daily job: trigger processed`, {
@@ -277,11 +289,12 @@ async function scheduleCall(params) {
   }
 }
 
-async function processTrigger(companyId, trigger, callSettings, tz) {
+async function processTrigger(companyId, trigger, callSettings, tz, smsLive = false) {
   switch (trigger.trigger_type) {
-    case "scheduled_unconfirmed":  return processScheduledUnconfirmed(companyId, trigger, callSettings, tz);
-    case "quotation_pending":      return processQuotationPending(companyId, trigger, callSettings, tz);
-    case "open_job_due_soon":      return processOpenJobDueSoon(companyId, trigger, callSettings, tz);
+    case "scheduled_unconfirmed":  return processScheduledUnconfirmed(companyId, trigger, callSettings, tz, smsLive);
+    case "quotation_pending":      return processQuotationPending(companyId, trigger, callSettings, tz, smsLive);
+    case "open_job_due_soon":      return processOpenJobDueSoon(companyId, trigger, callSettings, tz, smsLive);
+    // technician_unconfirmed dials the technician, not the end customer — voice only, out of scope.
     case "technician_unconfirmed": return processTechnicianUnconfirmed(companyId, trigger, callSettings, tz);
     default: return { c: 0, s: 0 };
   }
@@ -291,7 +304,7 @@ async function processTrigger(companyId, trigger, callSettings, tz) {
  * Dev:  schedule NOW+5min, is_test=true, match any upcoming unconfirmed appointment
  * Prod: schedule at business-hours window N days from now, is_test=false
  */
-async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz) {
+async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz, smsLive = false) {
   // Window match: any appointment whose date (in company tz) is within
   // [today, today + days_before]. Catches jobs created late and any day the cron missed.
   const todayStr = formatDateInTz(new Date(), tz);
@@ -314,7 +327,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
             j.title AS job_name, j.description AS job_description, j.job_type,
             a.id AS appointment_id, a.status AS appointment_status,
             c.phone AS customer_phone, c.full_name AS customer_name,
-            c.address_line1, c.city, c.state
+            c.address_line1, c.city, c.state, c.preferred_channel
      FROM jobs j
      JOIN appointments a ON a.job_id = j.id AND a.status IN ('scheduled','rescheduled')
      JOIN customers c ON c.id = j.customer_id
@@ -353,6 +366,11 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
       ? new Date()
       : snapToWindowStart(callSettings, tz, new Date());
 
+    const channel = resolveOutboundChannel({
+      smsLive, preferredChannel: row.preferred_channel,
+      channelStrategy: callSettings.channel_strategy, attemptNumber: 1,
+    });
+
     const inserted = await scheduleCall({
       companyId, callType: trigger.call_type,
       phoneNumber: row.customer_phone,
@@ -365,6 +383,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
       jobType: row.job_type || null,
       scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
       callPriority: computeInitialPriority({ triggerType: "scheduled_unconfirmed", jobDate: targetDate, tz }),
+      channel,
     });
     if (inserted) c++; else {
       logger.info("Scheduler [scheduled_unconfirmed]: skipped — duplicate on insert", { companyId, jobId });
@@ -374,7 +393,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz)
   return { c, s };
 }
 
-async function processQuotationPending(companyId, trigger, callSettings, tz) {
+async function processQuotationPending(companyId, trigger, callSettings, tz, smsLive = false) {
   const cfg = trigger.trigger_config;
   const quoteStatuses = cfg.quote_statuses ?? ["sent", "viewed"];
   const daysAfterSent = cfg.days_after_sent ?? 3;
@@ -384,7 +403,7 @@ async function processQuotationPending(companyId, trigger, callSettings, tz) {
   const { rows } = await db.query(
     `SELECT q.id AS quotation_id, q.job_id, q.title AS quote_title, q.notes AS quote_description,
             q.total_amount, q.currency,
-            c.phone AS customer_phone, c.full_name AS customer_name
+            c.phone AS customer_phone, c.full_name AS customer_name, c.preferred_channel
      FROM quotations q
      JOIN customers c ON c.id = q.customer_id
      WHERE q.company_id = $1
@@ -430,6 +449,11 @@ async function processQuotationPending(companyId, trigger, callSettings, tz) {
       ? new Date()
       : getNextWindowStart(callSettings, tz);
 
+    const channel = resolveOutboundChannel({
+      smsLive, preferredChannel: row.preferred_channel,
+      channelStrategy: callSettings.channel_strategy, attemptNumber: 1,
+    });
+
     const inserted = await scheduleCall({
       companyId, callType: trigger.call_type,
       phoneNumber: row.customer_phone,
@@ -440,6 +464,7 @@ async function processQuotationPending(companyId, trigger, callSettings, tz) {
       totalAmount: row.total_amount ?? null,
       scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
       callPriority: computeInitialPriority({ triggerType: "quotation_pending", jobDate: null, tz }),
+      channel,
     });
     if (inserted) c++; else {
       logger.info("Scheduler [quotation_pending]: skipped — duplicate on insert", { companyId, quotationId: row.quotation_id });
@@ -449,7 +474,7 @@ async function processQuotationPending(companyId, trigger, callSettings, tz) {
   return { c, s };
 }
 
-async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
+async function processOpenJobDueSoon(companyId, trigger, callSettings, tz, smsLive = false) {
   const todayStr = formatDateInTz(new Date(), tz);
   const endDate = new Date();
   endDate.setDate(endDate.getDate() + trigger.days_before);
@@ -466,7 +491,7 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
     SELECT j.id AS job_id, j.scheduled_date,
            j.title AS job_name, j.description AS job_description, j.job_type,
            c.phone AS customer_phone, c.full_name AS customer_name,
-           c.address_line1, c.city, c.state
+           c.address_line1, c.city, c.state, c.preferred_channel
     FROM jobs j
     JOIN customers c ON c.id = j.customer_id
     WHERE j.company_id = $1
@@ -508,6 +533,11 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
       ? new Date()
       : snapToWindowStart(callSettings, tz, new Date());
 
+    const channel = resolveOutboundChannel({
+      smsLive, preferredChannel: row.preferred_channel,
+      channelStrategy: callSettings.channel_strategy, attemptNumber: 1,
+    });
+
     const inserted = await scheduleCall({
       companyId, callType: trigger.call_type,
       phoneNumber: row.customer_phone,
@@ -519,6 +549,7 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz) {
       jobType: row.job_type || null,
       scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
       callPriority: computeInitialPriority({ triggerType: "open_job_due_soon", jobDate: targetDate, tz }),
+      channel,
     });
     if (inserted) c++; else {
       logger.info("Scheduler [open_job_due_soon]: skipped — duplicate on insert", { companyId, jobId });

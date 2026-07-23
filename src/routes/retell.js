@@ -10,6 +10,7 @@ const stServiceLink = require("../services/servicetrade-service-link");
 const db = require("../db");
 const { getNextWindowStart } = require("../services/scheduler");
 const { parseCallbackTime } = require("../services/callback-time");
+const { resolveOutboundChannel } = require("../services/channel-resolver");
 const logger = require("../utils/logger");
 
 const isDev = process.env.NODE_ENV === "development";
@@ -38,6 +39,11 @@ router.use((req, res, next) => {
 const NO_ANSWER_REASONS = new Set([
   "dial_no_answer", "dial_busy", "dial_failed", "user_declined",
   "invalid_destination", "error_no_audio_received",
+  // Synthetic reason we derive ourselves for a chat/SMS conversation that ended
+  // without the customer ever replying — see deriveChatHadUserReply below.
+  // Reusing this set lets deriveTodoType and the no-answer retry path treat it
+  // identically to a voice no-answer without any duplicate logic.
+  "sms_no_reply",
 ]);
 
 /**
@@ -60,14 +66,18 @@ function extractNodeTransitions(transcriptWithToolCalls) {
 router.post("/webhook", async (req, res) => {
   const signature = req.headers["x-retell-signature"];
 
+  // Chat webhooks nest their payload under "chat" instead of "call" — read both
+  // defensively (exact key confirmed via a live test, see plan Verification §2).
+  const eventBody = req.body?.call || req.body?.chat;
+
   // Always log what arrived — independent of signature outcome — so we can diagnose
   // production failures without losing data.
   logger.info("Retell webhook: incoming request", {
     hasSignature: !!signature,
     bodyLen:      req.rawBody?.length ?? 0,
     eventType:    req.body?.event,
-    callId:       req.body?.call?.call_id,
-    companyId:    req.body?.call?.metadata?.company_id,
+    callId:       eventBody?.call_id || eventBody?.chat_id,
+    companyId:    eventBody?.metadata?.company_id,
     contentType:  req.headers["content-type"],
   });
 
@@ -79,8 +89,8 @@ router.post("/webhook", async (req, res) => {
   // call_id + company_id pair — not impossible but acceptable for production until
   // signature config is fixed.
   if (!valid) {
-    const callId    = req.body?.call?.call_id;
-    const companyId = req.body?.call?.metadata?.company_id;
+    const callId    = eventBody?.call_id || eventBody?.chat_id;
+    const companyId = eventBody?.metadata?.company_id;
     if (!callId || !companyId) {
       logger.warn("Retell webhook: invalid signature AND no callId/companyId to fall back on");
       return res.status(401).json({ error: "Invalid signature" });
@@ -107,11 +117,11 @@ router.post("/webhook", async (req, res) => {
 
   const event = req.body;
   const eventType = event?.event;
-  const callData = event?.call;
+  const callData = event?.call || event?.chat;
 
   logger.info("Retell webhook received", {
     eventType,
-    callId: callData?.call_id,
+    callId: callData?.call_id || callData?.chat_id,
     signatureValid: valid,
   });
 
@@ -131,6 +141,20 @@ router.post("/webhook", async (req, res) => {
   if (eventType === "call_analyzed") {
     await handleCallAnalyzed(callData).catch((err) =>
       logger.error("call_analyzed handler failed", { error: err.message, callId: callData?.call_id })
+    );
+    return res.sendStatus(204);
+  }
+
+  if (eventType === "chat_ended") {
+    await handleChatEnded(callData).catch((err) =>
+      logger.error("chat_ended handler failed", { error: err.message, chatId: callData?.chat_id })
+    );
+    return res.sendStatus(204);
+  }
+
+  if (eventType === "chat_analyzed") {
+    await handleChatAnalyzed(callData).catch((err) =>
+      logger.error("chat_analyzed handler failed", { error: err.message, chatId: callData?.chat_id })
     );
     return res.sendStatus(204);
   }
@@ -392,6 +416,208 @@ async function handleCallAnalyzed(callData) {
 }
 
 /**
+ * Retell's ChatResponse payload (chat_ended/chat_analyzed) carries no
+ * to_number/from_number fields the way a voice call's payload does. We already
+ * know the customer's number — it's the phone_number on the scheduled_calls row
+ * that fired this chat (its retell_call_id is stamped with the chat_id right
+ * after send, well before this webhook can arrive). from_number is just the
+ * company's Retell number.
+ */
+async function resolveChatPhoneNumbers(chatId, companyId) {
+  const [{ rows: scRows }, { rows: coRows }] = await Promise.all([
+    db.query(`SELECT phone_number FROM scheduled_calls WHERE retell_call_id = $1 LIMIT 1`, [chatId]),
+    db.query(`SELECT retell_phone_number FROM companies WHERE id = $1`, [companyId]),
+  ]);
+  return {
+    toNumber: scRows[0]?.phone_number ?? null,
+    fromNumber: coRows[0]?.retell_phone_number ?? null,
+  };
+}
+
+async function handleChatEnded(chatData) {
+  const { chat_id, metadata, start_timestamp, end_timestamp } = chatData;
+  const companyId = metadata?.company_id;
+
+  if (!companyId) {
+    logger.warn("chat_ended: no company_id in metadata", { chatId: chat_id });
+    return;
+  }
+
+  const isTest = !!(metadata?.is_test || metadata?.test_call);
+  const durationMs = (start_timestamp != null && end_timestamp != null) ? (end_timestamp - start_timestamp) : null;
+  const { toNumber, fromNumber } = await resolveChatPhoneNumbers(chat_id, companyId);
+
+  await callsDb.upsertStub({
+    retellCallId: chat_id,
+    companyId,
+    toNumber,
+    fromNumber,
+    durationMs,
+    disconnectionReason: null,
+    inVoicemail: false,
+    metadata,
+    isTest,
+    channel: "sms",
+  });
+
+  const callRow = await db.query(`SELECT id FROM calls WHERE retell_call_id = $1`, [chat_id]);
+  const callId = callRow.rows[0]?.id ?? null;
+
+  await callLogsDb.insert({
+    companyId, callId, retellCallId: chat_id,
+    eventType: "chat_ended",
+    payload: { to_number: toNumber },
+  });
+
+  logger.info("Chat ended — stub + log saved", { chatId: chat_id, companyId, durationMs });
+}
+
+async function handleChatAnalyzed(chatData) {
+  const {
+    chat_id, metadata, transcript, message_with_tool_calls, chat_analysis, chat_cost,
+    start_timestamp, end_timestamp,
+  } = chatData;
+  const companyId = metadata?.company_id;
+
+  if (!companyId) {
+    logger.warn("chat_analyzed: no company_id in metadata", { chatId: chat_id });
+    return;
+  }
+
+  // Chat has no disconnection_reason/in_voicemail concept. Derive an equivalent
+  // "no answer" signal — the customer never actually replied — so deriveTodoType
+  // and the no-answer retry path (NO_ANSWER_REASONS) pick it up without duplicate logic.
+  const hadUserReply = Array.isArray(message_with_tool_calls) && message_with_tool_calls.some((m) => m.role === "user");
+  const disconnectionReason = hadUserReply ? null : "sms_no_reply";
+  const isNoAnswer = NO_ANSWER_REASONS.has(disconnectionReason);
+  const custom = chat_analysis?.custom_analysis_data ?? {};
+
+  const outcome = isNoAnswer
+    ? {
+        callSuccessful: false,
+        callSummary: "No reply",
+        userSentiment: "Unknown",
+        appointmentConfirmed: "unclear",
+        rescheduleRequested: false,
+        cancellationRequested: false,
+      }
+    : {
+        callSuccessful: chat_analysis?.chat_successful ?? false,
+        callSummary: chat_analysis?.chat_summary ?? null,
+        userSentiment: chat_analysis?.user_sentiment ?? "Unknown",
+        appointmentConfirmed: custom.appointment_confirmed ?? "unclear",
+        rescheduleRequested: custom.reschedule_requested ?? false,
+        cancellationRequested: custom.cancellation_requested ?? false,
+      };
+
+  // extract_dynamic_variables is a flow-level node shared by both channels, so
+  // node transitions parse identically to voice.
+  const nodeTransitions = extractNodeTransitions(message_with_tool_calls);
+  const activeSubagent = nodeTransitions.find((n) => n.node_id !== "node_router" && n.node_id !== "node_end");
+
+  const isTest = !!(metadata?.is_test || metadata?.test_call);
+  const durationMs = (start_timestamp != null && end_timestamp != null) ? (end_timestamp - start_timestamp) : null;
+  const { toNumber, fromNumber } = await resolveChatPhoneNumbers(chat_id, companyId);
+
+  await callsDb.upsertAnalyzed({
+    retellCallId: chat_id,
+    companyId,
+    toNumber,
+    fromNumber,
+    durationMs,
+    disconnectionReason,
+    inVoicemail: false,
+    metadata,
+    isTest,
+    transcript: transcript ?? null,
+    transcriptWithToolCalls: message_with_tool_calls,
+    callCost: chat_cost,
+    rawAnalysis: chat_analysis,
+    channel: "sms",
+    ...outcome,
+  });
+
+  const callRow = await db.query(`SELECT id FROM calls WHERE retell_call_id = $1`, [chat_id]);
+  const callId = callRow.rows[0]?.id ?? null;
+
+  await callLogsDb.insert({
+    companyId, callId, retellCallId: chat_id,
+    eventType: "chat_analyzed",
+    payload: {
+      disconnection_reason: disconnectionReason,
+      active_subagent: activeSubagent ?? null,
+      node_transitions: nodeTransitions,
+      chat_cost: chat_cost ?? null,
+      ...outcome,
+    },
+  });
+
+  const todoType = todosDb.deriveTodoType({
+    inVoicemail: false,
+    disconnectionReason,
+    appointmentConfirmed: outcome.appointmentConfirmed,
+    rescheduleRequested: outcome.rescheduleRequested,
+    cancellationRequested: outcome.cancellationRequested,
+    customerOutcome: custom.customer_outcome ?? null,
+  });
+
+  let suppressCancellationTodo = false;
+  if (todoType === todosDb.TODO_TYPES.ASKED_FOR_CANCELLATION) {
+    const { rows: cancelledCheck } = await db.query(
+      `SELECT 1 FROM appointments WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
+       UNION ALL
+       SELECT 1 FROM jobs WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
+       LIMIT 1`,
+      [companyId, chat_id]
+    );
+    suppressCancellationTodo = cancelledCheck.length > 0;
+  }
+
+  if (todoType && !suppressCancellationTodo) {
+    await todosDb.create({
+      companyId,
+      callId,
+      type: todoType,
+      isTest,
+      metadata: {
+        retell_call_id: chat_id,
+        to_number: toNumber,
+        call_summary: outcome.callSummary,
+        user_sentiment: outcome.userSentiment,
+        appointment_confirmed: outcome.appointmentConfirmed,
+        active_subagent: activeSubagent?.node_name ?? null,
+      },
+    });
+    logger.info("Todo created", { chatId: chat_id, companyId, todoType });
+  }
+
+  // NOTE: ServiceTrade comment/service-link write-back is intentionally NOT
+  // wired for chat in this pass (avoids double-sending if a voice retry and a
+  // chat both touch the same job) — revisit once channel de-duplication for
+  // those write-backs is designed.
+
+  logger.info("Chat analyzed — outcome saved", {
+    chatId: chat_id, companyId,
+    todoType: todoType || "none (confirmed)",
+    activeSubagent: activeSubagent?.node_name ?? null,
+    ...outcome,
+  });
+
+  // ── Retry / Callback scheduling (production only) ─────────────────────────
+  if (!isDev && !isTest) {
+    const outcomeStr = custom.customer_outcome ?? custom.technician_outcome ?? custom.quote_decision ?? custom.booking_outcome ?? null;
+    await handleRetryOrCallback({
+      companyId,
+      retellCallId: chat_id,
+      inVoicemail: false,
+      isNoAnswer,
+      customerOutcome: outcomeStr,
+      callbackTime: custom.callback_time ?? null,
+    }).catch(err => logger.error("retry/callback scheduling failed", { error: err.message, chatId: chat_id }));
+  }
+}
+
+/**
  * After a call ends, decide whether to schedule a retry or callback:
  *
  * RETRY  — customer didn't pick up (no-answer / voicemail):
@@ -417,20 +643,33 @@ async function handleRetryOrCallback({ companyId, retellCallId, inVoicemail, isN
   }
   const sc = scRows[0];
 
-  // Fetch company timezone + call settings for next-window calculation
+  // Fetch company timezone + SMS status + call settings for next-window/channel calculation
   const { rows: coRows } = await db.query(
-    `SELECT default_timezone FROM companies WHERE id = $1`, [companyId]
+    `SELECT default_timezone, sms_status FROM companies WHERE id = $1`, [companyId]
   );
   const tz = coRows[0]?.default_timezone || "America/New_York";
+  const smsLive = coRows[0]?.sms_status === "live";
   const cs = await callSettingsDb.getByCompanyId(companyId);
+
+  // Per-customer channel override, resolved by phone number (scheduled_calls
+  // doesn't carry a customer_id — the phone number is the join key we have).
+  const { rows: custRows } = await db.query(
+    `SELECT preferred_channel FROM customers WHERE company_id = $1 AND phone = $2 LIMIT 1`,
+    [companyId, sc.phone_number]
+  );
+  const preferredChannel = custRows[0]?.preferred_channel ?? null;
 
   // ── CALLBACK: customer asked to be called at a specific time ──────────────
   if (customerOutcome === "callback_requested" && callbackTime) {
     const callbackAt = parseCallbackTime(callbackTime, tz);
     if (callbackAt && callbackAt > new Date()) {
-      const created = await scheduledCallsDb.scheduleCallback(sc, callbackAt.toISOString(), sc.job_due_date);
+      const channel = resolveOutboundChannel({
+        smsLive, preferredChannel, channelStrategy: cs.channel_strategy,
+        isCallback: true, smsOnCallbackEnabled: cs.sms_on_callback_enabled,
+      });
+      const created = await scheduledCallsDb.scheduleCallback(sc, callbackAt.toISOString(), sc.job_due_date, channel);
       if (created) {
-        logger.info("Callback scheduled", { companyId, parentId: sc.id, callbackAt, jobId: sc.job_id });
+        logger.info("Callback scheduled", { companyId, parentId: sc.id, callbackAt, jobId: sc.job_id, channel });
       } else {
         logger.info("Callback not scheduled (past due date or duplicate)", { companyId, parentId: sc.id });
       }
@@ -443,11 +682,15 @@ async function handleRetryOrCallback({ companyId, retellCallId, inVoicemail, isN
   // ── RETRY: no-answer or voicemail ─────────────────────────────────────────
   if (inVoicemail || isNoAnswer) {
     const nextWindow = getNextWindowStart(cs, tz); // next business-hours slot
-    const created = await scheduledCallsDb.scheduleRetry(sc, nextWindow.toISOString(), sc.job_due_date, MAX_NO_ANSWER_RETRIES, tz);
+    const channel = resolveOutboundChannel({
+      smsLive, preferredChannel, channelStrategy: cs.channel_strategy,
+      attemptNumber: sc.retry_count + 1,
+    });
+    const created = await scheduledCallsDb.scheduleRetry(sc, nextWindow.toISOString(), sc.job_due_date, MAX_NO_ANSWER_RETRIES, tz, channel);
     if (created) {
       logger.info("Retry scheduled", {
         companyId, parentId: sc.id, retryCount: sc.retry_count + 1,
-        nextWindow, jobId: sc.job_id,
+        nextWindow, jobId: sc.job_id, channel,
       });
     } else {
       const reason = sc.retry_count >= MAX_NO_ANSWER_RETRIES

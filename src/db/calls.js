@@ -1,19 +1,20 @@
 const db = require("./index");
 
-async function upsertStub({ retellCallId, companyId, toNumber, fromNumber, durationMs, disconnectionReason, inVoicemail, metadata, isTest = false }) {
+async function upsertStub({ retellCallId, companyId, toNumber, fromNumber, durationMs, disconnectionReason, inVoicemail, metadata, isTest = false, channel = "voice" }) {
   await db.query(
     `INSERT INTO calls
        (retell_call_id, company_id, to_number, from_number, duration_ms,
-        disconnection_reason, in_voicemail, metadata, status, is_test)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ended', $9)
+        disconnection_reason, in_voicemail, metadata, status, is_test, channel)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ended', $9, $10)
      ON CONFLICT (retell_call_id) DO UPDATE SET
        duration_ms          = COALESCE(EXCLUDED.duration_ms, calls.duration_ms),
        disconnection_reason = COALESCE(EXCLUDED.disconnection_reason, calls.disconnection_reason),
        in_voicemail         = COALESCE(EXCLUDED.in_voicemail, calls.in_voicemail),
        metadata             = COALESCE(EXCLUDED.metadata, calls.metadata),
        is_test              = EXCLUDED.is_test,
+       channel              = EXCLUDED.channel,
        updated_at           = NOW()`,
-    [retellCallId, companyId, toNumber, fromNumber, durationMs, disconnectionReason, inVoicemail, metadata ? JSON.stringify(metadata) : null, isTest]
+    [retellCallId, companyId, toNumber, fromNumber, durationMs, disconnectionReason, inVoicemail, metadata ? JSON.stringify(metadata) : null, isTest, channel || "voice"]
   );
 }
 
@@ -22,7 +23,7 @@ async function upsertAnalyzed({
   durationMs, disconnectionReason, inVoicemail, metadata, isTest = false,
   callSuccessful, callSummary, userSentiment,
   appointmentConfirmed, rescheduleRequested, cancellationRequested,
-  transcript, transcriptWithToolCalls, callCost, rawAnalysis,
+  transcript, transcriptWithToolCalls, callCost, rawAnalysis, channel = "voice",
 }) {
   await db.query(
     `INSERT INTO calls
@@ -30,8 +31,8 @@ async function upsertAnalyzed({
         disconnection_reason, in_voicemail, metadata, status, is_test,
         call_successful, call_summary, user_sentiment,
         appointment_confirmed, reschedule_requested, cancellation_requested,
-        transcript, transcript_with_tool_calls, call_cost, raw_analysis)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'analyzed',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        transcript, transcript_with_tool_calls, call_cost, raw_analysis, channel)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'analyzed',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
      ON CONFLICT (retell_call_id) DO UPDATE SET
        status                      = 'analyzed',
        duration_ms                 = COALESCE(EXCLUDED.duration_ms, calls.duration_ms),
@@ -49,6 +50,7 @@ async function upsertAnalyzed({
        transcript_with_tool_calls  = EXCLUDED.transcript_with_tool_calls,
        call_cost                   = EXCLUDED.call_cost,
        raw_analysis                = EXCLUDED.raw_analysis,
+       channel                     = EXCLUDED.channel,
        updated_at                  = NOW()`,
     [
       retellCallId, companyId, toNumber, fromNumber, durationMs,
@@ -59,6 +61,7 @@ async function upsertAnalyzed({
       transcriptWithToolCalls ? JSON.stringify(transcriptWithToolCalls) : null,
       callCost ? JSON.stringify(callCost) : null,
       rawAnalysis ? JSON.stringify(rawAnalysis) : null,
+      channel || "voice",
     ]
   );
 }
@@ -75,7 +78,7 @@ async function list(companyId, { limit = 50, offset = 0, status, appointmentConf
   values.push(limit, offset);
   const result = await db.query(
     `SELECT c.id, c.retell_call_id, c.to_number, c.from_number, c.direction, c.status, c.is_test,
-            c.duration_ms, c.disconnection_reason, c.in_voicemail,
+            c.duration_ms, c.disconnection_reason, c.in_voicemail, c.channel,
             c.call_successful, c.call_summary, c.user_sentiment,
             c.appointment_confirmed, c.reschedule_requested, c.cancellation_requested,
             c.transcript, c.created_at, c.updated_at,
@@ -107,6 +110,7 @@ function rowToCall(row) {
     direction:               row.direction,
     status:                  row.status,
     is_test:                 row.is_test,
+    channel:                 row.channel ?? "voice",
     duration_ms:             row.duration_ms,
     disconnection_reason:    row.disconnection_reason,
     in_voicemail:            row.in_voicemail,
