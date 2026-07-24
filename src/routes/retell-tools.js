@@ -872,6 +872,77 @@ router.post("/create_contact", async (req, res) => {
   }
 });
 
+// ── RESOLVE SERVICE LINK CONTACT ─────────────────────────────────────────────
+// Replaces search_contact + create_contact (now disabled — see migration 071).
+// Those two required the model to reliably sequence "search first, only ask
+// for name/role if nothing found" itself — in practice it consistently asked
+// for name/role upfront regardless of prompt/tool-description wording. This
+// single tool moves that sequencing into our own code: it ALWAYS searches by
+// email first, and uses an existing match if found — ignoring any name/role
+// the model passed alongside — so a duplicate contact is never created
+// regardless of what order the model gathered its questions in. Only when no
+// match exists does it ask (via the "need_more_info" response status) for the
+// model to collect name/role and call again.
+router.post("/resolve_service_link_contact", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(400).json({ error: "company_id missing" });
+    const conversationId = getConversationId(req);
+    if (!conversationId) return res.status(400).json({ error: "call/chat id missing from request" });
+    const { email, first_name, last_name, role, phone } = getArgs(req);
+    if (!email) return res.status(400).json({ error: "email is required" });
+
+    const refs = await resolveConfirmationRefs(companyId, conversationId);
+    if (!refs) return res.status(404).json({ error: "No scheduled call or chat found for this conversation" });
+
+    // Chat state tracking — harmless no-op for voice/SMS.
+    await chatLinksDb.setState(conversationId, "collecting_contact_info").catch(() => {});
+
+    // ALWAYS search by email first — regardless of whether the model also
+    // supplied first_name/last_name/role on this same call.
+    const candidates = await serviceLink.searchContacts(companyId, email);
+    const exactMatch = candidates.find((c) => c.email && c.email.toLowerCase() === email.toLowerCase());
+    const match = exactMatch || (candidates.length === 1 ? candidates[0] : null);
+
+    let contactId, contactName, status;
+    if (match) {
+      contactId = match.id;
+      contactName = [match.firstName, match.lastName].filter(Boolean).join(" ") || null;
+      status = "found";
+    } else if (first_name || last_name) {
+      const companyIds = /^\d+$/.test(String(refs.customer_ref)) ? [Number(refs.customer_ref)] : [];
+      const locRaw = await resolveJobLocationId(companyId, refs.job_ref);
+      const locationIds = locRaw && /^\d+$/.test(String(locRaw)) ? [Number(locRaw)] : [];
+      const created = await serviceLink.createContact(companyId, {
+        firstName: first_name, lastName: last_name, email, phone, role, companyIds, locationIds,
+      });
+      if (!created) return res.status(502).json({ error: "Failed to create contact in ServiceTrade" });
+      contactId = created.id;
+      contactName = [created.firstName, created.lastName].filter(Boolean).join(" ") || null;
+      status = "created";
+    } else {
+      logger.info("Tool: resolve_service_link_contact — no match, more info needed", { companyId, email });
+      return res.json({ success: true, status: "need_more_info", email });
+    }
+
+    await serviceLinkMessagesDb.setRecipient({
+      companyId,
+      scheduledCallId: refs.scheduled_call_id,
+      retellCallId: conversationId,
+      jobExternalRef: refs.job_ref || null,
+      contactId: String(contactId),
+      email,
+    });
+
+    logger.info("Tool: resolve_service_link_contact", { companyId, status, contactId: String(contactId) });
+    return res.json({ success: true, status, contact_id: String(contactId), name: contactName, email });
+  } catch (err) {
+    logger.error("Tool resolve_service_link_contact failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to resolve service link contact" });
+  }
+});
+
 // ── REPORT CUSTOMER INTENT (chat only — see chat-links state machine) ───────
 // Lets the agent signal a clear decision before the corresponding action tool
 // actually fires (e.g. "wants_reschedule" before a date is collected). Harmless
@@ -942,11 +1013,19 @@ router.post("/get_service_link", async (req, res) => {
 
     const url = `https://app.servicetrade.com/customer/jobsummary?id=${encodeURIComponent(token)}`;
 
+    // Job name — for the frontend to render a preview card (title) rather
+    // than just a bare URL. Best-effort; never blocks the link itself.
+    const { rows: jobRows } = await db.query(
+      `SELECT title FROM jobs WHERE id = $1 AND company_id = $2`,
+      [refs.job_id, companyId]
+    );
+    const jobName = jobRows[0]?.title ?? null;
+
     // Chat state tracking — harmless no-op for voice/SMS.
     await chatLinksDb.setState(conversationId, "service_link_sent").catch(() => {});
 
     logger.info("Tool: get_service_link", { companyId, jobRef: refs.job_ref });
-    return res.json({ success: true, url });
+    return res.json({ success: true, url, job_name: jobName });
   } catch (err) {
     logger.error("Tool get_service_link failed", { error: err.message });
     return res.status(500).json({ error: err.message });
