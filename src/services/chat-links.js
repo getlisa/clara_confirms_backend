@@ -11,10 +11,14 @@
  * The agent must always speak first: client.chat.create() alone does NOT
  * auto-send an opening message (verified live — a session sits empty until
  * something triggers a turn, even though the shared flow has
- * start_speaker:"agent", which only drives voice). Calling
- * createChatCompletion({ chat_id, content: "" }) correctly triggers the
- * flow's opening message with no fake user turn in the transcript — that's
- * the mechanism getOrCreateSession relies on below.
+ * start_speaker:"agent", which only drives voice). Triggering with an EMPTY
+ * content string does correctly produce a first agent turn — but empirically,
+ * on that context-free first turn, the model does not reliably evaluate the
+ * prompt's {{is_chat_session}} conditional and can default to the voice-phrased
+ * opening. A short, real (filtered-out) trigger message that explicitly states
+ * this is a chat session is far more reliable — the model is reacting to an
+ * actual instruction instead of nothing — hence CHAT_TRIGGER_MESSAGE below
+ * instead of an empty string.
  */
 
 const chatLinksDb = require("../db/chat-links");
@@ -22,6 +26,11 @@ const { HYDRATORS } = require("./call-hydration");
 const db = require("../db");
 const retell = require("./retell");
 const { formatSpokenDateTime, formatSpokenDateOnly } = require("../utils/timezone");
+
+// Sent as the synthetic first "user" turn to reliably trigger the agent's
+// opening message in the right (chat) register — filtered out of everything
+// returned to the frontend by filterVisibleMessages, so the customer never sees it.
+const CHAT_TRIGGER_MESSAGE = "(This is a text chat, not a phone call. Please begin now with your chat-appropriate opening message.)";
 
 function buildDynamicVariables(params, { callType, isAppointment, tz }) {
   return {
@@ -42,12 +51,43 @@ function buildDynamicVariables(params, { callType, isAppointment, tz }) {
   };
 }
 
-/** Keep only real chat turns — strip node_transition/tool_call_* plumbing. */
+/**
+ * Keep only real chat turns — strip node_transition/tool_call_* plumbing and
+ * the synthetic trigger — but surface a successful get_service_link call as a
+ * structured `type: "service_link"` entry (url + job_name) instead of just
+ * whatever text the agent said, so the frontend can render a preview card
+ * (rather than parsing a raw URL out of message text) and only navigate to
+ * the full ServiceTrade page on click.
+ */
 function filterVisibleMessages(messages) {
   if (!Array.isArray(messages)) return [];
-  return messages
-    .filter((m) => m.role === "agent" || m.role === "user")
-    .map((m) => ({ role: m.role, content: m.content, created_at: m.created_timestamp ?? null }));
+
+  const invocationNameById = {};
+  for (const m of messages) {
+    if (m.role === "tool_call_invocation") invocationNameById[m.tool_call_id] = m.name;
+  }
+
+  const out = [];
+  for (const m of messages) {
+    if ((m.role === "agent" || m.role === "user") && m.content !== CHAT_TRIGGER_MESSAGE) {
+      out.push({ role: m.role, content: m.content, created_at: m.created_timestamp ?? null });
+      continue;
+    }
+    if (m.role === "tool_call_result" && invocationNameById[m.tool_call_id] === "get_service_link") {
+      let parsed;
+      try { parsed = JSON.parse(m.content); } catch { parsed = null; }
+      if (parsed?.success && parsed?.url) {
+        out.push({
+          role: "agent",
+          type: "service_link",
+          url: parsed.url,
+          job_name: parsed.job_name ?? null,
+          created_at: m.created_timestamp ?? null,
+        });
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -155,7 +195,7 @@ async function getOrCreateSession(link, dynamicVariables, chatAgentId) {
   }
 
   // Trigger the opening message — empty content, no fake user turn appears.
-  const completion = await client.chat.createChatCompletion({ chat_id: created.chat_id, content: "" });
+  const completion = await client.chat.createChatCompletion({ chat_id: created.chat_id, content: CHAT_TRIGGER_MESSAGE });
   return { chatId: created.chat_id, messages: filterVisibleMessages(completion.messages) };
 }
 

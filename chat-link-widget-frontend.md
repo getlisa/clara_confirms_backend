@@ -118,6 +118,19 @@ same conversation and returns the full history, not a fresh greeting.
 | `email_form` | — | Single email field |
 | `free_text` | — | Normal chat input (default/fallback) |
 
+### Service-link messages — a distinct message shape
+Most entries in `messages` (and in `message_complete` events, §4) look like
+`{ role, content, created_at }`. When the agent sends the service link, one
+entry instead looks like this:
+```json
+{ "role": "agent", "type": "service_link", "url": "https://app.servicetrade.com/customer/jobsummary?id=...", "job_name": "Fire Extinguisher Inspection", "created_at": 1784819388725 }
+```
+Render this as a **preview card** (e.g. job name + a "View Job" button), not a
+plain text bubble — clicking it should open the full ServiceTrade page (new
+tab or full navigation, your call). Entries without a `type` field are always
+plain text; check for `type === "service_link"` to distinguish. The agent's
+own text never contains the raw URL — it's intentionally never pasted as text.
+
 ---
 
 ## 4. Sending a message (SSE)

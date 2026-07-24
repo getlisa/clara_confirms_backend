@@ -215,15 +215,21 @@ function extractNodeId(type) { return `extract_${type}`; }
 // {{is_chat_session}} dynamic variable (only set "true" for web-chat-link
 // sessions — src/services/chat-links.js) so voice/SMS calls never see or act
 // on it, avoiding any extra tool-call latency there.
+//
+// NOTE: chat-appropriate language and the get_service_link paste behavior are
+// handled INLINE in the general_prompt content itself (src/db/call-type-configs.js
+// generateDefaultPrompts) at the exact points that otherwise assume voice —
+// appending them only here (at the very end of the prompt) was tried first and
+// didn't reliably override the earlier, more specific voice-only instructions
+// (e.g. "say this exactly", "do NOT send the link yourself"). This instruction
+// is now scoped to just the one thing that has no inline home: reporting intent
+// early, before the corresponding action tool completes.
 const CHAT_SESSION_INSTRUCTION =
-  "\n\n[If {{is_chat_session}} is true: this is a text chat, not a phone call — " +
-  "report the customer's decision immediately via report_customer_intent as soon " +
-  "as it becomes clear (wants_confirm / wants_reschedule / wants_cancel / other), " +
-  "even before you've completed the corresponding action (e.g. before you've " +
-  "collected a reschedule date). Call this silently — never mention the tool to " +
-  "the customer. If service_link_enabled tools are available and you reach the " +
-  "point of sending the service link, call get_service_link and paste the " +
-  "returned URL directly into your reply, in addition to it being emailed.]";
+  "\n\n[If {{is_chat_session}} is true: report the customer's decision immediately " +
+  "via report_customer_intent as soon as it becomes clear (wants_confirm / " +
+  "wants_reschedule / wants_cancel / other), even before you've completed the " +
+  "corresponding action (e.g. before you've collected a reschedule date). Call " +
+  "this silently — never mention the tool to the customer.]";
 
 function buildSubagentNode(callType) {
   const parts = [];
