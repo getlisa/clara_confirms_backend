@@ -8,9 +8,14 @@
  *     job_id?:         string|number,  // for open_job_due_soon
  *     quotation_id?:   number,  // for quotation_pending
  *     phone_number?:   string,  // optional manual override; dials this number (normalized to E.164) instead of the target's on-file number
+ *     email?:          string,  // optional manual override; emails this address instead of the customer's on-file email (channel: "web_chat" only)
  *     immediate?:      boolean (default true),
  *     force?:          boolean (default false),
  *     scheduled_at?:   string (ISO; ignored when immediate=true)
+ *     channel?:        "voice" | "sms" | "web_chat" — explicit override for the
+ *                      Call Now / Text Now / Email Now buttons. "web_chat" emails
+ *                      a chat-link confirmation instead of dialing/texting — requires
+ *                      the customer to have an email on file (422 "missing_email" if not).
  *   }
  *
  * The actual `call_type` written to scheduled_calls (e.g. "customer_confirmation")
@@ -41,9 +46,10 @@ router.post("/", async (req, res) => {
       jobId:         req.body?.job_id != null ? String(req.body.job_id) : undefined,
       quotationId:   req.body?.quotation_id != null ? Number(req.body.quotation_id) : undefined,
       phoneNumber:   req.body?.phone_number != null ? String(req.body.phone_number) : undefined,
+      email:         req.body?.email != null ? String(req.body.email) : undefined,
       immediate:     req.body?.immediate !== false,         // default true
       force:         req.body?.force === true,              // default false
-      channel:       req.body?.channel === "sms" ? "sms" : req.body?.channel === "voice" ? "voice" : null, // "Call Now" vs "Text Now"
+      channel:       ["voice", "sms", "web_chat"].includes(req.body?.channel) ? req.body.channel : null, // "Call Now" / "Text Now" / "Email Now"
       scheduledAt:   req.body?.scheduled_at || null,
     });
 

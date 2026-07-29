@@ -2,11 +2,13 @@
  * Chat links — generate + resolve shareable, token-based links to a web chat
  * widget for a specific job/appointment.
  *
- * POST /chat-links/appointments/:id  — authenticated (staff), generates/reuses a link
- * POST /chat-links/jobs/:id          — authenticated (staff), generates/reuses a link
- * GET  /chat-links/:token            — PUBLIC, no auth — the token IS the credential.
- *                                       Opened by an anonymous customer's browser, so
- *                                       CORS is intentionally opened wide for this one route.
+ * POST /chat-links/appointments/:id            — authenticated (staff), generates/reuses a link
+ * POST /chat-links/jobs/:id                    — authenticated (staff), generates/reuses a link
+ * POST /chat-links/appointments/:id/send-email — authenticated (staff), same as above + emails it
+ * POST /chat-links/jobs/:id/send-email         — authenticated (staff), same as above + emails it
+ * GET  /chat-links/:token                      — PUBLIC, no auth — the token IS the credential.
+ *                                                 Opened by an anonymous customer's browser, so
+ *                                                 CORS is intentionally opened wide for this one route.
  */
 
 const express = require("express");
@@ -46,6 +48,43 @@ router.post("/jobs/:id", authenticate, async (req, res) => {
   } catch (err) {
     logger.error("POST /chat-links/jobs/:id failed", { error: err.message });
     return res.status(500).json({ error: "Failed to create chat link" });
+  }
+});
+
+// "Send chat link" via email — creates/reuses the link (same as the plain
+// POST above) and additionally emails it to the customer on file, for a
+// button that actually delivers the link instead of just copying a URL.
+router.post("/appointments/:id/send-email", authenticate, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const callType = req.body?.call_type || "customer_confirmation";
+    const overrideEmail = req.body?.email != null ? String(req.body.email) : null;
+    const result = await chatLinksService.sendConfirmationEmailForAppointment(companyId, Number(req.params.id), callType, overrideEmail);
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+
+    return res.json(result);
+  } catch (err) {
+    logger.error("POST /chat-links/appointments/:id/send-email failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to send confirmation email" });
+  }
+});
+
+router.post("/jobs/:id/send-email", authenticate, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const callType = req.body?.call_type || "customer_confirmation";
+    const overrideEmail = req.body?.email != null ? String(req.body.email) : null;
+    const result = await chatLinksService.sendConfirmationEmailForJob(companyId, Number(req.params.id), callType, overrideEmail);
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+
+    return res.json(result);
+  } catch (err) {
+    logger.error("POST /chat-links/jobs/:id/send-email failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to send confirmation email" });
   }
 });
 

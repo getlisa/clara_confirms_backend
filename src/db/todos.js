@@ -9,6 +9,7 @@ const TODO_TYPES = {
   UNCONFIRMED: "UNCONFIRMED",
   APPOINTMENT_NEEDED: "APPOINTMENT_NEEDED",
   MISSING_PHONE: "MISSING_PHONE",
+  MISSING_EMAIL: "MISSING_EMAIL",
   SERVICE_OPPORTUNITY: "SERVICE_OPPORTUNITY",
   SERVICE_LINK: "SERVICE_LINK",
   CRM_SYNC: "CRM_SYNC",
@@ -49,6 +50,45 @@ async function createMissingPhone({ companyId, jobId, subjectKind, subjectName, 
     `INSERT INTO todo_logs (todo_id, company_id, actor_type, event_type, change)
      VALUES ($1, $2, 'system', 'created', $3)`,
     [todo.id, companyId, JSON.stringify({ type: "MISSING_PHONE", priority: "high", subjectKind, jobId })]
+  );
+  return todo;
+}
+
+/**
+ * Create a MISSING_EMAIL todo when the scheduler can't dispatch a web_chat
+ * confirmation link because the customer has no email on file. Mirrors
+ * createMissingPhone exactly (same idempotent re-use, same shape) — the
+ * chat-link flow needs an email instead of a phone number to deliver to.
+ */
+async function createMissingEmail({ companyId, jobId, subjectKind, subjectName, callType, reason, metadata = {}, isTest = false }) {
+  const existing = await db.query(
+    `SELECT id FROM todos
+     WHERE company_id = $1 AND type = 'MISSING_EMAIL' AND status = 'open' AND is_test = $2
+       AND metadata->>'job_id' = $3
+       AND metadata->>'subject_kind' = $4
+     LIMIT 1`,
+    [companyId, isTest, String(jobId), subjectKind]
+  );
+  if (existing.rows.length > 0) return existing.rows[0];
+
+  const fullMeta = {
+    job_id: String(jobId),
+    subject_kind: subjectKind,         // 'customer' | 'technician'
+    subject_name: subjectName || null,
+    call_type: callType || null,
+    reason: reason || "Email address not provided",
+    ...metadata,
+  };
+  const r = await db.query(
+    `INSERT INTO todos (company_id, type, priority, is_test, metadata, notes)
+     VALUES ($1, 'MISSING_EMAIL', 'high', $2, $3, $4) RETURNING *`,
+    [companyId, isTest, JSON.stringify(fullMeta), fullMeta.reason]
+  );
+  const todo = r.rows[0];
+  await db.query(
+    `INSERT INTO todo_logs (todo_id, company_id, actor_type, event_type, change)
+     VALUES ($1, $2, 'system', 'created', $3)`,
+    [todo.id, companyId, JSON.stringify({ type: "MISSING_EMAIL", priority: "high", subjectKind, jobId })]
   );
   return todo;
 }
@@ -228,4 +268,4 @@ async function getLogs(todoId, companyId) {
   return result.rows;
 }
 
-module.exports = { TODO_TYPES, deriveTodoType, create, createMissingPhone, list, updateStatus, assign, getLogs };
+module.exports = { TODO_TYPES, deriveTodoType, create, createMissingPhone, createMissingEmail, list, updateStatus, assign, getLogs };

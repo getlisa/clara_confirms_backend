@@ -25,6 +25,7 @@ const chatLinksDb = require("../db/chat-links");
 const { HYDRATORS } = require("./call-hydration");
 const db = require("../db");
 const retell = require("./retell");
+const chatLinkEmail = require("./chat-link-email");
 const { formatSpokenDateTime, formatSpokenDateOnly } = require("../utils/timezone");
 
 // Sent as the synthetic first "user" turn to reliably trigger the agent's
@@ -162,6 +163,72 @@ async function loadLinkContext(link) {
   if (!hydrated.ok) return hydrated;
 
   return { ok: true, company, hydrated };
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Send (or re-send) a link's confirmation email — the manual, staff-triggered
+ * counterpart to the scheduler's automatic web_chat dispatch
+ * (src/services/scheduler.js), reusing the exact same chat-link-email.js
+ * delivery. Idempotent on the link itself (same token every time); re-sends
+ * the email each call, same as clicking "resend."
+ *
+ * @param {object} link
+ * @param {string|null} [overrideEmail] — send here instead of the customer's
+ *   on-file email. Same idea as a manual phone_number override on
+ *   POST /calls/manual: ServiceTrade-synced customers almost never have an
+ *   email on the *customer* record (it lives on a separate ServiceTrade
+ *   Contact, not synced locally) — this lets staff supply one at send-time
+ *   without requiring it to already be on file.
+ */
+async function sendConfirmationEmail(link, overrideEmail = null) {
+  const ctx = await loadLinkContext(link);
+  if (!ctx.ok) return ctx;
+  const { company, hydrated } = ctx;
+
+  let email = overrideEmail || null;
+  if (email && !EMAIL_RE.test(email)) {
+    return { ok: false, status: 400, error: "Invalid email — could not validate as an email address." };
+  }
+  if (!email) {
+    const { rows } = await db.query(
+      `SELECT c.email FROM jobs j JOIN customers c ON c.id = j.customer_id
+       WHERE j.id = $1 AND j.company_id = $2`,
+      [link.job_id, link.company_id]
+    );
+    email = rows[0]?.email || null;
+  }
+  if (!email) {
+    return {
+      ok: false, status: 422,
+      error: "Customer has no email on file. Pass email to send to a specific address.",
+    };
+  }
+
+  const sent = await chatLinkEmail.sendConfirmationLinkEmail({
+    email,
+    customerName: hydrated.params.customerName || null,
+    companyName: company.name,
+    jobName: hydrated.params.jobName || null,
+    token: link.token,
+  });
+
+  return { ok: true, token: link.token, email, sent };
+}
+
+async function sendConfirmationEmailForAppointment(companyId, appointmentId, callType = "customer_confirmation", overrideEmail = null) {
+  const created = await createChatLinkForAppointment(companyId, appointmentId, callType);
+  if (!created.ok) return created;
+  const link = await chatLinksDb.getByToken(created.token);
+  return sendConfirmationEmail(link, overrideEmail);
+}
+
+async function sendConfirmationEmailForJob(companyId, jobId, callType = "customer_confirmation", overrideEmail = null) {
+  const created = await createChatLinkForJob(companyId, jobId, callType);
+  if (!created.ok) return created;
+  const link = await chatLinksDb.getByToken(created.token);
+  return sendConfirmationEmail(link, overrideEmail);
 }
 
 /**
@@ -314,6 +381,8 @@ async function sendChatMessage(token, content) {
 module.exports = {
   createChatLinkForAppointment,
   createChatLinkForJob,
+  sendConfirmationEmailForAppointment,
+  sendConfirmationEmailForJob,
   resolveChatLink,
   sendChatMessage,
   filterVisibleMessages,

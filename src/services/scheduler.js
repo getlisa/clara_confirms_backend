@@ -7,6 +7,8 @@ const todosDb = require("../db/todos");
 const { computeInitialPriority } = require("./call-priority");
 const { resolveOutboundChannel } = require("./channel-resolver");
 const retell = require("./retell");
+const chatLinksService = require("./chat-links");
+const chatLinkEmail = require("./chat-link-email");
 const logger = require("../utils/logger");
 
 const isDev = process.env.NODE_ENV === "development";
@@ -155,6 +157,57 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         .replace(/\{\{company_name\}\}/g,        co.company_name || "our company")
         .replace(/\{\{location_name\}\}/g,       (row.call_context && row.call_context.location_name) || "your location");
 
+      if (row.channel === "web_chat") {
+        // Chat link delivery — no live call/chat session yet, just an emailed
+        // link to the same stateful chat interface staff-triggered links use.
+        // retell_call_id stays null until the customer actually opens it.
+        const deliveryMethod = (await callSettingsDb.getByCompanyId(row.company_id)).chat_link_delivery_method;
+        if (deliveryMethod !== "email") {
+          logger.warn("Dispatcher: chat_link_delivery_method is not yet implemented beyond email — sending email anyway", {
+            ...ctx, configuredMethod: deliveryMethod,
+          });
+        }
+
+        // A manually-supplied email (e.g. the "Email Now" button, when the
+        // customer record itself has none — the common case for ServiceTrade-
+        // synced customers, whose email lives on a separate Contact, not
+        // synced here) travels through call_context since this dispatch step
+        // re-reads the row from the DB and has no other way to see it.
+        const overrideEmail = row.call_context?.override_email || null;
+        let customerEmail = overrideEmail;
+        if (!customerEmail) {
+          const { rows: custRows } = await db.query(
+            `SELECT c.email FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
+            [row.job_id, row.company_id]
+          );
+          customerEmail = custRows[0]?.email || null;
+        }
+        if (!customerEmail) {
+          // Contact-completeness is normally checked before the row is even
+          // created (processScheduledUnconfirmed) — this only fires if the
+          // email was removed in between scheduling and dispatch.
+          throw new Error("Customer email no longer on file — cannot dispatch web_chat confirmation");
+        }
+
+        const linkResult = row.appointment_id
+          ? await chatLinksService.createChatLinkForAppointment(row.company_id, row.appointment_id, row.call_type)
+          : await chatLinksService.createChatLinkForJob(row.company_id, row.job_id, row.call_type);
+        if (!linkResult.ok) throw new Error(linkResult.error || "Failed to create chat link");
+
+        const emailSent = await chatLinkEmail.sendConfirmationLinkEmail({
+          email: customerEmail,
+          customerName: row.customer_name,
+          companyName: co.company_name || "our company",
+          jobName: row.job_name,
+          token: linkResult.token,
+        });
+
+        await scheduledCallsDb.markCompletedWithChatLink(row.id, linkResult.token);
+        logger.info("Dispatcher: fired (web_chat)", { ...ctx, token: linkResult.token, emailSent });
+        fired++;
+        continue;
+      }
+
       const isSms = row.channel === "sms";
       const call = isSms
         ? await retell.createSmsChat({
@@ -232,6 +285,17 @@ async function runDailyJob({ companyId = null, respectAutoFlag = true, engine = 
         continue;
       }
 
+      // Independent of trigger config — falls unopened chat-link confirmations
+      // back to voice regardless of which trigger originally scheduled them.
+      try {
+        const { fallenBack } = await processUnopenedChatLinks(co.id);
+        if (fallenBack > 0) {
+          logger.info("Daily job: unopened chat links fell back to voice", { companyId: co.id, fallenBack });
+        }
+      } catch (err) {
+        logger.error("Daily job: unopened chat-link watchdog error", { companyId: co.id, error: err.message });
+      }
+
       const triggers = await callTriggerConfigsDb.getEnabledByCompanyId(co.id);
       if (triggers.length === 0) {
         logger.info("Daily job: skipped company — no enabled triggers", { companyId: co.id });
@@ -289,6 +353,61 @@ async function scheduleCall(params) {
   }
 }
 
+// A web_chat confirmation whose link has sat unopened this long is treated
+// as the "no answer" equivalent — there's no chat_ended/chat_analyzed webhook
+// to react to if the customer never opened it at all, so this can't reuse the
+// existing webhook-driven retry path and instead falls back to voice.
+const CHAT_LINK_UNOPENED_WINDOW_HOURS = 48;
+
+async function processUnopenedChatLinks(companyId) {
+  const { rows } = await db.query(
+    `SELECT sc.id, sc.job_id, sc.appointment_id, sc.call_type, sc.customer_name,
+            sc.job_name, sc.job_description, sc.job_type, sc.job_date,
+            sc.is_test, sc.max_attempts, sc.phone_number
+     FROM scheduled_calls sc
+     JOIN chat_links cl ON cl.token = sc.chat_link_token
+     WHERE sc.company_id = $1
+       AND sc.channel = 'web_chat'
+       AND sc.status = 'completed'
+       AND sc.chat_link_token IS NOT NULL
+       AND cl.retell_chat_id IS NULL
+       AND sc.updated_at < NOW() - INTERVAL '${CHAT_LINK_UNOPENED_WINDOW_HOURS} hours'`,
+    [companyId]
+  );
+
+  let fallenBack = 0;
+  for (const row of rows) {
+    const jobId = String(row.job_id);
+    if (await scheduledCallsDb.existsForCustomerJob(companyId, jobId, row.call_type, row.is_test)) {
+      logger.info("Scheduler [unopened_chat_link]: skipped — a call already exists for this job", { companyId, jobId });
+      continue;
+    }
+
+    const inserted = await scheduleCall({
+      companyId, callType: row.call_type,
+      phoneNumber: row.phone_number,
+      jobId, jobDate: row.job_date,
+      appointmentId: row.appointment_id || null,
+      customerName: row.customer_name,
+      jobName: row.job_name || null,
+      jobDescription: row.job_description || null,
+      jobType: row.job_type || null,
+      scheduledAt: new Date(), isTest: row.is_test, maxAttempts: row.max_attempts,
+      callPriority: "retry",
+      channel: "voice",
+    });
+    if (!inserted) continue;
+
+    await db.query(
+      `UPDATE scheduled_calls SET status = 'failed', failure_reason = 'chat_link_unopened', updated_at = NOW() WHERE id = $1`,
+      [row.id]
+    );
+    logger.info("Scheduler [unopened_chat_link]: fell back to voice", { companyId, jobId, scheduledCallId: row.id });
+    fallenBack++;
+  }
+  return { fallenBack };
+}
+
 async function processTrigger(companyId, trigger, callSettings, tz, smsLive = false) {
   switch (trigger.trigger_type) {
     case "scheduled_unconfirmed":  return processScheduledUnconfirmed(companyId, trigger, callSettings, tz, smsLive);
@@ -326,7 +445,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz,
             j.id AS job_id, j.scheduled_date, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
             a.id AS appointment_id, a.status AS appointment_status,
-            c.phone AS customer_phone, c.full_name AS customer_name,
+            c.phone AS customer_phone, c.email AS customer_email, c.full_name AS customer_name,
             c.address_line1, c.city, c.state, c.preferred_channel
      FROM jobs j
      JOIN appointments a ON a.job_id = j.id AND a.status IN ('scheduled','rescheduled')
@@ -370,6 +489,21 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz,
       smsLive, preferredChannel: row.preferred_channel,
       channelStrategy: callSettings.channel_strategy, attemptNumber: 1,
     });
+
+    // Contact-completeness gate — web_chat delivers by email (this phase),
+    // so an appointment can't dispatch that way without one on file. Flag it
+    // for staff instead of silently skipping or guessing another channel;
+    // the next sweep picks it up normally once the email is added.
+    if (channel === "web_chat" && !row.customer_email) {
+      await todosDb.createMissingEmail({
+        companyId, jobId, subjectKind: "customer",
+        subjectName: row.customer_name, callType: trigger.call_type,
+        reason: "Customer email not provided — confirmation chat link could not be sent.",
+        isTest: isDev,
+      });
+      logger.info("Scheduler [scheduled_unconfirmed]: todo created — customer missing email for web_chat dispatch", { companyId, jobId, customer: row.customer_name });
+      s++; continue;
+    }
 
     const inserted = await scheduleCall({
       companyId, callType: trigger.call_type,
@@ -640,4 +774,4 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
   return { c, s };
 }
 
-module.exports = { runDispatcher, runDailyJob, isWithinActiveHours, getNextWindowStart };
+module.exports = { runDispatcher, runDailyJob, isWithinActiveHours, getNextWindowStart, processUnopenedChatLinks };

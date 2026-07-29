@@ -16,7 +16,7 @@
  * @param {number} [opts.attemptNumber=1]       — 1 for the first attempt, 2+ for retries
  * @param {boolean} [opts.isCallback=false]     — true when scheduling a customer-requested callback
  * @param {boolean} [opts.smsOnCallbackEnabled=false] — call_settings.sms_on_callback_enabled
- * @returns {"voice"|"sms"}
+ * @returns {"voice"|"sms"|"web_chat"}
  */
 function resolveOutboundChannel({
   smsLive,
@@ -26,6 +26,11 @@ function resolveOutboundChannel({
   isCallback = false,
   smsOnCallbackEnabled = false,
 }) {
+  // web_chat_only has no SMS/A2P dependency at all (that's the whole point of
+  // the chat-link flow — it sidesteps SMS entirely), so this is checked before
+  // the smsLive safety net below, not after it.
+  if (channelStrategy === "web_chat_only") return "web_chat";
+
   // Hard safety net — never depends on the UI having blocked an invalid state.
   // If SMS isn't actually live for this company, every path falls back to voice.
   if (!smsLive) return "voice";

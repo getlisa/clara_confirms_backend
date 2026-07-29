@@ -301,6 +301,10 @@ async function claimPending(batchSize = 10, { companyId = null, respectAutoFlag 
   // Within this batch, dedupe by phone number — keep only the earliest-scheduled,
   // highest-priority call per phone. The rest go back to pending so the next
   // dispatcher tick can pick them up after the first one finishes.
+  // phone_number is nullable (web_chat dispatch, or any customer with none on
+  // file) — a JS Set treats every `null` as equal to every other `null`, which
+  // would wrongly collapse unrelated null-phone rows into "duplicates" of each
+  // other, so those never go through this dedupe at all; each is always kept.
   const seen = new Set();
   const winners = [];
   const losers  = [];
@@ -310,6 +314,7 @@ async function claimPending(batchSize = 10, { companyId = null, respectAutoFlag 
     return new Date(a.scheduled_at) - new Date(b.scheduled_at);
   });
   for (const row of sorted) {
+    if (!row.phone_number) { winners.push(row); continue; }
     if (seen.has(row.phone_number)) { losers.push(row); continue; }
     seen.add(row.phone_number);
     winners.push(row);
@@ -330,6 +335,18 @@ async function markCompleted(id, retellCallId) {
   await db.query(
     `UPDATE scheduled_calls SET status = 'completed', retell_call_id = $2, updated_at = NOW() WHERE id = $1`,
     [id, retellCallId]
+  );
+}
+
+/**
+ * Web-chat dispatch: the "call" here is an emailed chat link, not a live
+ * call/chat session — retell_call_id stays null until the customer actually
+ * opens the link (chat-links.js sets chat_links.retell_chat_id at that point).
+ */
+async function markCompletedWithChatLink(id, chatLinkToken) {
+  await db.query(
+    `UPDATE scheduled_calls SET status = 'completed', chat_link_token = $2, updated_at = NOW() WHERE id = $1`,
+    [id, chatLinkToken]
   );
 }
 
@@ -400,6 +417,7 @@ module.exports = {
   create,
   claimPending,
   markCompleted,
+  markCompletedWithChatLink,
   markFailedOrRetry,
   advanceToNextWindow,
   scheduleRetry,
