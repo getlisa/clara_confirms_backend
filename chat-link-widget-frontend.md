@@ -95,8 +95,20 @@ No auth header — fetched from an anonymous customer's browser.
 ```
 `messages` only ever contains real chat turns (`role: "agent" | "user"`) —
 internal tool-call/routing plumbing is already filtered out server-side.
-Calling this again later (e.g. the customer reopens the link) resumes the
-same conversation and returns the full history, not a fresh greeting.
+Calling this again later (e.g. the customer reopens the link, or just
+refreshes the page) resumes the same conversation and returns the full
+history — no special "reopen" endpoint needed, this is just what `GET` does.
+
+If enough time has passed that the underlying session timed out from
+inactivity, this same `GET` transparently starts a fresh session behind the
+scenes instead of erroring: the response still contains the full prior
+history, followed by a new opening-style greeting, and `state`/`input_hint`
+reset back to `chat_started`/`quick_replies` for that new turn (the agent's
+own next tool calls will reflect whatever's actually true in the platform —
+e.g. if the appointment was already confirmed before the gap, it'll pick that
+up rather than re-asking from scratch). Nothing distinguishes this response
+shape from a normal resume — treat it the same way, just render the returned
+`messages` in order.
 
 ### State reference
 | State | Meaning |
