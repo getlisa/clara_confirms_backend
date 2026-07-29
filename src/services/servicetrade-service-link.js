@@ -157,9 +157,77 @@ async function raiseServiceLinkTodo(companyId, callId, retellCallId, reason, ext
 }
 
 /**
+ * Resolve the recorded recipient for a conversation and actually send the
+ * ServiceTrade service-link email right now. Shared by:
+ *  - the post-call voice flow (postCallServiceLink, below), after its own
+ *    callType/outcome checks, and
+ *  - the live get_service_link chat tool (src/routes/retell-tools.js), fired
+ *    the instant the agent shares the link — chat has no reliable "post-call"
+ *    moment to wait for (the session can stay open indefinitely), so email
+ *    delivery can't be deferred the way it is for voice.
+ * Best-effort — never throws. Anything not sent → status + SERVICE_LINK todo.
+ * Idempotent: a row already `sent` is a no-op (e.g. the agent re-shares the
+ * link later in the same chat — don't re-email every time).
+ *
+ * @param {object} args
+ * @param {number|string} args.companyId
+ * @param {string} args.retellCallId
+ * @param {number|null} [args.scheduledCallId]
+ * @param {number|null} [args.callId]
+ */
+async function sendRecordedServiceLink({ companyId, retellCallId, scheduledCallId = null, callId = null }) {
+  if (!(await isServiceLinkEnabled(companyId))) {
+    logger.info("service-link: service_link_enabled is FALSE for company; skipping", { companyId, retellCallId });
+    return { sent: false, reason: "disabled" };
+  }
+
+  const row = await serviceLinkMessagesDb.getByRetellCallId(companyId, retellCallId);
+  if (row?.status === "sent") {
+    return { sent: true, reason: "already_sent", messageId: row.servicetrade_message_id ?? null };
+  }
+
+  if (!row || !row.contact_id || !row.email) {
+    logger.info("service-link: no recipient captured; marking skipped + todo", { companyId, retellCallId, hasRow: !!row });
+    await serviceLinkMessagesDb.markSkipped({
+      companyId, scheduledCallId: scheduledCallId ?? row?.scheduled_call_id ?? null, retellCallId,
+      jobExternalRef: row?.job_external_ref ?? null,
+      reason: "No service-link recipient (contact/email) was captured.",
+    });
+    await raiseServiceLinkTodo(companyId, callId, retellCallId, "Send the customer the service link — no recipient was captured.");
+    return { sent: false, reason: "no_recipient" };
+  }
+
+  if (!row.job_external_ref) {
+    logger.warn("service-link: no job external_ref on the recipient row; cannot target the job", { companyId, retellCallId, rowId: row.id });
+    await serviceLinkMessagesDb.markFailed(row.id, "No ServiceTrade job id to point the service link at.");
+    await raiseServiceLinkTodo(companyId, callId, retellCallId, "Service link could not be sent — the job is not linked to ServiceTrade.", { contact_id: row.contact_id, email: row.email });
+    return { sent: false, reason: "no_job_ref" };
+  }
+
+  try {
+    const result = await sendServiceLink(companyId, { contactId: row.contact_id, jobExternalRef: row.job_external_ref });
+    if (result.ok) {
+      await serviceLinkMessagesDb.markSent(row.id, result.messageId);
+      logger.info("service-link: sent OK", { companyId, retellCallId, messageId: result.messageId, contactId: row.contact_id });
+      return { sent: true, messageId: result.messageId };
+    }
+    const err = JSON.stringify(result.messages || { status: result.status, failureCount: result.failureCount });
+    await serviceLinkMessagesDb.markFailed(row.id, err);
+    await raiseServiceLinkTodo(companyId, callId, retellCallId, "Service link email failed to send — please resend from ServiceTrade.", { contact_id: row.contact_id, email: row.email, status: result.status });
+    logger.error("service-link: send failed", { companyId, retellCallId, status: result.status, messages: result.messages });
+    return { sent: false, reason: "send_failed" };
+  } catch (err) {
+    await serviceLinkMessagesDb.markFailed(row.id, err.message);
+    await raiseServiceLinkTodo(companyId, callId, retellCallId, "Service link email errored — please resend from ServiceTrade.", { contact_id: row.contact_id, email: row.email });
+    logger.error("service-link: send threw", { companyId, retellCallId, error: err.message });
+    return { sent: false, reason: "error" };
+  }
+}
+
+/**
  * Post-call: email the job's service link for a confirmed customer_confirmation
- * call. Uses the `pending` recipient recorded live during the call. Best-effort —
- * never throws into the webhook path. Anything not sent → status + SERVICE_LINK todo.
+ * call. Voice-specific gating (callType, confirmed outcome) then delegates the
+ * actual resolve/send/mark logic to sendRecordedServiceLink.
  *
  * @param {object} args
  * @param {number|string} args.companyId
@@ -177,46 +245,8 @@ async function postCallServiceLink({ companyId, scheduledCall, outcome, retellCa
     logger.info("service-link: appointment not confirmed; skipping", { companyId, retellCallId, appointmentConfirmed: outcome?.appointmentConfirmed });
     return;
   }
-  if (!(await isServiceLinkEnabled(companyId))) {
-    logger.info("service-link: service_link_enabled is FALSE for company; skipping", { companyId, retellCallId });
-    return;
-  }
 
-  const row = await serviceLinkMessagesDb.getByRetellCallId(companyId, retellCallId);
-  if (!row || !row.contact_id || !row.email) {
-    logger.info("service-link: confirmed but no recipient captured during the call; marking skipped + todo", { companyId, retellCallId, hasRow: !!row });
-    await serviceLinkMessagesDb.markSkipped({
-      companyId, scheduledCallId: scheduledCall?.id ?? null, retellCallId,
-      jobExternalRef: row?.job_external_ref ?? null,
-      reason: "Customer confirmed but no service-link recipient (contact/email) was captured on the call.",
-    });
-    await raiseServiceLinkTodo(companyId, callId, retellCallId, "Customer confirmed — send them the service link (no recipient captured on the call).");
-    return;
-  }
-
-  if (!row.job_external_ref) {
-    logger.warn("service-link: no job external_ref on the recipient row; cannot target the job", { companyId, retellCallId, rowId: row.id });
-    await serviceLinkMessagesDb.markFailed(row.id, "No ServiceTrade job id to point the service link at.");
-    await raiseServiceLinkTodo(companyId, callId, retellCallId, "Service link could not be sent — the job is not linked to ServiceTrade.", { contact_id: row.contact_id, email: row.email });
-    return;
-  }
-
-  try {
-    const result = await sendServiceLink(companyId, { contactId: row.contact_id, jobExternalRef: row.job_external_ref });
-    if (result.ok) {
-      await serviceLinkMessagesDb.markSent(row.id, result.messageId);
-      logger.info("service-link: sent OK", { companyId, retellCallId, messageId: result.messageId, contactId: row.contact_id });
-    } else {
-      const err = JSON.stringify(result.messages || { status: result.status, failureCount: result.failureCount });
-      await serviceLinkMessagesDb.markFailed(row.id, err);
-      await raiseServiceLinkTodo(companyId, callId, retellCallId, "Service link email failed to send — please resend from ServiceTrade.", { contact_id: row.contact_id, email: row.email, status: result.status });
-      logger.error("service-link: send failed", { companyId, retellCallId, status: result.status, messages: result.messages });
-    }
-  } catch (err) {
-    await serviceLinkMessagesDb.markFailed(row.id, err.message);
-    await raiseServiceLinkTodo(companyId, callId, retellCallId, "Service link email errored — please resend from ServiceTrade.", { contact_id: row.contact_id, email: row.email });
-    logger.error("service-link: send threw", { companyId, retellCallId, error: err.message });
-  }
+  await sendRecordedServiceLink({ companyId, retellCallId, scheduledCallId: scheduledCall?.id ?? null, callId });
 }
 
 module.exports = {
@@ -228,5 +258,6 @@ module.exports = {
   createContact,
   sendServiceLink,
   isServiceLinkEnabled,
+  sendRecordedServiceLink,
   postCallServiceLink,
 };
