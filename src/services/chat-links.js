@@ -165,18 +165,14 @@ async function loadLinkContext(link) {
 }
 
 /**
- * Ensure a real Retell chat session exists for this link, creating it (and
- * triggering the opening message) on first open, or resuming it otherwise.
- * Race-safe: two near-simultaneous first-opens only leave one live session.
- * @returns {Promise<{chatId:string, messages:Array}>}
+ * Create a brand-new Retell chat session for this link and trigger its
+ * opening message. Shared by first-open and reopen-after-expiry — the only
+ * difference is how the winning chat_id gets written back (claim onto a null
+ * column vs. compare-and-swap off a known-dead one), so `persist` supplies
+ * that one call and this does the create/race/trigger mechanics once.
  */
-async function getOrCreateSession(link, dynamicVariables, chatAgentId) {
+async function createAndTriggerSession(link, dynamicVariables, chatAgentId, persist) {
   const client = retell.getClient();
-
-  if (link.retell_chat_id) {
-    const chat = await client.chat.retrieve(link.retell_chat_id);
-    return { chatId: link.retell_chat_id, messages: filterVisibleMessages(chat.message_with_tool_calls) };
-  }
 
   const created = await client.chat.create({
     agent_id: chatAgentId,
@@ -184,7 +180,7 @@ async function getOrCreateSession(link, dynamicVariables, chatAgentId) {
     metadata: { company_id: String(link.company_id), call_type: link.call_type, channel: "web_chat" },
   });
 
-  const claimed = await chatLinksDb.claimRetellChatId(link.id, created.chat_id);
+  const claimed = await persist(created.chat_id);
   if (!claimed) {
     // Another concurrent request already won the race — discard our
     // just-created (now orphaned) session and adopt the winner's.
@@ -194,9 +190,50 @@ async function getOrCreateSession(link, dynamicVariables, chatAgentId) {
     return { chatId: winner.retell_chat_id, messages: filterVisibleMessages(chat.message_with_tool_calls) };
   }
 
-  // Trigger the opening message — empty content, no fake user turn appears.
+  // Trigger the opening message — synthetic content, no fake user turn appears.
   const completion = await client.chat.createChatCompletion({ chat_id: created.chat_id, content: CHAT_TRIGGER_MESSAGE });
   return { chatId: created.chat_id, messages: filterVisibleMessages(completion.messages) };
+}
+
+/**
+ * Ensure a real, LIVE Retell chat session exists for this link — creating one
+ * (and triggering the opening message) on first open, resuming it if it's
+ * still active, or transparently reopening with a fresh session if the prior
+ * one can no longer generate new turns.
+ *
+ * Retell auto-closes a chat after a period of silence (end_chat_after_silence_ms
+ * on the chat agent); once chat_status is "ended" (or "error"), createChatCompletion
+ * on that chat_id no longer works. A customer coming back to an old link after
+ * that point needs a fresh session, not a resume — but they should still see
+ * their prior conversation above the new turn, so we prepend it rather than
+ * discarding it. State resets to chat_started for the new session; the agent's
+ * own get_job/get_appointment tool calls will naturally reflect whatever the
+ * platform's real, current state is (e.g. already confirmed) regardless of
+ * what chat_links.state says, same as any voice/SMS callback would.
+ *
+ * Race-safe in both directions: two near-simultaneous first-opens, or two
+ * near-simultaneous reopens of the same dead session, only leave one live
+ * session behind.
+ * @returns {Promise<{chatId:string, messages:Array}>}
+ */
+async function getOrCreateSession(link, dynamicVariables, chatAgentId) {
+  const client = retell.getClient();
+
+  if (link.retell_chat_id) {
+    const chat = await client.chat.retrieve(link.retell_chat_id);
+    if (chat.chat_status === "ended" || chat.chat_status === "error") {
+      const priorMessages = filterVisibleMessages(chat.message_with_tool_calls);
+      const reopened = await createAndTriggerSession(link, dynamicVariables, chatAgentId, (newChatId) =>
+        chatLinksDb.reopen(link.id, link.retell_chat_id, newChatId)
+      );
+      return { chatId: reopened.chatId, messages: [...priorMessages, ...reopened.messages] };
+    }
+    return { chatId: link.retell_chat_id, messages: filterVisibleMessages(chat.message_with_tool_calls) };
+  }
+
+  return createAndTriggerSession(link, dynamicVariables, chatAgentId, (newChatId) =>
+    chatLinksDb.claimRetellChatId(link.id, newChatId)
+  );
 }
 
 async function resolveChatLink(token) {
@@ -254,13 +291,12 @@ async function sendChatMessage(token, content) {
     tz,
   });
 
-  // Defensive — ensures a session exists even if a message somehow arrives
-  // before the first GET (getOrCreateSession no-ops into a resume otherwise).
-  let chatId = link.retell_chat_id;
-  if (!chatId) {
-    const session = await getOrCreateSession(link, dynamicVariables, company.retell_chat_agent_id);
-    chatId = session.chatId;
-  }
+  // Always routed through getOrCreateSession (not just when no chat_id exists
+  // yet) so a message sent against an already-expired session (e.g. the page
+  // was left open past the inactivity timeout without a fresh GET) still gets
+  // transparently reopened instead of erroring against a dead chat_id.
+  const session = await getOrCreateSession(link, dynamicVariables, company.retell_chat_agent_id);
+  const chatId = session.chatId;
 
   const client = retell.getClient();
   const completion = await client.chat.createChatCompletion({ chat_id: chatId, content });

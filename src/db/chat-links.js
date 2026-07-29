@@ -84,7 +84,23 @@ async function setState(chatId, state) {
   return result.rows[0] || null; // null is expected/harmless for voice/SMS calls (no matching row)
 }
 
+/**
+ * Atomically swap in a fresh chat_id for a link whose previous Retell session
+ * can no longer accept new turns (ended/errored), resetting state back to
+ * chat_started for the new session. Compare-and-swap on the OLD chat_id, same
+ * pattern as claimRetellChatId, so two concurrent reopens of the same dead
+ * session only leave one live replacement behind.
+ */
+async function reopen(id, oldChatId, newChatId) {
+  const result = await db.query(
+    `UPDATE chat_links SET retell_chat_id = $1, state = 'chat_started'
+     WHERE id = $2 AND retell_chat_id = $3 RETURNING *`,
+    [newChatId, id, oldChatId]
+  );
+  return result.rows[0] || null;
+}
+
 module.exports = {
   findByAppointment, findByJob, create, getByToken, markOpened,
-  getByRetellChatId, claimRetellChatId, setState,
+  getByRetellChatId, claimRetellChatId, setState, reopen,
 };
