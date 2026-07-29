@@ -1024,7 +1024,34 @@ router.post("/get_service_link", async (req, res) => {
     // Chat state tracking — harmless no-op for voice/SMS.
     await chatLinksDb.setState(conversationId, "service_link_sent").catch(() => {});
 
-    logger.info("Tool: get_service_link", { companyId, jobRef: refs.job_ref });
+    // Chat has no reliable "post-call" moment to defer the actual email to —
+    // the session can stay open indefinitely (reschedule loops, the customer
+    // just going quiet, etc.) — so for a chat session, send the recorded
+    // recipient their ServiceTrade service-link email right now, the instant
+    // the agent shares it, rather than waiting on a webhook that may fire much
+    // later or (for a still-open chat) not at all yet. Voice keeps its
+    // existing post-call-only send (postCallServiceLink) — this is gated on
+    // an actual chat_links match so a voice call accidentally invoking this
+    // tool can't double-send.
+    //
+    // Awaited (not fire-and-forget): this may run on Vercel, where a
+    // serverless function's execution can be frozen the instant its response
+    // is sent — an un-awaited send here could silently never complete.
+    // sendRecordedServiceLink is itself best-effort/never-throws, so awaiting
+    // it just adds latency, not risk, to this tool's response.
+    const isChatSession = !!(await chatLinksDb.getByRetellChatId(conversationId));
+    let emailResult = null;
+    if (isChatSession) {
+      const serviceLink = require("../services/servicetrade-service-link");
+      emailResult = await serviceLink
+        .sendRecordedServiceLink({ companyId, retellCallId: conversationId, scheduledCallId: refs.scheduled_call_id ?? null })
+        .catch((err) => {
+          logger.error("Tool get_service_link: instant email send threw", { error: err.message, companyId, conversationId });
+          return null;
+        });
+    }
+
+    logger.info("Tool: get_service_link", { companyId, jobRef: refs.job_ref, isChatSession, emailResult });
     return res.json({ success: true, url, job_name: jobName });
   } catch (err) {
     logger.error("Tool get_service_link failed", { error: err.message });
