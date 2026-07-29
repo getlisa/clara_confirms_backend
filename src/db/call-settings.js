@@ -20,6 +20,7 @@ const DEFAULTS = {
   service_link_enabled:    false,
   channel_strategy:        "voice_only",
   sms_on_callback_enabled: false,
+  chat_link_delivery_method: "email",
 };
 
 function rowToSettings(row) {
@@ -33,6 +34,7 @@ function rowToSettings(row) {
     service_link_enabled:   row.service_link_enabled ?? false,
     channel_strategy:       row.channel_strategy ?? "voice_only",
     sms_on_callback_enabled: row.sms_on_callback_enabled ?? false,
+    chat_link_delivery_method: row.chat_link_delivery_method ?? "email",
   };
 }
 
@@ -42,7 +44,7 @@ const SELECT_COLS = `
   voicemail_message, agent_can_make_changes,
   auto_schedule_enabled, auto_dispatch_enabled,
   crm_comment_writeback_enabled, service_link_enabled,
-  channel_strategy, sms_on_callback_enabled
+  channel_strategy, sms_on_callback_enabled, chat_link_delivery_method
 `;
 
 async function getByCompanyId(companyId) {
@@ -60,7 +62,7 @@ async function upsert(companyId, fields) {
     "voicemail_message", "agent_can_make_changes",
     "auto_schedule_enabled", "auto_dispatch_enabled",
     "crm_comment_writeback_enabled", "service_link_enabled",
-    "channel_strategy", "sms_on_callback_enabled",
+    "channel_strategy", "sms_on_callback_enabled", "chat_link_delivery_method",
   ];
   const keys = Object.keys(fields).filter((k) => allowed.includes(k));
   if (keys.length === 0) return getByCompanyId(companyId);

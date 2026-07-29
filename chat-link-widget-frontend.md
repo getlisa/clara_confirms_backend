@@ -72,6 +72,42 @@ the same job/appointment returns the same token rather than minting a new one.
 **Errors:** `404` if the job/appointment doesn't exist for this company; `422`
 if the appointment is cancelled or its time has already passed.
 
+### Sending it by email — `POST /chat-links/appointments/:id/send-email` / `POST /chat-links/jobs/:id/send-email`
+Same auth, same idempotent link (re-using an existing token rather than
+minting a new one) — but this variant **also emails the link** to the
+customer, for an actual "Send chat link" button on the appointment card
+instead of the clipboard-copy-only flow above. Use this one if you want the
+button to really deliver the link, not just generate a URL for a human to
+paste somewhere.
+
+```json
+{ "call_type": "customer_confirmation", "email": "jack@example.com" }
+```
+Both fields optional. **`email`** sends to that address for this one send
+instead of requiring the customer to already have one on file — pass it
+whenever the caller has one in hand (e.g. a field the service manager just
+typed in). It is **not** saved back to the customer record.
+
+**Response `200`:**
+```json
+{ "token": "a4fce883…", "email": "customer@example.com", "sent": true }
+```
+`sent` mirrors whether the email actually went out (it's `true` even in local
+dev if SendGrid isn't configured — that's a no-op-but-successful send, not a
+failure).
+
+**Errors:** same `404`/`422` as above, plus:
+- **`422` `{ "error": "Customer has no email on file. Pass email to send to a specific address." }`**
+  if no `email` was given in the request and the customer has none on file
+  either. **This will happen a lot** — ServiceTrade-synced customers almost
+  never have `customers.email` populated (their real email lives on a
+  separate ServiceTrade Contact) — so don't dead-end on this error: prompt for
+  an address inline and resubmit with `email` set, same pattern as
+  `web-chat-dispatch-frontend.md`'s automatic-dispatch `MISSING_EMAIL` todo
+  suggests for the unattended path.
+- **`400` `{ "error": "Invalid email — could not validate as an email address." }`**
+  if the given `email` doesn't look like one.
+
 ---
 
 ## 3. Loading a conversation

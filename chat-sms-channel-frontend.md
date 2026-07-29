@@ -119,31 +119,73 @@ readiness gate — if SMS isn't live, "Always text" has no effect yet).
 
 ---
 
-## 3. Manual actions — "Call Now" vs "Text Now"
+## 3. Manual actions — "Call Now" / "Text Now" / "Email Now"
 
 ### `POST /calls/manual`
 New optional field:
 ```json
 { "trigger_type": "scheduled_unconfirmed", "appointment_id": 123, "channel": "sms" }
 ```
-`channel`: `"voice"` | `"sms"` (omit to let the backend resolve it the same way
-the scheduler would). When the frontend already shows two distinct buttons,
-send the explicit value — it always wins over any per-customer/company default.
+`channel`: `"voice"` | `"sms"` | `"web_chat"` (omit to let the backend resolve
+it the same way the scheduler would). When the frontend already shows
+distinct buttons, send the explicit value — it always wins over any
+per-customer/company default.
+
+**`"web_chat"` — "Email Now":** instead of dialing/texting, this emails the
+customer a link to the same stateful chat interface from
+`chat-link-widget-frontend.md` (see also `web-chat-dispatch-frontend.md` for
+the automatic/scheduled version of this same delivery). It has no SMS/A2P
+dependency, so it's available regardless of `sms_status`. It needs the
+customer's **email**, not phone — on success the response includes:
+```json
+{ "ok": true, "emailSent": true, "chatLinkToken": "3a90f7a5…", "dialed": false, "retellCallId": null }
+```
+`dialed`/`retellCallId` stay `false`/`null` for this channel — that's normal,
+not a failure, they only ever apply to voice/SMS. Use `emailSent`/
+`chatLinkToken` instead to know if it worked. If the customer has no email on
+file, this returns the same 422 shape as the missing-phone case:
+```json
+{ "ok": false, "status": 422, "code": "missing_email", "subject": "customer", "error": "No customer email on file. Pass email to send a chat-link confirmation to a specific address." }
+```
+(mirrors the existing `code: "missing_phone"` you already handle for
+voice/SMS.)
+
+**Important — this will be the common case, not the exception:** for
+ServiceTrade-synced customers, `customers.email` is essentially always empty
+(the real email lives on a separate ServiceTrade *Contact*, which isn't
+synced into this table) — the same way a meaningful fraction of customers
+have no phone either. **Don't just show a dead-end error** — same pattern as
+`phone_number` already supports for "Call Now"/"Text Now": add an optional
+`email` field to the same request:
+```json
+{ "trigger_type": "scheduled_unconfirmed", "appointment_id": 123, "channel": "web_chat", "email": "jack@example.com" }
+```
+When present, this sends to that address for this one confirmation — it does
+**not** get written back to the customer record (a one-time override, not a
+data edit). Suggested UI: on `missing_email` (or `missing_phone`), prompt for
+the address/number inline and resubmit with it, rather than a bare error
+toast — this is the expected happy path for a lot of real customers, not a
+rare failure.
 
 ---
 
 ## 4. Activity/timeline rendering
 
-`channel` (`"voice"` | `"sms"`, default `"voice"`) is now present on:
+`channel` (`"voice"` | `"sms"` | `"web_chat"`, default `"voice"`) is now
+present on:
 - `GET /calls`, `GET /calls/:id`
-- `GET /scheduled-calls`
+- `GET /scheduled-calls` — also includes `chat_link_token` for `"web_chat"`
+  rows (see `web-chat-dispatch-frontend.md` §3 for what a `"web_chat"` row
+  looks like while the link is still unopened — that's expected, not stuck).
 - `GET /todos`
 
-Suggest a small 📞/💬 indicator wherever these lists render. No other schema
-change — a chat's `transcript` field is a **plain string** transcript (not the
-array-of-turns / tool-call-annotated shape some voice transcript viewers may
-assume); if there's a transcript viewer that renders raw structure, make sure
-it degrades gracefully for a plain-text chat transcript.
+Suggest a small 📞/💬/✉️ indicator wherever these lists render. No other
+schema change — a chat's `transcript` field is a **plain string** transcript
+(not the array-of-turns / tool-call-annotated shape some voice transcript
+viewers may assume); if there's a transcript viewer that renders raw
+structure, make sure it degrades gracefully for a plain-text chat transcript
+(and for `"web_chat"` rows, there may be no transcript at all until the
+customer actually opens the link).
 
 ---
 

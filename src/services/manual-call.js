@@ -35,17 +35,22 @@ const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
  * @param {string|number} [args.jobId]
  * @param {number} [args.quotationId]
  * @param {string} [args.phoneNumber]              — optional manual override; dials this number instead of the target's on-file number. Normalized to E.164.
+ * @param {string} [args.email]                    — optional manual override; emails this address instead of the
+ *                                                     customer's on-file email (channel: "web_chat" only) — same idea
+ *                                                     as phoneNumber, for when the customer record has no email at
+ *                                                     all (the common case for ServiceTrade-synced customers, whose
+ *                                                     email lives on a separate ServiceTrade Contact, not synced here).
  * @param {boolean} [args.immediate=true]
  * @param {boolean} [args.force=false]
  * @param {string}  [args.scheduledAt]
- * @param {string}  [args.channel]                  — explicit 'voice'|'sms' override (e.g. the
- *                                                     frontend's "Call Now" vs "Text Now" buttons).
- *                                                     Omit to fall back to the company's channel strategy.
- * @returns {Promise<{ok:boolean, status:number, scheduledCall?, dialed?, retellCallId?, error?}>}
+ * @param {string}  [args.channel]                  — explicit 'voice'|'sms'|'web_chat' override (e.g.
+ *                                                     the frontend's "Call Now" / "Text Now" / "Email Now"
+ *                                                     buttons). Omit to fall back to the company's channel strategy.
+ * @returns {Promise<{ok:boolean, status:number, scheduledCall?, dialed?, retellCallId?, chatLinkToken?, error?}>}
  */
 async function triggerManualCall({
   companyId, triggerType,
-  appointmentId, jobId: rawJobId, quotationId, phoneNumber = null,
+  appointmentId, jobId: rawJobId, quotationId, phoneNumber = null, email = null,
   immediate = true, force = false, scheduledAt = null, channel = null,
 }) {
   // ── 1. Validate trigger_type and resolve the company's configured call_type ─
@@ -60,6 +65,16 @@ async function triggerManualCall({
     if (!manualPhone) {
       return { ok: false, status: 400, error: "Invalid phone_number — could not normalize to a valid E.164 number." };
     }
+  }
+
+  // Optional manual email override — same idea as manualPhone above.
+  let manualEmail = null;
+  if (email != null && String(email).trim() !== "") {
+    const trimmed = String(email).trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+      return { ok: false, status: 400, error: "Invalid email — could not validate as an email address." };
+    }
+    manualEmail = trimmed;
   }
 
   const { rows: trigRows } = await db.query(
@@ -88,20 +103,47 @@ async function triggerManualCall({
   // Override the hydrator's placeholder call_type with the company's configured one.
   hydrated.params.callType = callType;
 
-  // ── 2b. Resolve the number to dial ─────────────────────────────────────────
-  // A manually-supplied phone_number overrides the target's on-file number and
-  // rescues targets that have no number on file. If neither is present, 422.
-  const dialPhone = manualPhone || hydrated.params.phoneNumber;
-  if (!dialPhone) {
-    const subject = hydrated.phoneSubject || "customer";
-    return {
-      ok: false, status: 422, code: "missing_phone", subject,
-      error: `No ${subject} phone number on file. Pass phone_number to dial a specific number.`,
-    };
-  }
-  hydrated.params.phoneNumber = dialPhone;
-  if (manualPhone) {
-    logger.info("Manual call: using manual phone override", { companyId, triggerType, targetId });
+  // ── 2b. Resolve who/what to contact ────────────────────────────────────────
+  // "Email Now" needs an email, not a phone — checked separately below, once
+  // the resolved channel is known, instead of the phone-required gate voice/sms use.
+  let overrideEmail = null;
+  if (channel === "web_chat") {
+    const { rows: emailRows } = await db.query(
+      `SELECT c.email FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
+      [hydrated.jobId, companyId]
+    );
+    const onFileEmail = emailRows[0]?.email || null;
+    // Mirrors the phoneNumber override below: ServiceTrade-synced customers
+    // almost never have an email on the *customer* record (that lives on a
+    // separate ServiceTrade Contact) — a manually-supplied email rescues that,
+    // same as phone_number does for a customer with no phone on file.
+    if (manualEmail) {
+      overrideEmail = manualEmail;
+    } else if (!onFileEmail) {
+      const subject = hydrated.phoneSubject || "customer";
+      return {
+        ok: false, status: 422, code: "missing_email", subject,
+        error: `No ${subject} email on file. Pass email to send a chat-link confirmation to a specific address.`,
+      };
+    }
+    // scheduled_calls still stores a phone_number column (used for queue dedup);
+    // pass through whatever's on file without requiring it for this channel.
+    hydrated.params.phoneNumber = manualPhone || hydrated.params.phoneNumber || null;
+  } else {
+    // A manually-supplied phone_number overrides the target's on-file number and
+    // rescues targets that have no number on file. If neither is present, 422.
+    const dialPhone = manualPhone || hydrated.params.phoneNumber;
+    if (!dialPhone) {
+      const subject = hydrated.phoneSubject || "customer";
+      return {
+        ok: false, status: 422, code: "missing_phone", subject,
+        error: `No ${subject} phone number on file. Pass phone_number to dial a specific number.`,
+      };
+    }
+    hydrated.params.phoneNumber = dialPhone;
+    if (manualPhone) {
+      logger.info("Manual call: using manual phone override", { companyId, triggerType, targetId });
+    }
   }
 
   // ── 3. Dedup (unless forced) ───────────────────────────────────────────────
@@ -175,6 +217,10 @@ async function triggerManualCall({
       callPriority:      "high",
       bypassOfficeHours: immediate === true,
       channel:           resolvedChannel,
+      // Carries the manual email override through to the dispatcher (which
+      // runs as a separate step below and re-reads the row from the DB —
+      // it has no other way to see a value that was never persisted).
+      ...(overrideEmail && { callContext: { override_email: overrideEmail } }),
     });
   } catch (err) {
     if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") {
@@ -208,12 +254,19 @@ async function triggerManualCall({
   );
   const finalRow = after[0] || row;
   const dialed = !!finalRow.retell_call_id;
+  // web_chat has no retell_call_id until the customer opens the link — its
+  // success signal is the row completing with a chat_link_token instead.
+  const emailSent = resolvedChannel === "web_chat" && finalRow.status === "completed";
   return {
     ok: true,
     status: 201,
     scheduledCall: finalRow,
     dialed,
     retellCallId: finalRow.retell_call_id || null,
+    ...(resolvedChannel === "web_chat" && {
+      emailSent,
+      chatLinkToken: finalRow.chat_link_token || null,
+    }),
   };
 }
 
