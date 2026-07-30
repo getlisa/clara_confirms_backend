@@ -15,6 +15,7 @@ const serviceLinkMessagesDb = require("../db/service-link-messages");
 const stAppointments = require("../services/servicetrade-appointments");
 const todosDb = require("../db/todos");
 const chatLinksDb = require("../db/chat-links");
+const { toE164 } = require("../utils/phone");
 const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
 const { parseCallbackTime } = require("../services/callback-time");
@@ -308,7 +309,15 @@ router.post("/confirm_appointment", async (req, res) => {
 
     // Chat state tracking — harmless no-op for voice/SMS (getConversationId
     // returns a call_id there, which won't match any chat_links row).
-    await chatLinksDb.setState(getConversationId(req), "confirmation_accepted").catch(() => {});
+    const conversationId = getConversationId(req);
+    await chatLinksDb.setState(conversationId, "confirmation_accepted").catch(() => {});
+
+    // If the recipient was already captured earlier in this same call (agent
+    // asked about the service link before confirming — unusual order but
+    // possible), this is the moment that makes it sendable — fire it now
+    // instead of waiting for the recipient-capture path to also check.
+    const refs = await resolveConfirmationRefs(companyId, conversationId);
+    if (refs) await maybeSendServiceLinkNow(companyId, conversationId, refs);
 
     const tz = await getCompanyTimezone(companyId);
     logger.info("Tool: confirm_appointment", { companyId, appointment_id });
@@ -796,6 +805,53 @@ async function resolveConfirmationRefs(companyId, retellCallId) {
   return chatRows[0] || null;
 }
 
+/**
+ * Whether the appointment behind this conversation is already confirmed —
+ * the code-level gate for sending the service link live, mid-call, instead
+ * of waiting for the post-call webhook. Deliberately checked in the DB
+ * (not inferred from conversation/tool-call order) since that ordering is
+ * prompt-driven and not reliable to depend on.
+ * Only meaningful for scheduled (voice/sms-channel) calls — a raw web-chat-
+ * link session has no scheduled_call_id/appointment, and already has its own
+ * unconditional instant-send in get_service_link.
+ */
+async function isAppointmentConfirmed(companyId, refs) {
+  if (!refs?.scheduled_call_id) return false;
+  const { rows } = await db.query(
+    `SELECT a.customer_confirmed
+       FROM scheduled_calls sc
+       LEFT JOIN appointments a ON a.id = sc.appointment_id
+      WHERE sc.id = $1 AND sc.company_id = $2`,
+    [refs.scheduled_call_id, companyId]
+  );
+  return rows[0]?.customer_confirmed === true;
+}
+
+/**
+ * Send the service link right now if (a) the appointment is confirmed and
+ * (b) a recipient has been captured — whichever of those two facts becomes
+ * true LAST during the call triggers the actual send. Called from both
+ * confirm_appointment and resolve_service_link_contact so either tool-call
+ * order works, without depending on the prompt asking for things in a
+ * specific sequence. sendRecordedServiceLink is itself idempotent (a `sent`
+ * row is a no-op), so this can safely run more than once per call, and the
+ * existing post-call postCallServiceLink remains a safety net if neither
+ * hook fires in time.
+ */
+async function maybeSendServiceLinkNow(companyId, conversationId, refs) {
+  if (!(await isAppointmentConfirmed(companyId, refs))) return { sent: false, reason: "not_confirmed_yet" };
+
+  const row = await serviceLinkMessagesDb.getByRetellCallId(companyId, conversationId);
+  if (!row || !row.contact_id || !row.email) return { sent: false, reason: "no_recipient_yet" };
+
+  return serviceLink
+    .sendRecordedServiceLink({ companyId, retellCallId: conversationId, scheduledCallId: refs.scheduled_call_id })
+    .catch((err) => {
+      logger.error("maybeSendServiceLinkNow: send threw", { error: err.message, companyId, conversationId });
+      return { sent: false, reason: "error" };
+    });
+}
+
 async function resolveJobLocationId(companyId, jobRef) {
   if (!jobRef) return null;
   const { rows } = await db.query(
@@ -905,10 +961,11 @@ router.post("/resolve_service_link_contact", async (req, res) => {
     const exactMatch = candidates.find((c) => c.email && c.email.toLowerCase() === email.toLowerCase());
     const match = exactMatch || (candidates.length === 1 ? candidates[0] : null);
 
-    let contactId, contactName, status;
+    let contactId, contactName, status, contactPhone;
     if (match) {
       contactId = match.id;
       contactName = [match.firstName, match.lastName].filter(Boolean).join(" ") || null;
+      contactPhone = match.phone || null;
       status = "found";
     } else if (first_name || last_name) {
       const companyIds = /^\d+$/.test(String(refs.customer_ref)) ? [Number(refs.customer_ref)] : [];
@@ -920,11 +977,16 @@ router.post("/resolve_service_link_contact", async (req, res) => {
       if (!created) return res.status(502).json({ error: "Failed to create contact in ServiceTrade" });
       contactId = created.id;
       contactName = [created.firstName, created.lastName].filter(Boolean).join(" ") || null;
+      contactPhone = phone || null;
       status = "created";
     } else {
       logger.info("Tool: resolve_service_link_contact — no match, more info needed", { companyId, email });
       return res.json({ success: true, status: "need_more_info", email });
     }
+
+    // Prefer whatever phone the model gave on THIS call (e.g. a number the
+    // customer just stated) over the contact's on-file one.
+    const normalizedPhone = toE164(phone) || toE164(contactPhone);
 
     await serviceLinkMessagesDb.setRecipient({
       companyId,
@@ -933,10 +995,18 @@ router.post("/resolve_service_link_contact", async (req, res) => {
       jobExternalRef: refs.job_ref || null,
       contactId: String(contactId),
       email,
+      phone: normalizedPhone,
     });
 
-    logger.info("Tool: resolve_service_link_contact", { companyId, status, contactId: String(contactId) });
-    return res.json({ success: true, status, contact_id: String(contactId), name: contactName, email });
+    // If the appointment was already confirmed earlier in this same call,
+    // this recipient capture is the moment that makes it sendable — fire it
+    // now instead of waiting for the post-call webhook. link_sent tells the
+    // agent (via the prompt) whether to say it's already been sent or that
+    // it'll go out after the call.
+    const sendResult = await maybeSendServiceLinkNow(companyId, conversationId, refs);
+
+    logger.info("Tool: resolve_service_link_contact", { companyId, status, contactId: String(contactId), linkSent: sendResult?.sent });
+    return res.json({ success: true, status, contact_id: String(contactId), name: contactName, email, link_sent: !!sendResult?.sent });
   } catch (err) {
     logger.error("Tool resolve_service_link_contact failed", { error: err.message });
     return res.status(500).json({ error: "Failed to resolve service link contact" });
@@ -991,27 +1061,12 @@ router.post("/get_service_link", async (req, res) => {
       return res.status(404).json({ error: "No ServiceTrade job found for this conversation" });
     }
 
-    const { rows: credRows } = await db.query(
-      `SELECT metadata->>'servicetrade_user_id' AS user_id FROM servicetrade_integration WHERE company_id = $1`,
-      [companyId]
-    );
-    const stUserId = credRows[0]?.user_id;
-    if (!stUserId) {
-      return res.status(503).json({ error: "ServiceTrade user id not on file for this company — cannot mint a service-link token" });
+    const minted = await serviceLink.mintServiceLinkUrl(companyId, refs.job_ref);
+    if (!minted.ok) {
+      logger.error("Tool get_service_link: mint failed", { companyId, error: minted.error, status: minted.status });
+      return res.status(minted.status ? 502 : 503).json({ error: minted.error });
     }
-
-    const { stLoggedRequest } = require("../services/servicetrade-api");
-    const tokenRes = await stLoggedRequest(
-      companyId, "GET", `/token?jobId=${encodeURIComponent(refs.job_ref)}&userId=${encodeURIComponent(stUserId)}`,
-      { context: "serviceLink.token" }
-    );
-    const token = tokenRes.data?.token || tokenRes.data?.id || (typeof tokenRes.data === "string" ? tokenRes.data : null);
-    if (!tokenRes.ok || !token) {
-      logger.error("Tool get_service_link: token fetch failed", { companyId, status: tokenRes.status, messages: tokenRes.messages });
-      return res.status(502).json({ error: "Failed to mint a service-link token" });
-    }
-
-    const url = `https://app.servicetrade.com/customer/jobsummary?id=${encodeURIComponent(token)}`;
+    const url = minted.url;
 
     // Job name — for the frontend to render a preview card (title) rather
     // than just a bare URL. Best-effort; never blocks the link itself.
@@ -1027,12 +1082,14 @@ router.post("/get_service_link", async (req, res) => {
     // Chat has no reliable "post-call" moment to defer the actual email to —
     // the session can stay open indefinitely (reschedule loops, the customer
     // just going quiet, etc.) — so for a chat session, send the recorded
-    // recipient their ServiceTrade service-link email right now, the instant
-    // the agent shares it, rather than waiting on a webhook that may fire much
-    // later or (for a still-open chat) not at all yet. Voice keeps its
-    // existing post-call-only send (postCallServiceLink) — this is gated on
-    // an actual chat_links match so a voice call accidentally invoking this
-    // tool can't double-send.
+    // recipient their ServiceTrade service-link email (+ text, if a phone is
+    // on file) right now, the instant the agent shares it, rather than
+    // waiting on a webhook that may fire much later or (for a still-open
+    // chat) not at all yet. Voice's equivalent instant-send is triggered
+    // from confirm_appointment/resolve_service_link_contact instead (gated
+    // on the appointment actually being confirmed) — sendRecordedServiceLink
+    // is idempotent, so it's harmless if both end up firing for the same
+    // call.
     //
     // Awaited (not fire-and-forget): this may run on Vercel, where a
     // serverless function's execution can be frozen the instant its response
@@ -1042,7 +1099,6 @@ router.post("/get_service_link", async (req, res) => {
     const isChatSession = !!(await chatLinksDb.getByRetellChatId(conversationId));
     let emailResult = null;
     if (isChatSession) {
-      const serviceLink = require("../services/servicetrade-service-link");
       emailResult = await serviceLink
         .sendRecordedServiceLink({ companyId, retellCallId: conversationId, scheduledCallId: refs.scheduled_call_id ?? null })
         .catch((err) => {

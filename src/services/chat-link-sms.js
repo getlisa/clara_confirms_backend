@@ -30,6 +30,7 @@ async function sendConfirmationLinkSms({ phone, customerName, companyName, jobNa
   const greeting = customerName ? `Hi ${customerName}, ` : "Hi, ";
 
   const body = `${greeting}please confirm your upcoming appointment${jobPhrase} with ${companyName}. Chat with us here: ${url}`;
+  console.log("=======> body:", body);
 
   const sent = await sendSms({ to: phone, body });
 

@@ -1,14 +1,17 @@
 /**
  * service_link_messages — tracks the lifecycle of each ServiceTrade Service Link
- * email we attempt to send after a confirmed customer_confirmation call.
+ * send we attempt for a confirmed customer_confirmation call. `status`/`sent`
+ * tracks the email leg (ServiceTrade's own API, the authoritative channel);
+ * `phone`, when present, additionally gets a best-effort text (via Twilio)
+ * with the link — that leg doesn't affect `status`.
  *
  * Flow:
  *   during the call  → setRecipient(...)  writes/updates a `pending` row with the
- *                      resolved contact + confirmed email.
+ *                      resolved contact + confirmed email/phone.
  *   after the call   → markSent / markFailed / markSkipped.
  * Anything not `sent` is surfaced on the platform (list API + a SERVICE_LINK todo).
  *
- * See migrations/062_service_link.sql.
+ * See migrations/062_service_link.sql, migrations/074_service_link_phone.sql.
  */
 
 const db = require("./index");
@@ -17,7 +20,7 @@ const db = require("./index");
  * Create or update the pending row for a call. One service link per call, so we
  * key on retell_call_id: update the existing row if present, else insert.
  */
-async function setRecipient({ companyId, scheduledCallId = null, retellCallId, jobExternalRef = null, contactId = null, email = null }) {
+async function setRecipient({ companyId, scheduledCallId = null, retellCallId, jobExternalRef = null, contactId = null, email = null, phone = null }) {
   const existing = await db.query(
     `SELECT id FROM service_link_messages WHERE retell_call_id = $1 AND company_id = $2 ORDER BY id DESC LIMIT 1`,
     [retellCallId, companyId]
@@ -29,21 +32,22 @@ async function setRecipient({ companyId, scheduledCallId = null, retellCallId, j
               job_external_ref  = COALESCE($3, job_external_ref),
               contact_id        = COALESCE($4, contact_id),
               email             = COALESCE($5, email),
+              phone             = COALESCE($6, phone),
               status            = 'pending',
               error             = NULL,
               updated_at        = now()
         WHERE id = $1
       RETURNING *`,
-      [existing.rows[0].id, scheduledCallId, jobExternalRef, contactId, email]
+      [existing.rows[0].id, scheduledCallId, jobExternalRef, contactId, email, phone]
     );
     return rows[0];
   }
   const { rows } = await db.query(
     `INSERT INTO service_link_messages
-       (company_id, scheduled_call_id, retell_call_id, job_external_ref, contact_id, email, status)
-     VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+       (company_id, scheduled_call_id, retell_call_id, job_external_ref, contact_id, email, phone, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
      RETURNING *`,
-    [companyId, scheduledCallId, retellCallId, jobExternalRef, contactId, email]
+    [companyId, scheduledCallId, retellCallId, jobExternalRef, contactId, email, phone]
   );
   return rows[0];
 }

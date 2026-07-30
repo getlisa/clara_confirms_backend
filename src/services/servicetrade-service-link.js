@@ -13,6 +13,8 @@ const { stLoggedRequest } = require("./servicetrade-api");
 const serviceLinkMessagesDb = require("../db/service-link-messages");
 const callSettingsDb = require("../db/call-settings");
 const todosDb = require("../db/todos");
+const db = require("../db");
+const { sendSms } = require("../utils/sms");
 const logger = require("../utils/logger");
 
 // ── Service-link message template (SINGLE point to confirm) ─────────────────
@@ -137,6 +139,33 @@ async function sendServiceLink(companyId, { contactId, jobExternalRef }) {
   };
 }
 
+/**
+ * Mint the customer-facing ServiceTrade job-summary URL for a job — the same
+ * link ServiceTrade's own emailed "Service Link" template points to. Used
+ * both by the get_service_link tool (to display/paste the URL in a chat) and
+ * here, to text it via Twilio as the sms leg of sendRecordedServiceLink.
+ * Real captured values (per plan): token = GET /token?jobId=&userId=,
+ * link = https://app.servicetrade.com/customer/jobsummary?id=<token>.
+ */
+async function mintServiceLinkUrl(companyId, jobExternalRef) {
+  const { rows: credRows } = await db.query(
+    `SELECT metadata->>'servicetrade_user_id' AS user_id FROM servicetrade_integration WHERE company_id = $1`,
+    [companyId]
+  );
+  const stUserId = credRows[0]?.user_id;
+  if (!stUserId) return { ok: false, error: "ServiceTrade user id not on file for this company" };
+
+  const tokenRes = await stLoggedRequest(
+    companyId, "GET", `/token?jobId=${encodeURIComponent(jobExternalRef)}&userId=${encodeURIComponent(stUserId)}`,
+    { context: "serviceLink.token" }
+  );
+  const token = tokenRes.data?.token || tokenRes.data?.id || (typeof tokenRes.data === "string" ? tokenRes.data : null);
+  if (!tokenRes.ok || !token) {
+    return { ok: false, error: "Failed to mint a service-link token", status: tokenRes.status };
+  }
+  return { ok: true, url: `https://app.servicetrade.com/customer/jobsummary?id=${encodeURIComponent(token)}` };
+}
+
 // ── Enablement + post-call orchestration ────────────────────────────────────
 
 async function isServiceLinkEnabled(companyId) {
@@ -204,18 +233,36 @@ async function sendRecordedServiceLink({ companyId, retellCallId, scheduledCallI
     return { sent: false, reason: "no_job_ref" };
   }
 
+  // SMS leg — best-effort, independent of the email leg below. Doesn't affect
+  // `status` (email via ServiceTrade's own API remains the authoritative,
+  // todo-tracked channel); a phone-send failure just gets logged, never
+  // raises a todo or fails the row.
+  let smsSent = false;
+  if (row.phone) {
+    try {
+      const minted = await mintServiceLinkUrl(companyId, row.job_external_ref);
+      if (minted.ok) {
+        smsSent = await sendSms({ to: row.phone, body: `Here's your service link: ${minted.url}` });
+      } else {
+        logger.warn("service-link: could not mint URL for sms leg", { companyId, retellCallId, error: minted.error });
+      }
+    } catch (err) {
+      logger.warn("service-link: sms leg failed", { companyId, retellCallId, error: err.message });
+    }
+  }
+
   try {
     const result = await sendServiceLink(companyId, { contactId: row.contact_id, jobExternalRef: row.job_external_ref });
     if (result.ok) {
       await serviceLinkMessagesDb.markSent(row.id, result.messageId);
-      logger.info("service-link: sent OK", { companyId, retellCallId, messageId: result.messageId, contactId: row.contact_id });
-      return { sent: true, messageId: result.messageId };
+      logger.info("service-link: sent OK", { companyId, retellCallId, messageId: result.messageId, contactId: row.contact_id, smsSent });
+      return { sent: true, messageId: result.messageId, smsSent };
     }
     const err = JSON.stringify(result.messages || { status: result.status, failureCount: result.failureCount });
     await serviceLinkMessagesDb.markFailed(row.id, err);
     await raiseServiceLinkTodo(companyId, callId, retellCallId, "Service link email failed to send — please resend from ServiceTrade.", { contact_id: row.contact_id, email: row.email, status: result.status });
     logger.error("service-link: send failed", { companyId, retellCallId, status: result.status, messages: result.messages });
-    return { sent: false, reason: "send_failed" };
+    return { sent: false, reason: "send_failed", smsSent };
   } catch (err) {
     await serviceLinkMessagesDb.markFailed(row.id, err.message);
     await raiseServiceLinkTodo(companyId, callId, retellCallId, "Service link email errored — please resend from ServiceTrade.", { contact_id: row.contact_id, email: row.email });
@@ -257,6 +304,7 @@ module.exports = {
   resolveContactType,
   createContact,
   sendServiceLink,
+  mintServiceLinkUrl,
   isServiceLinkEnabled,
   sendRecordedServiceLink,
   postCallServiceLink,
