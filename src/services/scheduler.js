@@ -9,6 +9,7 @@ const { resolveOutboundChannel } = require("./channel-resolver");
 const retell = require("./retell");
 const chatLinksService = require("./chat-links");
 const chatLinkEmail = require("./chat-link-email");
+const chatLinkSms = require("./chat-link-sms");
 const logger = require("../utils/logger");
 
 const isDev = process.env.NODE_ENV === "development";
@@ -158,35 +159,42 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         .replace(/\{\{location_name\}\}/g,       (row.call_context && row.call_context.location_name) || "your location");
 
       if (row.channel === "web_chat") {
-        // Chat link delivery — no live call/chat session yet, just an emailed
-        // link to the same stateful chat interface staff-triggered links use.
-        // retell_call_id stays null until the customer actually opens it.
+        // One shared chat_links token, delivered by email and/or SMS per
+        // chat_link_delivery_method — a plain text with a link, same idea as
+        // the email. Same underlying mechanism the plain "sms" channel now
+        // uses too (below) — retell_call_id stays null until the customer
+        // actually opens the link, regardless of medium.
         const deliveryMethod = (await callSettingsDb.getByCompanyId(row.company_id)).chat_link_delivery_method;
-        if (deliveryMethod !== "email") {
-          logger.warn("Dispatcher: chat_link_delivery_method is not yet implemented beyond email — sending email anyway", {
-            ...ctx, configuredMethod: deliveryMethod,
-          });
-        }
 
-        // A manually-supplied email (e.g. the "Email Now" button, when the
-        // customer record itself has none — the common case for ServiceTrade-
-        // synced customers, whose email lives on a separate Contact, not
-        // synced here) travels through call_context since this dispatch step
-        // re-reads the row from the DB and has no other way to see it.
+        // A manually-supplied email/phone (e.g. the "Email Now" button, when
+        // the customer record itself has none — the common case for
+        // ServiceTrade-synced customers, whose email lives on a separate
+        // Contact, not synced here) travels through call_context since this
+        // dispatch step re-reads the row from the DB and has no other way to
+        // see it.
         const overrideEmail = row.call_context?.override_email || null;
-        let customerEmail = overrideEmail;
-        if (!customerEmail) {
-          const { rows: custRows } = await db.query(
-            `SELECT c.email FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
-            [row.job_id, row.company_id]
-          );
-          customerEmail = custRows[0]?.email || null;
-        }
-        if (!customerEmail) {
-          // Contact-completeness is normally checked before the row is even
-          // created (processScheduledUnconfirmed) — this only fires if the
-          // email was removed in between scheduling and dispatch.
+        const overridePhone = row.call_context?.override_phone || null;
+        const { rows: custRows } = await db.query(
+          `SELECT c.email, c.phone FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
+          [row.job_id, row.company_id]
+        );
+        const customerEmail = overrideEmail || custRows[0]?.email || null;
+        const customerPhone = overridePhone || custRows[0]?.phone || null;
+
+        const wantEmail = deliveryMethod === "email" || deliveryMethod === "both";
+        const wantSms = deliveryMethod === "sms" || deliveryMethod === "both";
+
+        // Contact-completeness is normally checked before the row is even
+        // created (processScheduledUnconfirmed) — these only fire if contact
+        // info was removed in between scheduling and dispatch.
+        if (deliveryMethod === "email" && !customerEmail) {
           throw new Error("Customer email no longer on file — cannot dispatch web_chat confirmation");
+        }
+        if (deliveryMethod === "sms" && !customerPhone) {
+          throw new Error("Customer phone no longer on file — cannot dispatch web_chat confirmation");
+        }
+        if (deliveryMethod === "both" && !customerEmail && !customerPhone) {
+          throw new Error("Customer has no email or phone on file — cannot dispatch web_chat confirmation");
         }
 
         const linkResult = row.appointment_id
@@ -194,8 +202,82 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
           : await chatLinksService.createChatLinkForJob(row.company_id, row.job_id, row.call_type);
         if (!linkResult.ok) throw new Error(linkResult.error || "Failed to create chat link");
 
-        const emailSent = await chatLinkEmail.sendConfirmationLinkEmail({
-          email: customerEmail,
+        // Each leg is caught independently — for 'both', one leg throwing
+        // must NOT cause the whole row to retry, since a retry would
+        // re-send whichever leg already succeeded (e.g. re-emailing the
+        // customer while only the sms leg actually needs another attempt).
+        let emailSent = false, smsSent = false, emailError = null, smsError = null;
+
+        if (wantEmail && customerEmail) {
+          try {
+            await chatLinkEmail.sendConfirmationLinkEmail({
+              email: customerEmail,
+              customerName: row.customer_name,
+              companyName: co.company_name || "our company",
+              jobName: row.job_name,
+              token: linkResult.token,
+            });
+            emailSent = true;
+          } catch (err) {
+            emailError = err;
+          }
+        } else if (wantEmail) {
+          logger.warn("Dispatcher: chat_link_delivery_method wants email but customer has none — sending sms only", { ...ctx });
+        }
+
+        if (wantSms && customerPhone) {
+          try {
+            await chatLinkSms.sendConfirmationLinkSms({
+              phone: customerPhone,
+              customerName: row.customer_name,
+              companyName: co.company_name || "our company",
+              jobName: row.job_name,
+              token: linkResult.token,
+            });
+            smsSent = true;
+          } catch (err) {
+            smsError = err;
+          }
+        } else if (wantSms) {
+          logger.warn("Dispatcher: chat_link_delivery_method wants sms but customer has no phone — sending email only", { ...ctx });
+        }
+
+        // Single-method modes: propagate the sole leg's error as-is so the
+        // existing retry/max-attempts machinery handles it (safe — nothing
+        // else was sent this attempt). 'both': only propagate (and thus
+        // retry) if NEITHER leg went out; if exactly one succeeded, mark
+        // completed with the shared link and flag the failed leg instead of
+        // risking a duplicate send on retry.
+        if (deliveryMethod !== "both") {
+          if (emailError) throw emailError;
+          if (smsError) throw smsError;
+        } else if (!emailSent && !smsSent) {
+          throw emailError || smsError || new Error("web_chat 'both' dispatch failed on both legs");
+        } else if (emailError || smsError) {
+          logger.warn("Dispatcher: web_chat 'both' partially failed — one leg succeeded, not retrying to avoid duplicate send", {
+            ...ctx, emailError: emailError?.message, smsError: smsError?.message,
+          });
+        }
+
+        await scheduledCallsDb.markCompletedWithChatLink(row.id, linkResult.token);
+        logger.info("Dispatcher: fired (web_chat)", { ...ctx, deliveryMethod, token: linkResult.token, emailSent, smsSent });
+        fired++;
+        continue;
+      }
+
+      if (row.channel === "sms") {
+        // Texts the same chat_links confirmation link used by web_chat/sms —
+        // NOT a live Retell agent<->customer conversation. We've stopped
+        // using Retell's conversational SMS (createSmsChat) for confirmations
+        // for now; retell.createSmsChat is left defined, just unused, in
+        // case this needs to be re-enabled later.
+        const linkResult = row.appointment_id
+          ? await chatLinksService.createChatLinkForAppointment(row.company_id, row.appointment_id, row.call_type)
+          : await chatLinksService.createChatLinkForJob(row.company_id, row.job_id, row.call_type);
+        if (!linkResult.ok) throw new Error(linkResult.error || "Failed to create chat link");
+
+        await chatLinkSms.sendConfirmationLinkSms({
+          phone: row.phone_number,
           customerName: row.customer_name,
           companyName: co.company_name || "our company",
           jobName: row.job_name,
@@ -203,29 +285,20 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         });
 
         await scheduledCallsDb.markCompletedWithChatLink(row.id, linkResult.token);
-        logger.info("Dispatcher: fired (web_chat)", { ...ctx, token: linkResult.token, emailSent });
+        logger.info("Dispatcher: fired (sms-link)", { ...ctx, channel: row.channel, token: linkResult.token });
         fired++;
         continue;
       }
 
-      const isSms = row.channel === "sms";
-      const call = isSms
-        ? await retell.createSmsChat({
-            toNumber: row.phone_number,
-            companyId: row.company_id,
-            callType: row.call_type,
-            dynamicVariables: dynVars,
-            metadata: { scheduled_call_id: String(row.id), is_test: row.is_test },
-          })
-        : await retell.createCall({
-            toNumber: row.phone_number,
-            companyId: row.company_id,
-            callType: row.call_type,
-            dynamicVariables: dynVars,
-            metadata: { scheduled_call_id: String(row.id), is_test: row.is_test },
-            voicemailMessage,
-          });
-      const externalId = call.call_id || call.chat_id;
+      const call = await retell.createCall({
+        toNumber: row.phone_number,
+        companyId: row.company_id,
+        callType: row.call_type,
+        dynamicVariables: dynVars,
+        metadata: { scheduled_call_id: String(row.id), is_test: row.is_test },
+        voicemailMessage,
+      });
+      const externalId = call.call_id;
       await scheduledCallsDb.markCompleted(row.id, externalId);
       logger.info("Dispatcher: fired", { ...ctx, channel: row.channel, retellCallId: externalId });
       fired++;
@@ -367,7 +440,7 @@ async function processUnopenedChatLinks(companyId) {
      FROM scheduled_calls sc
      JOIN chat_links cl ON cl.token = sc.chat_link_token
      WHERE sc.company_id = $1
-       AND sc.channel = 'web_chat'
+       AND sc.channel IN ('web_chat', 'sms')
        AND sc.status = 'completed'
        AND sc.chat_link_token IS NOT NULL
        AND cl.retell_chat_id IS NULL
@@ -463,7 +536,18 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz,
   let c = 0, s = 0;
   for (const row of rows) {
     const jobId = String(row.job_id);
-    if (!row.customer_phone) {
+
+    // Channel must be resolved before the contact-completeness gate below —
+    // resolveOutboundChannel only depends on settings/preferences, never on
+    // contact info, so this ordering is always safe. (Previously the phone
+    // check ran unconditionally first, which would incorrectly block a
+    // web_chat/email-delivery customer who has an email but no phone on file.)
+    const channel = resolveOutboundChannel({
+      smsLive, preferredChannel: row.preferred_channel,
+      channelStrategy: callSettings.channel_strategy, attemptNumber: 1,
+    });
+
+    if (channel !== "web_chat" && !row.customer_phone) {
       await todosDb.createMissingPhone({
         companyId, jobId, subjectKind: "customer",
         subjectName: row.customer_name, callType: trigger.call_type,
@@ -473,6 +557,42 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz,
       logger.info("Scheduler [scheduled_unconfirmed]: todo created — customer missing phone", { companyId, jobId, customer: row.customer_name });
       s++; continue;
     }
+
+    // Contact-completeness gate for web_chat — required contact info depends
+    // on the company's configured chat_link_delivery_method ('email' sends a
+    // link by email; 'sms' starts a live Retell conversation over text, same
+    // mechanism as the "Text Now" channel, so it needs a phone; 'both' needs
+    // at least one). Flag missing info for staff instead of silently skipping
+    // or guessing another channel; the next sweep picks it up normally once
+    // the missing info is added.
+    if (channel === "web_chat") {
+      const deliveryMethod = callSettings.chat_link_delivery_method;
+      const needsEmail = deliveryMethod === "email" && !row.customer_email;
+      const needsPhone = deliveryMethod === "sms" && !row.customer_phone;
+      const needsEither = deliveryMethod === "both" && !row.customer_email && !row.customer_phone;
+
+      if (needsEmail || needsEither) {
+        await todosDb.createMissingEmail({
+          companyId, jobId, subjectKind: "customer",
+          subjectName: row.customer_name, callType: trigger.call_type,
+          reason: "Customer email not provided — confirmation chat link could not be sent.",
+          isTest: isDev,
+        });
+        logger.info("Scheduler [scheduled_unconfirmed]: todo created — customer missing email for web_chat dispatch", { companyId, jobId, customer: row.customer_name });
+        s++; continue;
+      }
+      if (needsPhone) {
+        await todosDb.createMissingPhone({
+          companyId, jobId, subjectKind: "customer",
+          subjectName: row.customer_name, callType: trigger.call_type,
+          reason: "Customer phone number not provided — confirmation chat could not be texted.",
+          isTest: isDev,
+        });
+        logger.info("Scheduler [scheduled_unconfirmed]: todo created — customer missing phone for web_chat dispatch", { companyId, jobId, customer: row.customer_name });
+        s++; continue;
+      }
+    }
+
     if (await scheduledCallsDb.existsForCustomerJob(companyId, jobId, trigger.call_type, isDev)) {
       logger.info("Scheduler [scheduled_unconfirmed]: skipped — call already exists", {
         companyId, jobId, jobName: row.job_name, customer: row.customer_name,
@@ -484,26 +604,6 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz,
     const scheduledAt = isDev
       ? new Date()
       : snapToWindowStart(callSettings, tz, new Date());
-
-    const channel = resolveOutboundChannel({
-      smsLive, preferredChannel: row.preferred_channel,
-      channelStrategy: callSettings.channel_strategy, attemptNumber: 1,
-    });
-
-    // Contact-completeness gate — web_chat delivers by email (this phase),
-    // so an appointment can't dispatch that way without one on file. Flag it
-    // for staff instead of silently skipping or guessing another channel;
-    // the next sweep picks it up normally once the email is added.
-    if (channel === "web_chat" && !row.customer_email) {
-      await todosDb.createMissingEmail({
-        companyId, jobId, subjectKind: "customer",
-        subjectName: row.customer_name, callType: trigger.call_type,
-        reason: "Customer email not provided — confirmation chat link could not be sent.",
-        isTest: isDev,
-      });
-      logger.info("Scheduler [scheduled_unconfirmed]: todo created — customer missing email for web_chat dispatch", { companyId, jobId, customer: row.customer_name });
-      s++; continue;
-    }
 
     const inserted = await scheduleCall({
       companyId, callType: trigger.call_type,

@@ -108,6 +108,27 @@ failure).
 - **`400` `{ "error": "Invalid email — could not validate as an email address." }`**
   if the given `email` doesn't look like one.
 
+### Sending it by SMS — `POST /chat-links/appointments/:id/send-sms` / `POST /chat-links/jobs/:id/send-sms`
+Same idea as `send-email` above, but texts the link via Twilio instead — a
+plain text with a link, **not** the conversational Retell "Text Now" feature
+used elsewhere in the product.
+
+```json
+{ "call_type": "customer_confirmation", "phone": "+15551234567" }
+```
+Both fields optional. **`phone`** sends to that number for this one send
+instead of requiring the customer to already have one on file. Not saved
+back to the customer record. Accepts loose formats — normalized to E.164
+server-side.
+
+**Response `200`:**
+```json
+{ "token": "a4fce883…", "phone": "+15551234567", "sent": true }
+```
+**Errors:** same `404` as `send-email`, plus:
+- **`422` `{ "error": "Customer has no phone on file. Pass phone to send to a specific number." }`**
+- **`400` `{ "error": "Invalid phone_number — could not normalize to a valid E.164 number." }`**
+
 ---
 
 ## 3. Loading a conversation

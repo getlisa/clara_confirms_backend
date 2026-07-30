@@ -47,6 +47,11 @@ module.exports = {
     fromEmail: process.env.SENDGRID_FROM_EMAIL || "developer@justclara.ai",
     fromName: process.env.SENDGRID_FROM_NAME || "Clara Confirms",
   },
+  twilio: {
+    accountSid: process.env.TWILIO_ACCOUNT_SID || "",
+    authToken: process.env.TWILIO_AUTH_TOKEN || "",
+    fromNumber: process.env.TWILIO_PHONE_NUMBER || process.env.TWILIO_FROM_NUMBER || "",
+  },
   servicetrade: {
     baseUrl: (process.env.SERVICETRADE_BASE_URL || "https://api.servicetrade.com/api").replace(/\/$/, ""),
     username: process.env.SERVICETRADE_USERNAME || "",

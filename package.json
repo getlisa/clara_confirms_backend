@@ -30,6 +30,7 @@
     "libphonenumber-js": "^1.13.8",
     "pg": "^8.18.0",
     "retell-sdk": "^5.19.0",
+    "twilio": "^6.0.2",
     "zod": "^3.24.1"
   }
 }

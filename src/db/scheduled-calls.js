@@ -339,7 +339,8 @@ async function markCompleted(id, retellCallId) {
 }
 
 /**
- * Web-chat dispatch: the "call" here is an emailed chat link, not a live
+ * Web-chat dispatch: the "call" here is a chat_links link (delivered by
+ * email and/or SMS text, per chat_link_delivery_method), not a live
  * call/chat session — retell_call_id stays null until the customer actually
  * opens the link (chat-links.js sets chat_links.retell_chat_id at that point).
  */

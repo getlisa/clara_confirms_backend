@@ -131,41 +131,53 @@ it the same way the scheduler would). When the frontend already shows
 distinct buttons, send the explicit value — it always wins over any
 per-customer/company default.
 
-**`"web_chat"` — "Email Now":** instead of dialing/texting, this emails the
+**`"web_chat"` — "Email Now":** instead of dialing/texting, this sends the
 customer a link to the same stateful chat interface from
-`chat-link-widget-frontend.md` (see also `web-chat-dispatch-frontend.md` for
-the automatic/scheduled version of this same delivery). It has no SMS/A2P
-dependency, so it's available regardless of `sms_status`. It needs the
-customer's **email**, not phone — on success the response includes:
+`chat-link-widget-frontend.md`, by whichever medium the company's
+`chat_link_delivery_method` setting specifies (`chat-sms-channel-frontend.md`
+§1 / `web-chat-dispatch-frontend.md` §1):
+- `"email"`: emails the link (SendGrid).
+- `"sms"`: texts the link (Twilio) — a plain text with the URL, **not** the
+  conversational Retell "Text Now" feature (`createSmsChat`) used elsewhere.
+  No Retell SMS/A2P dependency for this leg.
+- `"both"`: sends both, independently.
+
+It has no SMS/A2P dependency at all, for any delivery method — that's the
+whole point of this channel. On success:
 ```json
-{ "ok": true, "emailSent": true, "chatLinkToken": "3a90f7a5…", "dialed": false, "retellCallId": null }
+{ "ok": true, "emailSent": true, "smsSent": false, "chatLinkToken": "3a90f7a5…", "dialed": false, "retellCallId": null }
 ```
-`dialed`/`retellCallId` stay `false`/`null` for this channel — that's normal,
-not a failure, they only ever apply to voice/SMS. Use `emailSent`/
-`chatLinkToken` instead to know if it worked. If the customer has no email on
-file, this returns the same 422 shape as the missing-phone case:
+`dialed`/`retellCallId` stay `false`/`null` for this channel regardless of
+delivery method — that's normal, not a failure, they only ever apply to
+voice/SMS-conversation channels. Use `emailSent`/`smsSent`/`chatLinkToken`
+instead to know what went out (note: both booleans reflect the row
+completing, not a per-medium delivery receipt — a coarse signal, same as the
+existing single-medium behavior). If the customer is missing the contact
+info the configured delivery method needs, this returns a 422:
 ```json
 { "ok": false, "status": 422, "code": "missing_email", "subject": "customer", "error": "No customer email on file. Pass email to send a chat-link confirmation to a specific address." }
 ```
-(mirrors the existing `code: "missing_phone"` you already handle for
-voice/SMS.)
+`code` is `"missing_email"` (method `"email"`), `"missing_phone"` (method
+`"sms"`, mirrors the existing voice/SMS `missing_phone` code), or
+`"missing_contact_info"` (method `"both"`, neither email nor phone on file).
 
 **Important — this will be the common case, not the exception:** for
 ServiceTrade-synced customers, `customers.email` is essentially always empty
 (the real email lives on a separate ServiceTrade *Contact*, which isn't
 synced into this table) — the same way a meaningful fraction of customers
-have no phone either. **Don't just show a dead-end error** — same pattern as
-`phone_number` already supports for "Call Now"/"Text Now": add an optional
-`email` field to the same request:
+have no phone either. **Don't just show a dead-end error** — the same
+`phone_number`/`email` override fields "Call Now"/"Text Now" already support
+work here too:
 ```json
-{ "trigger_type": "scheduled_unconfirmed", "appointment_id": 123, "channel": "web_chat", "email": "jack@example.com" }
+{ "trigger_type": "scheduled_unconfirmed", "appointment_id": 123, "channel": "web_chat", "email": "jack@example.com", "phone_number": "+15551234567" }
 ```
-When present, this sends to that address for this one confirmation — it does
-**not** get written back to the customer record (a one-time override, not a
-data edit). Suggested UI: on `missing_email` (or `missing_phone`), prompt for
-the address/number inline and resubmit with it, rather than a bare error
-toast — this is the expected happy path for a lot of real customers, not a
-rare failure.
+Pass whichever the configured delivery method needs (or both, for `"both"`).
+When present, this sends to that address/number for this one confirmation —
+it does **not** get written back to the customer record (a one-time
+override, not a data edit). Suggested UI: on `missing_email`/`missing_phone`/
+`missing_contact_info`, prompt for the address/number inline and resubmit
+with it, rather than a bare error toast — this is the expected happy path
+for a lot of real customers, not a rare failure.
 
 ---
 
