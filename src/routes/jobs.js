@@ -31,7 +31,7 @@ function localizeJob(job, tz) {
   const out = localizeFields(job, tz, JOB_TZ_FIELDS);
   if (Array.isArray(job.appointments)) out.appointments = localizeRows(job.appointments, tz, APPT_TZ_FIELDS);
   if (Array.isArray(job.quotations))   out.quotations   = localizeRows(job.quotations, tz, QUOTE_TZ_FIELDS);
-  if (job.active_appointment) out.active_appointment = localizeFields(job.active_appointment, tz, ["scheduled_start", "scheduled_end"]);
+  if (job.active_appointment!=null) out.active_appointment = localizeFields(job.active_appointment, tz, ["scheduled_start", "scheduled_end"]);
   return out;
 }
 
@@ -95,8 +95,9 @@ router.get("/", async (req, res) => {
       offset:            offset ? Number(offset) : 0,
     });
 
+    const jobsWithAppointments = jobs.filter((j) => j.active_appointment != null);
     const tz = await getCompanyTimezone(companyId);
-    return res.json({ jobs: jobs.map((j) => localizeJob(j, tz)) });
+    return res.json({ jobs: jobsWithAppointments.map((j) => localizeJob(j, tz)) });
   } catch (err) {
     logger.error("GET /jobs failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load jobs" });
