@@ -85,6 +85,10 @@ async function createCall({ fromNumber, toNumber, companyId, callType, dynamicVa
  * Start an outbound SMS/chat conversation via the company's flow-backed Retell
  * chat agent. Mirrors createCall() — same dynamic-variable/metadata contract,
  * so the shared conversation flow sees an identical shape regardless of channel.
+ *
+ * NOT currently called anywhere — the "sms" channel dispatch (scheduler.js)
+ * was switched to texting a chat_links link via Twilio instead of a live
+ * Retell conversation. Left defined/exported in case that's reversed later.
  */
 async function createSmsChat({ toNumber, companyId, callType, dynamicVariables = {}, metadata = {} }) {
   if (!callType) throw new Error("callType is required — the branch router needs it to route to the correct subagent");

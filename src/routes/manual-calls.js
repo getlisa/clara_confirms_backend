@@ -7,15 +7,21 @@
  *     appointment_id?: number,  // for scheduled_unconfirmed / technician_unconfirmed
  *     job_id?:         string|number,  // for open_job_due_soon
  *     quotation_id?:   number,  // for quotation_pending
- *     phone_number?:   string,  // optional manual override; dials this number (normalized to E.164) instead of the target's on-file number
+ *     phone_number?:   string,  // optional manual override; for channel "voice"/"sms" dials this number (normalized
+ *                      to E.164) instead of the target's on-file number; for channel "web_chat" it's an alternate
+ *                      to email — texts the chat-link confirmation to this number instead (when
+ *                      chat_link_delivery_method is "sms"/"both")
  *     email?:          string,  // optional manual override; emails this address instead of the customer's on-file email (channel: "web_chat" only)
  *     immediate?:      boolean (default true),
  *     force?:          boolean (default false),
  *     scheduled_at?:   string (ISO; ignored when immediate=true)
  *     channel?:        "voice" | "sms" | "web_chat" — explicit override for the
- *                      Call Now / Text Now / Email Now buttons. "web_chat" emails
- *                      a chat-link confirmation instead of dialing/texting — requires
- *                      the customer to have an email on file (422 "missing_email" if not).
+ *                      Call Now / Text Now / Email Now buttons. "web_chat" sends a chat-link
+ *                      confirmation by email/SMS/both (per the company's chat_link_delivery_method)
+ *                      instead of dialing — the "sms" leg is a plain text with the link (via Twilio,
+ *                      NOT the conversational createSmsChat mechanism "sms"/Text Now uses) — requires
+ *                      the matching contact info on file or as an override (422 "missing_email" |
+ *                      "missing_phone" | "missing_contact_info" if not).
  *   }
  *
  * The actual `call_type` written to scheduled_calls (e.g. "customer_confirmation")

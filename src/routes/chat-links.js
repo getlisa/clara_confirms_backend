@@ -88,6 +88,42 @@ router.post("/jobs/:id/send-email", authenticate, async (req, res) => {
   }
 });
 
+// Same idea as send-email above, but texts the link via Twilio instead — a
+// plain text with a link, NOT the conversational Retell "Text Now" feature.
+router.post("/appointments/:id/send-sms", authenticate, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const callType = req.body?.call_type || "customer_confirmation";
+    const overridePhone = req.body?.phone != null ? String(req.body.phone) : null;
+    const result = await chatLinksService.sendConfirmationSmsForAppointment(companyId, Number(req.params.id), callType, overridePhone);
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+
+    return res.json(result);
+  } catch (err) {
+    logger.error("POST /chat-links/appointments/:id/send-sms failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to send confirmation sms" });
+  }
+});
+
+router.post("/jobs/:id/send-sms", authenticate, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const callType = req.body?.call_type || "customer_confirmation";
+    const overridePhone = req.body?.phone != null ? String(req.body.phone) : null;
+    const result = await chatLinksService.sendConfirmationSmsForJob(companyId, Number(req.params.id), callType, overridePhone);
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+
+    return res.json(result);
+  } catch (err) {
+    logger.error("POST /chat-links/jobs/:id/send-sms failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to send confirmation sms" });
+  }
+});
+
 // PUBLIC — no authenticate() call. Wide-open CORS scoped to this single route
 // only (the app-level CORS in src/server.js stays restrictive for everything else).
 const openCors = cors();

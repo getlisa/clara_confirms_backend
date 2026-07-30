@@ -70,27 +70,37 @@ fields, one more valid value, plus one new field:
 | `chat_link_delivery_method` | string | `"email"` \| `"sms"` \| `"both"` | `"email"` |
 
 **Suggested UI:** add a 4th option to the existing `channel_strategy` select —
-*"Chat link (email)"*. **Important:** only `chat_link_delivery_method: "email"`
-is actually implemented server-side right now — `"sms"` and `"both"` are
-accepted by the API (so you can build the 3-option control now without
-another backend round-trip later) but currently dispatch by email regardless
-of what's selected, with a warning logged server-side. Either hide `"sms"`/
-`"both"` from the picker for now, or show them with a "coming soon" note —
-your call; just don't imply they already work.
+*"Chat link"* — with a sub-picker for `chat_link_delivery_method`. All three
+values send the **same link** to the stateful `chat_links` web UI — no live
+session until the customer actually opens it, regardless of medium:
+- `"email"` emails the link (SendGrid).
+- `"sms"` texts the link (Twilio) — a plain text message containing the URL,
+  **not** the conversational Retell "Text Now" feature (`createSmsChat`) used
+  elsewhere in the product. No Retell SMS/A2P approval needed for this — it's
+  a separate, independent send.
+- `"both"` sends both, independently (send whichever the customer has
+  contact info for; if only one is present, that one goes out — not
+  all-or-nothing).
 
-Unlike `sms_only`/`voice_then_sms_fallback`, **`web_chat_only` does not need
-the `sms_status: "live"` gate** from `chat-sms-channel-frontend.md` §1 — it
-has no SMS/A2P dependency, so don't disable it behind that same readiness
-check.
+`web_chat_only` has **no SMS/A2P dependency at all**, for any
+`chat_link_delivery_method` value — that's the whole point of this channel
+strategy.
 
 ---
 
-## 2. Contact-completeness — `MISSING_EMAIL` todo
+## 2. Contact-completeness — `MISSING_EMAIL` / `MISSING_PHONE` todo
 
 When `channel_strategy` is `web_chat_only` and a customer due for
-confirmation has no email on file, dispatch is skipped and a todo is created
-instead — same shape and lifecycle as the existing `MISSING_PHONE` todo you
-already render.
+confirmation is missing the contact info their company's
+`chat_link_delivery_method` requires, dispatch is skipped and a todo is
+created instead:
+- `chat_link_delivery_method: "email"` and no email on file → `MISSING_EMAIL`.
+- `chat_link_delivery_method: "sms"` and no phone on file → `MISSING_PHONE`
+  (same todo type/shape as the existing voice/sms one, distinguished by its
+  `notes` text mentioning the chat rather than a call).
+- `chat_link_delivery_method: "both"` and *neither* email nor phone is on
+  file → `MISSING_EMAIL` (if only one is missing, dispatch proceeds using
+  whichever contact info is present — no todo).
 
 ### `GET /todos`
 ```json
@@ -119,27 +129,27 @@ duplicate (the backend re-uses the existing open todo for the same job).
 `channel` (`chat-sms-channel-frontend.md` §4) now has a third possible value,
 `"web_chat"`, on:
 - `GET /scheduled-calls` — now also includes `chat_link_token` (string or
-  `null`) alongside `channel`. While the link is unopened, `retell_call_id` is
-  `null` and `status` is `"completed"` (the email went out) — this is
-  expected, not a stuck/broken state. If you want to let staff open the link
-  themselves from this view, build the URL as
-  `${FRONTEND_BASE_URL}/chat/${chat_link_token}` (same pattern the existing
-  "Send chat link" action already uses).
+  `null`) alongside `channel`. One shared token regardless of
+  `chat_link_delivery_method` — email and/or SMS just deliver the same
+  link by different media. While the link is unopened, `retell_call_id` is
+  `null` and `status` is `"completed"` (the email/text went out) — this is
+  expected, not a stuck/broken state. Build the URL as
+  `${FRONTEND_BASE_URL}/chat/${chat_link_token}` if you want to let staff
+  open the link themselves (same pattern the existing "Send chat link"
+  action already uses).
 - `GET /todos` — a todo tied to a web_chat scheduled call still shows
   `channel: "web_chat"` the same way voice/SMS ones show their channel today.
 
-If an emailed link goes unopened for 48 hours, the system automatically
-schedules a voice fallback attempt — you'll see the original `scheduled_calls`
-row flip to `status: "failed"`, `failure_reason: "chat_link_unopened"`, and a
-new row appear with `channel: "voice"`, `call_priority: "retry"`. No action
-needed; a 📞 icon on the new row communicates what happened if you want to
-make it visible.
+If the link goes unopened for 48 hours (regardless of delivery method), the
+system automatically schedules a voice fallback attempt — you'll see the
+original `scheduled_calls` row flip to `status: "failed"`,
+`failure_reason: "chat_link_unopened"`, and a new row appear with
+`channel: "voice"`, `call_priority: "retry"`. No action needed; a 📞 icon on
+the new row communicates what happened if you want to make it visible.
 
 ---
 
 ## 4. Not in this build
-- SMS delivery of the chat link — schema/setting accepts it (§1), dispatch
-  code doesn't implement it yet.
 - A manual "send chat-link confirmation now" button — that's covered by the
   separate `POST /jobs/bulk-send-confirmation` request in
   `frontend-requested-changes-v2.md` §3, not part of this automatic-dispatch

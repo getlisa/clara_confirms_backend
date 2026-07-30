@@ -34,7 +34,12 @@ const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
  * @param {number} [args.appointmentId]
  * @param {string|number} [args.jobId]
  * @param {number} [args.quotationId]
- * @param {string} [args.phoneNumber]              — optional manual override; dials this number instead of the target's on-file number. Normalized to E.164.
+ * @param {string} [args.phoneNumber]              — optional manual override; for channel "voice"/"sms" dials this
+ *                                                     number instead of the target's on-file number; for channel
+ *                                                     "web_chat" it's an alternate to args.email — when
+ *                                                     chat_link_delivery_method is "sms"/"both" this texts the
+ *                                                     chat-link confirmation to this number instead of the
+ *                                                     customer's on-file number. Normalized to E.164.
  * @param {string} [args.email]                    — optional manual override; emails this address instead of the
  *                                                     customer's on-file email (channel: "web_chat" only) — same idea
  *                                                     as phoneNumber, for when the customer record has no email at
@@ -46,6 +51,8 @@ const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
  * @param {string}  [args.channel]                  — explicit 'voice'|'sms'|'web_chat' override (e.g.
  *                                                     the frontend's "Call Now" / "Text Now" / "Email Now"
  *                                                     buttons). Omit to fall back to the company's channel strategy.
+ *                                                     For "web_chat", which contact info is required (email/phone/either)
+ *                                                     depends on the company's chat_link_delivery_method setting.
  * @returns {Promise<{ok:boolean, status:number, scheduledCall?, dialed?, retellCallId?, chatLinkToken?, error?}>}
  */
 async function triggerManualCall({
@@ -103,29 +110,54 @@ async function triggerManualCall({
   // Override the hydrator's placeholder call_type with the company's configured one.
   hydrated.params.callType = callType;
 
+  // Fetched here (rather than in step 4, where it originally lived) because
+  // step 2b's web_chat gate below needs chat_link_delivery_method.
+  const callSettings = await callSettingsDb.getByCompanyId(companyId);
+
   // ── 2b. Resolve who/what to contact ────────────────────────────────────────
-  // "Email Now" needs an email, not a phone — checked separately below, once
-  // the resolved channel is known, instead of the phone-required gate voice/sms use.
+  // "Email Now" (channel: web_chat) needs at least one of email/phone,
+  // depending on the company's configured chat_link_delivery_method —
+  // checked separately below, once the resolved channel is known, instead of
+  // the phone-required gate voice/sms use.
   let overrideEmail = null;
+  let overridePhone = null;
   if (channel === "web_chat") {
-    const { rows: emailRows } = await db.query(
-      `SELECT c.email FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
+    const { rows: contactRows } = await db.query(
+      `SELECT c.email, c.phone FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
       [hydrated.jobId, companyId]
     );
-    const onFileEmail = emailRows[0]?.email || null;
+    const onFileEmail = contactRows[0]?.email || null;
+    const onFilePhone = contactRows[0]?.phone || null;
     // Mirrors the phoneNumber override below: ServiceTrade-synced customers
     // almost never have an email on the *customer* record (that lives on a
-    // separate ServiceTrade Contact) — a manually-supplied email rescues that,
-    // same as phone_number does for a customer with no phone on file.
-    if (manualEmail) {
-      overrideEmail = manualEmail;
-    } else if (!onFileEmail) {
-      const subject = hydrated.phoneSubject || "customer";
+    // separate ServiceTrade Contact) — a manually-supplied email/phone rescues
+    // that, same as phone_number does for the voice/sms channels below.
+    const deliveryMethod = callSettings.chat_link_delivery_method;
+    const email = manualEmail || onFileEmail;
+    const phone = manualPhone || onFilePhone;
+    const subject = hydrated.phoneSubject || "customer";
+
+    if (deliveryMethod === "email" && !email) {
       return {
         ok: false, status: 422, code: "missing_email", subject,
         error: `No ${subject} email on file. Pass email to send a chat-link confirmation to a specific address.`,
       };
     }
+    if (deliveryMethod === "sms" && !phone) {
+      return {
+        ok: false, status: 422, code: "missing_phone", subject,
+        error: `No ${subject} phone number on file. Pass phone_number to text a chat confirmation to a specific number.`,
+      };
+    }
+    if (deliveryMethod === "both" && !email && !phone) {
+      return {
+        ok: false, status: 422, code: "missing_contact_info", subject,
+        error: `No ${subject} email or phone on file. Pass email and/or phone_number to send a chat confirmation.`,
+      };
+    }
+
+    if (manualEmail) overrideEmail = manualEmail;
+    if (manualPhone) overridePhone = manualPhone;
     // scheduled_calls still stores a phone_number column (used for queue dedup);
     // pass through whatever's on file without requiring it for this channel.
     hydrated.params.phoneNumber = manualPhone || hydrated.params.phoneNumber || null;
@@ -171,7 +203,6 @@ async function triggerManualCall({
   }
 
   // ── 4. Determine when ──────────────────────────────────────────────────────
-  const callSettings = await callSettingsDb.getByCompanyId(companyId);
   const { rows: co } = await db.query(`SELECT default_timezone, sms_status FROM companies WHERE id = $1`, [companyId]);
   const smsLive = co[0]?.sms_status === "live";
 
@@ -220,7 +251,12 @@ async function triggerManualCall({
       // Carries the manual email override through to the dispatcher (which
       // runs as a separate step below and re-reads the row from the DB —
       // it has no other way to see a value that was never persisted).
-      ...(overrideEmail && { callContext: { override_email: overrideEmail } }),
+      ...((overrideEmail || overridePhone) && {
+        callContext: {
+          ...(overrideEmail && { override_email: overrideEmail }),
+          ...(overridePhone && { override_phone: overridePhone }),
+        },
+      }),
     });
   } catch (err) {
     if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") {
@@ -254,9 +290,14 @@ async function triggerManualCall({
   );
   const finalRow = after[0] || row;
   const dialed = !!finalRow.retell_call_id;
-  // web_chat has no retell_call_id until the customer opens the link — its
-  // success signal is the row completing with a chat_link_token instead.
-  const emailSent = resolvedChannel === "web_chat" && finalRow.status === "completed";
+  // web_chat and sms ("Text Now") both text/email a chat_links link now —
+  // neither has a retell_call_id until the customer opens it (sms no longer
+  // starts a live Retell conversation). Their success signal is the row
+  // completing with a chat_link_token instead. Note: this reflects the row
+  // completing, not which medium(s) actually succeeded (same coarse signal
+  // for both fields — the underlying dispatch sends email and/or SMS
+  // independently and best-effort; see scheduler.js).
+  const linkDispatched = (resolvedChannel === "web_chat" || resolvedChannel === "sms") && finalRow.status === "completed";
   return {
     ok: true,
     status: 201,
@@ -264,7 +305,12 @@ async function triggerManualCall({
     dialed,
     retellCallId: finalRow.retell_call_id || null,
     ...(resolvedChannel === "web_chat" && {
-      emailSent,
+      emailSent: linkDispatched,
+      smsSent: linkDispatched,
+      chatLinkToken: finalRow.chat_link_token || null,
+    }),
+    ...(resolvedChannel === "sms" && {
+      smsSent: linkDispatched,
       chatLinkToken: finalRow.chat_link_token || null,
     }),
   };

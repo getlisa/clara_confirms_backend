@@ -26,6 +26,8 @@ const { HYDRATORS } = require("./call-hydration");
 const db = require("../db");
 const retell = require("./retell");
 const chatLinkEmail = require("./chat-link-email");
+const chatLinkSms = require("./chat-link-sms");
+const { toE164 } = require("../utils/phone");
 const { formatSpokenDateTime, formatSpokenDateOnly } = require("../utils/timezone");
 
 // Sent as the synthetic first "user" turn to reliably trigger the agent's
@@ -232,6 +234,65 @@ async function sendConfirmationEmailForJob(companyId, jobId, callType = "custome
 }
 
 /**
+ * Send (or re-send) a link's confirmation SMS — the Twilio-backed counterpart
+ * to sendConfirmationEmail above. Same link, delivered by text instead of
+ * email. NOT the conversational Retell "Text Now" feature — a plain text
+ * with a URL.
+ *
+ * @param {object} link
+ * @param {string|null} [overridePhone] — send here instead of the customer's
+ *   on-file phone. Same idea as overrideEmail above.
+ */
+async function sendConfirmationSms(link, overridePhone = null) {
+  const ctx = await loadLinkContext(link);
+  if (!ctx.ok) return ctx;
+  const { company, hydrated } = ctx;
+
+  let phone = overridePhone ? toE164(overridePhone) : null;
+  if (overridePhone && !phone) {
+    return { ok: false, status: 400, error: "Invalid phone_number — could not normalize to a valid E.164 number." };
+  }
+  if (!phone) {
+    const { rows } = await db.query(
+      `SELECT c.phone FROM jobs j JOIN customers c ON c.id = j.customer_id
+       WHERE j.id = $1 AND j.company_id = $2`,
+      [link.job_id, link.company_id]
+    );
+    phone = rows[0]?.phone ? toE164(rows[0].phone) : null;
+  }
+  if (!phone) {
+    return {
+      ok: false, status: 422,
+      error: "Customer has no phone on file. Pass phone to send to a specific number.",
+    };
+  }
+
+  const sent = await chatLinkSms.sendConfirmationLinkSms({
+    phone,
+    customerName: hydrated.params.customerName || null,
+    companyName: company.name,
+    jobName: hydrated.params.jobName || null,
+    token: link.token,
+  });
+
+  return { ok: true, token: link.token, phone, sent };
+}
+
+async function sendConfirmationSmsForAppointment(companyId, appointmentId, callType = "customer_confirmation", overridePhone = null) {
+  const created = await createChatLinkForAppointment(companyId, appointmentId, callType);
+  if (!created.ok) return created;
+  const link = await chatLinksDb.getByToken(created.token);
+  return sendConfirmationSms(link, overridePhone);
+}
+
+async function sendConfirmationSmsForJob(companyId, jobId, callType = "customer_confirmation", overridePhone = null) {
+  const created = await createChatLinkForJob(companyId, jobId, callType);
+  if (!created.ok) return created;
+  const link = await chatLinksDb.getByToken(created.token);
+  return sendConfirmationSms(link, overridePhone);
+}
+
+/**
  * Create a brand-new Retell chat session for this link and trigger its
  * opening message. Shared by first-open and reopen-after-expiry — the only
  * difference is how the winning chat_id gets written back (claim onto a null
@@ -383,6 +444,8 @@ module.exports = {
   createChatLinkForJob,
   sendConfirmationEmailForAppointment,
   sendConfirmationEmailForJob,
+  sendConfirmationSmsForAppointment,
+  sendConfirmationSmsForJob,
   resolveChatLink,
   sendChatMessage,
   filterVisibleMessages,
