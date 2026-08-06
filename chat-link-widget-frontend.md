@@ -1,8 +1,12 @@
 # Chat links — Frontend Integration Guide
 
 > Covers a **third** way to reach the same conversation flow, alongside voice
-> and SMS: a shareable link for a specific job/appointment that opens **our
-> own** full-page, ChatGPT-style chat interface — not Retell's widget. This
+> and SMS: a shareable link for a specific **job** that opens **our
+> own** full-page, ChatGPT-style chat interface — not Retell's widget. The
+> conversation is **job-centric**: it covers every upcoming appointment on that
+> job, confirms the next one, and offers to confirm the rest before ending. (An
+> appointment-scoped link resolves to that appointment's parent job and behaves
+> identically.) This
 > sidesteps the SMS A2P approval cost/timeline entirely — no phone number, no
 > Retell public key, no Retell script tag on the page at all. The frontend
 > talks only to this backend; everything Retell-related (creating the chat
@@ -14,8 +18,10 @@
 ## 0. What shipped (backend)
 
 - `POST /chat-links/appointments/:id` and `POST /chat-links/jobs/:id` —
-  authenticated (staff), generates (or reuses) an opaque, unguessable token
-  for that specific job/appointment.
+  authenticated (staff), generates (or reuses) an opaque, unguessable token.
+  **`/jobs/:id` is the preferred entry point** now that the conversation is
+  job-scoped; `/appointments/:id` is kept for the appointment-card action and
+  resolves to the parent job.
 - `GET /chat-links/:token` — **public, no auth** — the token itself is the
   credential. Creates the real chat session on first open (triggering the
   agent's opening greeting — verified live, the agent always speaks first,
@@ -67,10 +73,31 @@ Defaults to `"customer_confirmation"` — this is the only call type the
 chat-link feature currently drives.
 
 **Response `201`:** `{ "token": "a4fce883…" }` — idempotent, calling again for
-the same job/appointment returns the same token rather than minting a new one.
+the same job/appointment returns the same token rather than minting a new one
+**as long as it hasn't expired**.
+
+**Expiry — new:** every link is now valid for **24 hours** from creation.
+After that, `GET /chat-links/:token` returns `410 link_expired` (§5) and the
+idempotent lookup above stops returning it — a fresh `POST` mints a new token
+instead. This isn't just a widget-side concern: if a link goes out via the
+automatic scheduler and sits unopened for 24h, the backend treats that the
+same as a voice no-answer and automatically re-queues the confirmation (voice,
+if the customer has `is_voice` on file — see `chat-sms-channel-frontend.md`
+§2 — otherwise a fresh link), up to that job's normal retry cap. Nothing for
+the frontend to build here beyond handling `410` gracefully; it's mentioned so
+"the link died and nothing happened" isn't mistaken for a bug — a new attempt
+is already on its way.
 
 **Errors:** `404` if the job/appointment doesn't exist for this company; `422`
-if the appointment is cancelled or its time has already passed.
+if there is nothing left to talk about — the job is cancelled/completed, or it
+has no upcoming appointment. A job with *past* appointments is fine: the chat
+covers whatever is still upcoming.
+
+Note the asymmetry: that `422` applies at **creation** time. Once a link has been
+delivered, `GET /chat-links/:token` deliberately still opens even if every
+appointment has since been cancelled or has passed — the customer clicking a link
+you sent them should never hit a dead page, and the agent simply offers to book a
+new visit instead.
 
 ### Sending it by email — `POST /chat-links/appointments/:id/send-email` / `POST /chat-links/jobs/:id/send-email`
 Same auth, same idempotent link (re-using an existing token rather than
@@ -144,12 +171,17 @@ No auth header — fetched from an anonymous customer's browser.
   "job_name": "Construction Job #44399940",
   "customer_name": "JACK LTR",
   "messages": [
-    { "role": "agent", "content": "Hi JACK LTR, this is Clara calling from Testing Enterprise. I'm reaching out about the Construction Job #44399940 job scheduled for Thursday, July 23, 2026 at 09:30 AM. Is now a good time to talk?", "created_at": 1784819388725 }
+    { "role": "agent", "content": "Hi JACK LTR, this is Clara with Testing Enterprise. I'm reaching out about your Construction Job #44399940 — you have 3 upcoming appointments on it, and the next one is on Thursday, July 23, 2026 at 09:30 AM for a Sprinkler / Fire Protection inspection. Is now a good time to chat?", "created_at": 1784819388725 }
   ],
   "state": "chat_started",
-  "input_hint": { "type": "quick_replies", "options": ["Yes", "No", "Reschedule", "Cancel"] }
+  "input_hint": { "type": "quick_replies", "options": ["Yes", "Reschedule", "Cancel"] }
 }
 ```
+The greeting adapts to how many appointments are upcoming: with **one** it names
+just that appointment and never mentions a count (no "1 upcoming appointments");
+with **none** it says no visit is booked yet and offers to schedule one. It leads
+with the date and service rather than an appointment ID — internal IDs mean
+nothing to a customer, so the agent only gives one if asked.
 `messages` only ever contains real chat turns (`role: "agent" | "user"`) —
 internal tool-call/routing plumbing is already filtered out server-side.
 Calling this again later (e.g. the customer reopens the link, or just
@@ -162,8 +194,8 @@ scenes instead of erroring: the response still contains the full prior
 history, followed by a new opening-style greeting, and `state`/`input_hint`
 reset back to `chat_started`/`quick_replies` for that new turn (the agent's
 own next tool calls will reflect whatever's actually true in the platform —
-e.g. if the appointment was already confirmed before the gap, it'll pick that
-up rather than re-asking from scratch). Nothing distinguishes this response
+e.g. if some appointments were already confirmed before the gap, it'll pick
+that up rather than re-asking from scratch). Nothing distinguishes this response
 shape from a normal resume — treat it the same way, just render the returned
 `messages` in order.
 
@@ -171,7 +203,7 @@ shape from a normal resume — treat it the same way, just render the returned
 | State | Meaning |
 |---|---|
 | `chat_started` | Greeting sent, awaiting the customer's initial decision |
-| `confirmation_accepted` | Customer confirmed the appointment |
+| `confirmation_accepted` | Customer confirmed **at least one** appointment on the job — normally the next one. Other upcoming appointments may still be unconfirmed; the agent asks about those before ending |
 | `collecting_contact_info` | Agent is resolving/collecting a contact for the service link |
 | `service_link_sent` | Service link emailed + pasted into the chat |
 | `reschedule_needed` | Customer wants to reschedule, no date picked yet |
@@ -182,8 +214,8 @@ shape from a normal resume — treat it the same way, just render the returned
 ### `input_hint` reference — what to render for the next input
 | `type` | Fields | Render |
 |---|---|---|
-| `quick_replies` | `options: string[]` | Buttons instead of a text box — send the clicked label as `content` |
-| `date_picker` | `min`, `max` (YYYY-MM-DD) | Calendar/time picker constrained to before the job/appointment's due date — send the picked value as a plain formatted string through the same `content` field (e.g. `"August 5th at 2pm"`) — the flow already parses natural-language dates, no special payload needed |
+| `quick_replies` | `options: string[]` | Buttons instead of a text box — send the clicked label as `content`. **State-dependent**: `["Yes","Reschedule","Cancel"]` at `chat_started`; `["Yes, confirm the rest","No, just this one"]` at `confirmation_accepted` when the job still has other unconfirmed upcoming appointments |
+| `date_picker` | `min`, `max` (YYYY-MM-DD) | Calendar/time picker constrained to before the job's due date. Rescheduling moves **one** appointment — the job's other appointments are untouched — send the picked value as a plain formatted string through the same `content` field (e.g. `"August 5th at 2pm"`) — the flow already parses natural-language dates, no special payload needed |
 | `email_form` | — | Single email field |
 | `free_text` | — | Normal chat input (default/fallback) |
 
@@ -237,7 +269,8 @@ it optimistically the moment the user hits send, same as any chat UI).
 
 | Response | Meaning | Suggested UI |
 |---|---|---|
-| `404` | Token doesn't exist (or expired, once expiry is used) | "This chat link is no longer valid." |
+| `404` | Token doesn't exist at all | "This chat link is no longer valid." |
+| `410` `{code:"link_expired"}` | Token existed but its 24h window has passed | "This confirmation link has expired — please contact us to reschedule." Distinct from 404 because it's a much more common case: every link now expires 24h after being sent, and an unopened one is automatically re-queued on a different channel (see below) rather than silently going nowhere. |
 | `503` | Token is valid but the company's chat agent isn't provisioned yet | "Chat isn't available for this yet — please call us instead." |
 
 ---
@@ -249,9 +282,13 @@ it optimistically the moment the user hits send, same as any chat UI).
   new link when a rescheduled appointment needs reconfirmation) is a separate,
   larger piece of backend work, not yet built.
 - Any delivery mechanism (emailing the link, etc.) — link generation only.
-- Link expiry — the schema supports it (`expires_at`), but nothing sets it yet.
 - Revoking/rotating a link once shared.
 - Rate limiting / abuse protection on the public endpoints.
+- Per-appointment confirmation as separate customer turns — confirming the
+  remaining appointments is one batch action driven by the single "confirm the
+  rest?" question, not a loop the UI walks through.
+- A distinct chat state for that "confirm the rest?" turn — it reuses
+  `confirmation_accepted` with a context-sensitive `input_hint`.
 - A distinct `contact_form` (name/email/phone) input hint for when the
   customer isn't found in the CRM — `collecting_contact_info` currently always
   hints `email_form`; the agent's own message will ask for more details in

@@ -651,22 +651,41 @@ async function handleRetryOrCallback({ companyId, retellCallId, inVoicemail, isN
   const smsLive = coRows[0]?.sms_status === "live";
   const cs = await callSettingsDb.getByCompanyId(companyId);
 
-  // Per-customer channel override, resolved by phone number (scheduled_calls
-  // doesn't carry a customer_id — the phone number is the join key we have).
-  const { rows: custRows } = await db.query(
-    `SELECT preferred_channel FROM customers WHERE company_id = $1 AND phone = $2 LIMIT 1`,
-    [companyId, sc.phone_number]
-  );
-  const preferredChannel = custRows[0]?.preferred_channel ?? null;
+  // Per-customer channel flags. Resolved via the row's own job_id → customer
+  // link when it's a real numeric job id — NOT by matching phone_number,
+  // which used to be safe because scheduled_calls.phone_number was always
+  // the customer's own phone. Since migration 081 (confirmation recipients),
+  // a row's phone_number can belong to a non-customer recipient (a property
+  // manager, etc.), which would never match any customers.phone row and
+  // silently degrade every recipient-row retry to the channelStrategy
+  // fallback. Falls back to the phone match for synthetic job ids
+  // ('quotation:N', 'service_opportunity:N-N') that don't resolve to a real
+  // job — those never carry a recipient_contact_id anyway.
+  let flags = null;
+  if (/^\d+$/.test(String(sc.job_id || ""))) {
+    const { rows: custRows } = await db.query(
+      `SELECT c.is_voice, c.is_sms, c.is_email
+         FROM jobs j JOIN customers c ON c.id = j.customer_id
+        WHERE j.id = $1 AND j.company_id = $2`,
+      [sc.job_id, companyId]
+    );
+    if (custRows[0]) flags = { is_voice: custRows[0].is_voice, is_sms: custRows[0].is_sms, is_email: custRows[0].is_email };
+  }
+  if (!flags) {
+    const { rows: custRows } = await db.query(
+      `SELECT is_voice, is_sms, is_email FROM customers WHERE company_id = $1 AND phone = $2 LIMIT 1`,
+      [companyId, sc.phone_number]
+    );
+    if (custRows[0]) flags = { is_voice: custRows[0].is_voice, is_sms: custRows[0].is_sms, is_email: custRows[0].is_email };
+  }
 
   // ── CALLBACK: customer asked to be called at a specific time ──────────────
+  // Always voice — a callback is only ever requested during a live voice
+  // conversation, so there's no link-delivery variant of it.
   if (customerOutcome === "callback_requested" && callbackTime) {
     const callbackAt = parseCallbackTime(callbackTime, tz);
     if (callbackAt && callbackAt > new Date()) {
-      const channel = resolveOutboundChannel({
-        smsLive, preferredChannel, channelStrategy: cs.channel_strategy,
-        isCallback: true, smsOnCallbackEnabled: cs.sms_on_callback_enabled,
-      });
+      const { channel } = resolveOutboundChannel({ smsLive, flags, channelStrategy: cs.channel_strategy, isCallback: true });
       const created = await scheduledCallsDb.scheduleCallback(sc, callbackAt.toISOString(), sc.job_due_date, channel);
       if (created) {
         logger.info("Callback scheduled", { companyId, parentId: sc.id, callbackAt, jobId: sc.job_id, channel });
@@ -681,11 +700,27 @@ async function handleRetryOrCallback({ companyId, retellCallId, inVoicemail, isN
 
   // ── RETRY: no-answer or voicemail ─────────────────────────────────────────
   if (inVoicemail || isNoAnswer) {
+    const voiceExhausted = sc.retry_count + 1 >= MAX_NO_ANSWER_RETRIES;
+
+    // Voice attempts are used up and the customer also has an sms/email flag
+    // on file — one chat-link send instead of going silently terminal.
+    // Guarded to only fire from an actual voice row (never from a row that's
+    // itself already a link — that's how a voice<->link ping-pong would start).
+    if (voiceExhausted && sc.channel === "voice") {
+      const { linkDelivery } = resolveOutboundChannel({ smsLive, flags, channelStrategy: cs.channel_strategy, voiceExhausted: true });
+      if (linkDelivery) {
+        const created = await scheduledCallsDb.fallbackToLink(sc, linkDelivery);
+        if (created) {
+          logger.info("Voice retries exhausted — fell back to chat link", { companyId, parentId: sc.id, jobId: sc.job_id, linkDelivery });
+        } else {
+          logger.info("Voice retries exhausted — link fallback not created (duplicate or past due)", { companyId, parentId: sc.id });
+        }
+        return;
+      }
+    }
+
     const nextWindow = getNextWindowStart(cs, tz); // next business-hours slot
-    const channel = resolveOutboundChannel({
-      smsLive, preferredChannel, channelStrategy: cs.channel_strategy,
-      attemptNumber: sc.retry_count + 1,
-    });
+    const { channel } = resolveOutboundChannel({ smsLive, flags, channelStrategy: cs.channel_strategy, voiceExhausted });
     const created = await scheduledCallsDb.scheduleRetry(sc, nextWindow.toISOString(), sc.job_due_date, MAX_NO_ANSWER_RETRIES, tz, channel);
     if (created) {
       logger.info("Retry scheduled", {

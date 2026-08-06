@@ -161,11 +161,33 @@ function formatSpokenDateOnly(dateOnly) {
   return new Date(dateOnly).toLocaleDateString("en-US", { timeZone: "UTC", weekday: "long", year: "numeric", month: "long", day: "numeric" });
 }
 
+/**
+ * The calendar day a timestamp falls on IN `tz`, as "YYYY-MM-DD" — for writing
+ * an instant into a DATE column.
+ *
+ * Letting Postgres cast the timestamp instead would truncate it in the session
+ * timezone (UTC here), so an 8pm America/Chicago appointment (01:00 UTC next
+ * day) would land on the FOLLOWING calendar day. That matters wherever a DATE
+ * gates scheduling — `scheduled_calls.job_date` is compared against retry and
+ * callback windows, so a day-late value can allow a retry after the appointment
+ * has already happened.
+ */
+function toLocalDateOnly(input, tz) {
+  if (input == null) return null;
+  const date = input instanceof Date ? input : new Date(input);
+  if (isNaN(date.getTime())) return null;
+  // en-CA renders as YYYY-MM-DD, which is exactly the DATE literal Postgres wants.
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz || DEFAULT_TZ, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(date);
+}
+
 module.exports = {
   DEFAULT_TZ,
   getCompanyTimezone,
   localToUTC,
   toOffsetISOString,
+  toLocalDateOnly,
   localizeFields,
   localizeRows,
   formatSpokenDate,

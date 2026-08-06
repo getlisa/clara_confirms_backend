@@ -18,6 +18,10 @@ const chatLinksDb = require("../db/chat-links");
 const { toE164 } = require("../utils/phone");
 const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
+const {
+  buildJobConfirmationContext, toAppointmentsPayload,
+} = require("../services/job-confirmation-context");
+const { syncJobConfirmationStatus } = require("../services/job-confirmation-status");
 const { parseCallbackTime } = require("../services/callback-time");
 const { authenticate, getCompanyId: getCompanyIdFromToken } = require("../auth");
 const {
@@ -143,152 +147,41 @@ function localizeJobForAgent(job, tz) {
   };
 }
 
-// ── GET JOB ───────────────────────────────────────────────────────────────────
+// ── GET APPOINTMENTS ──────────────────────────────────────────────────────────
 
 /**
- * Real service(s) this job/appointment is for, from the synced ServiceTrade
- * appointment detail (see migrations/065_appointment_services.sql) — a
- * confirmed GET /appointment/{id} response carries `serviceRequests[]` with a
- * full serviceLine object, which is a materially better call-context signal
- * than a bare job number. Empty array when nothing resolved (e.g. no service
- * request was ever attached, or the sync hasn't picked it up yet) — callers
- * fall back to the job's own title/description/job_type in that case.
+ * The ONE way appointment data reaches the agent, for both voice and chat.
+ *
+ * Replaces the old `get_job` (job + all its appointments) and `get_appointment`
+ * (one appointment by id). Job details are injected into the prompt as dynamic
+ * variables instead, so this tool is purely about appointments:
+ *   - job details are static for the length of a conversation → cheap to inject;
+ *   - appointment data is not (it changes as the agent confirms, reschedules,
+ *     cancels or creates), and Retell binds dynamic variables only once, so
+ *     injecting it would hand the agent a snapshot that silently goes stale.
+ *
+ * Returns every upcoming appointment (earliest first, `next` = the lead) plus a
+ * few past ones for "were you out here in June?". Only *_spoken timestamps are
+ * exposed — a raw ISO string gets read aloud verbatim.
  */
-async function fetchServicesForAppointment(companyId, appointmentId) {
-  const { rows } = await db.query(
-    `SELECT aps.description, aps.status, aps.completion, aps.estimated_price, aps.duration,
-            sl.name AS service_line_name, sl.trade AS service_line_trade
-       FROM appointment_services aps
-       LEFT JOIN service_lines sl ON sl.id = aps.service_line_id
-      WHERE aps.company_id = $1 AND aps.appointment_id = $2`,
-    [companyId, appointmentId]
-  );
-  return rows.map((r) => ({
-    service_line: [r.service_line_name, r.service_line_trade].filter(Boolean).join(" / ") || null,
-    description: r.description || null,
-    status: r.status || null,
-    completion: r.completion || null,
-    estimated_price: r.estimated_price ?? null,
-    duration: r.duration ?? null,
-  }));
-}
-
-/** Same as fetchServicesForAppointment but aggregated across every appointment on the job. */
-async function fetchServicesForJob(companyId, jobId) {
-  const { rows } = await db.query(
-    `SELECT aps.description, aps.status, aps.completion, aps.estimated_price, aps.duration,
-            sl.name AS service_line_name, sl.trade AS service_line_trade
-       FROM appointment_services aps
-       LEFT JOIN service_lines sl ON sl.id = aps.service_line_id
-      WHERE aps.company_id = $1 AND aps.job_id = $2`,
-    [companyId, jobId]
-  );
-  return rows.map((r) => ({
-    service_line: [r.service_line_name, r.service_line_trade].filter(Boolean).join(" / ") || null,
-    description: r.description || null,
-    status: r.status || null,
-    completion: r.completion || null,
-    estimated_price: r.estimated_price ?? null,
-    duration: r.duration ?? null,
-  }));
-}
-
-function buildJobSummary(job, tz) {
-  const c = job.customer || {};
-  const t = job.technician || {};
-
-  const activeAppointment = (job.appointments || [])
-    .filter(a => a.status === "scheduled")
-    .sort((a, b) => new Date(a.scheduled_start) - new Date(b.scheduled_start))[0] || null;
-
-  return {
-    job_id: job.id,
-    title: job.title,
-    description: job.description,
-    job_type: job.job_type,
-    status: job.status,
-    scheduled_date: formatSpokenDateOnly(job.scheduled_date),
-
-    customer: {
-      name: c.full_name,
-      phone: c.phone,
-      email: c.email,
-      address: [c.address_line1, c.city, c.state, c.zipcode].filter(Boolean).join(", ") || null,
-    },
-
-    technician: t.name ? {
-      name: t.name,
-      phone: t.phone,
-    } : null,
-
-    active_appointment: activeAppointment ? {
-      appointment_id: activeAppointment.id,
-      scheduled_start: formatSpokenDateTime(activeAppointment.scheduled_start, tz),
-      scheduled_end: formatSpokenDateTime(activeAppointment.scheduled_end, tz),
-      customer_confirmed: activeAppointment.customer_confirmed ?? false,
-      technician_confirmed: activeAppointment.technician_confirmed ?? false,
-      technician: activeAppointment.technician_name || null,
-    } : null,
-
-    has_active_appointment: !!activeAppointment,
-  };
-}
-
-router.post("/get_job", async (req, res) => {
+router.post("/get_appointments", async (req, res) => {
   if (!verifyToolSecret(req, res)) return;
   try {
     const companyId = getCompanyId(req);
     const { job_id } = getArgs(req);
     if (!companyId || !job_id) return res.status(400).json({ error: "company_id and job_id are required" });
 
-    const job = await jobsDb.getJobById(Number(job_id), companyId);
-    if (!job) return res.status(404).json({ error: "Job not found" });
+    const ctx = await buildJobConfirmationContext(companyId, job_id);
+    if (!ctx.ok) return res.status(ctx.status || 404).json({ error: ctx.error });
 
-    const tz = await getCompanyTimezone(companyId);
-    const services = await fetchServicesForJob(companyId, job.id);
-
-    logger.info("Tool: get_job", { companyId, job_id, serviceCount: services.length, tz });
-    return res.json({ job: { ...buildJobSummary(job, tz), services } });
-  } catch (err) {
-    logger.error("Tool get_job failed", { error: err.message });
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-// ── GET APPOINTMENT ───────────────────────────────────────────────────────────
-
-router.post("/get_appointment", async (req, res) => {
-  if (!verifyToolSecret(req, res)) return;
-  try {
-    const companyId = getCompanyId(req);
-    const { appointment_id } = getArgs(req);
-    if (!companyId || !appointment_id) return res.status(400).json({ error: "company_id and appointment_id are required" });
-
-    const appointment = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
-    if (!appointment) return res.status(404).json({ error: "Appointment not found" });
-
-    // getAppointmentById doesn't carry job context — pull the parent job's
-    // title/description/job_type as the fallback when no service resolves below.
-    const { rows: jobRows } = await db.query(
-      `SELECT title, description, job_type FROM jobs WHERE id = $1 AND company_id = $2`,
-      [appointment.job_id, companyId]
-    );
-    const jobInfo = jobRows[0] || {};
-    const tz = await getCompanyTimezone(companyId);
-    const services = await fetchServicesForAppointment(companyId, appointment.id);
-
-    logger.info("Tool: get_appointment", { companyId, appointment_id, serviceCount: services.length, tz });
-    return res.json({
-      appointment: {
-        ...localizeAppointmentForAgent(appointment, tz),
-        job_title: jobInfo.title ?? null,
-        job_description: jobInfo.description ?? null,
-        job_type: jobInfo.job_type ?? null,
-        services,
-      },
+    const payload = toAppointmentsPayload(ctx);
+    logger.info("Tool: get_appointments", {
+      companyId, job_id, tz: ctx.tz,
+      upcoming: payload.upcoming_count, unconfirmed: payload.unconfirmed_count, past: payload.past.length,
     });
+    return res.json(payload);
   } catch (err) {
-    logger.error("Tool get_appointment failed", { error: err.message });
+    logger.error("Tool get_appointments failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });
@@ -319,11 +212,127 @@ router.post("/confirm_appointment", async (req, res) => {
     const refs = await resolveConfirmationRefs(companyId, conversationId);
     if (refs) await maybeSendServiceLinkNow(companyId, conversationId, refs);
 
+    // The job only becomes 'confirmed' once every upcoming appointment is.
+    const jobStatus = await syncJobConfirmationStatus(companyId, appointment.job_id);
+
+    // Tell the agent what's LEFT, so it knows whether to ask the
+    // "confirm the others too?" question before wrapping up.
+    const after = await buildJobConfirmationContext(companyId, appointment.job_id);
     const tz = await getCompanyTimezone(companyId);
-    logger.info("Tool: confirm_appointment", { companyId, appointment_id });
-    return res.json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
+    logger.info("Tool: confirm_appointment", {
+      companyId, appointment_id, jobStatus,
+      remainingUnconfirmed: after.ok ? after.counts.unconfirmed : null,
+    });
+    return res.json({
+      success: true,
+      appointment: localizeAppointmentForAgent(appointment, tz),
+      ...(after.ok && {
+        remaining_unconfirmed: after.counts.unconfirmed,
+        all_upcoming_confirmed: after.counts.all_confirmed,
+        remaining_appointments: after.appointments.upcoming
+          .filter((a) => !a.customer_confirmed)
+          .map((a) => ({
+            appointment_id: a.appointment_id,
+            scheduled_start: a.scheduled_start_spoken,
+            service_line: a.service_line,
+            technician: a.technician,
+          })),
+      }),
+    });
   } catch (err) {
     logger.error("Tool confirm_appointment failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── CONFIRM SEVERAL APPOINTMENTS ON A JOB ─────────────────────────────────────
+
+/**
+ * Batch confirm, for the "would you like to confirm the other appointments as
+ * well?" moment at the end of a job-centric conversation.
+ *
+ * Not a client-side loop over `confirm_appointment`: that tool has
+ * `speak_after_execution: true`, so N calls make the agent narrate N times, and
+ * models drop writes in long sequential tool chains. One call here is also one
+ * job-status recompute and one service-link check.
+ *
+ * Requested ids that aren't confirmable come back in `skipped` with a reason
+ * rather than as an error — a 4xx makes the agent apologise to the customer for
+ * something that isn't a problem.
+ */
+router.post("/confirm_job_appointments", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    const { job_id, appointment_ids, confirm_all } = getArgs(req);
+    if (!companyId || !job_id) return res.status(400).json({ error: "company_id and job_id are required" });
+
+    const wantsAll = confirm_all === true || confirm_all === "true";
+    // Accept a comma/space-separated string OR an array — models are inconsistent
+    // about which they emit for a list-shaped parameter.
+    const requestedIds = wantsAll
+      ? []
+      : (Array.isArray(appointment_ids) ? appointment_ids : String(appointment_ids ?? "").split(/[,\s]+/))
+          .map((v) => String(v).trim())
+          .filter(Boolean);
+    if (!wantsAll && requestedIds.length === 0) {
+      return res.status(400).json({ error: "Pass confirm_all=true or a non-empty appointment_ids list" });
+    }
+
+    const ctx = await buildJobConfirmationContext(companyId, job_id);
+    if (!ctx.ok) return res.status(ctx.status || 404).json({ error: ctx.error });
+
+    const upcomingById = new Map(ctx.appointments.upcoming.map((a) => [String(a.appointment_id), a]));
+    const targets = [];
+    const skipped = [];
+
+    if (wantsAll) {
+      targets.push(...ctx.appointments.upcoming.filter((a) => !a.customer_confirmed));
+    } else {
+      for (const id of requestedIds) {
+        const appt = upcomingById.get(id);
+        if (!appt) {
+          // Either it belongs to a different job, or it's already past/cancelled.
+          skipped.push({ appointment_id: id, reason: "not_an_upcoming_appointment_on_this_job" });
+        } else if (appt.customer_confirmed) {
+          skipped.push({ appointment_id: id, reason: "already_confirmed" });
+        } else {
+          targets.push(appt);
+        }
+      }
+    }
+
+    for (const appt of targets) {
+      await jobsDb.updateAppointment(appt.appointment_id, companyId, { customer_confirmed: true });
+    }
+
+    const jobStatus = targets.length ? await syncJobConfirmationStatus(companyId, ctx.job.id) : ctx.job.status;
+
+    if (targets.length) {
+      const conversationId = getConversationId(req);
+      await chatLinksDb.setState(conversationId, "confirmation_accepted").catch(() => {});
+      const refs = await resolveConfirmationRefs(companyId, conversationId);
+      if (refs) await maybeSendServiceLinkNow(companyId, conversationId, refs);
+    }
+
+    const after = await buildJobConfirmationContext(companyId, ctx.job.id);
+    logger.info("Tool: confirm_job_appointments", {
+      companyId, job_id, confirmAll: wantsAll,
+      confirmed: targets.length, skipped: skipped.length, jobStatus,
+    });
+    return res.json({
+      success: true,
+      confirmed: targets.map((a) => a.appointment_id),
+      skipped,
+      job_status: jobStatus,
+      remaining_unconfirmed: after.ok ? after.counts.unconfirmed : null,
+      all_upcoming_confirmed: after.ok ? after.counts.all_confirmed : null,
+      ...(targets.length === 0 && {
+        message: "Nothing left to confirm — those appointments were already confirmed.",
+      }),
+    });
+  } catch (err) {
+    logger.error("Tool confirm_job_appointments failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });
@@ -347,6 +356,11 @@ router.post("/reschedule_appointment", async (req, res) => {
     const appointment = await jobsDb.updateAppointment(Number(appointment_id), companyId, {
       scheduled_start: startUTC,
       scheduled_end: endUTC,
+      // A moved appointment is no longer confirmed — the customer agreed to the
+      // OLD time. Leaving this true let a job read 'confirmed' for a slot nobody
+      // ever agreed to, and kept the service-link gate open on stale consent.
+      customer_confirmed: false,
+      customer_confirmed_at: null,
     });
     if (!appointment) return res.status(404).json({ error: "Appointment not found" });
 
@@ -358,6 +372,9 @@ router.post("/reschedule_appointment", async (req, res) => {
 
     // Chat state tracking — harmless no-op for voice/SMS.
     await chatLinksDb.setState(getConversationId(req), "reschedule_pending_confirmation").catch(() => {});
+
+    // Now unconfirmed again, so a 'confirmed' job must fall back to 'scheduled'.
+    await syncJobConfirmationStatus(companyId, appointment.job_id);
 
     logger.info("Tool: reschedule_appointment", { companyId, appointment_id, scheduled_start, startUTC, tz });
     return res.json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
@@ -393,6 +410,10 @@ router.post("/create_appointment", async (req, res) => {
       `UPDATE jobs SET status = 'scheduled', updated_at = NOW() WHERE id = $1 AND company_id = $2 AND status = 'open'`,
       [job_id, companyId]
     );
+    // The new appointment is unconfirmed, so a job sitting at 'confirmed' has to
+    // drop back to 'scheduled' — otherwise the confirmation sweep skips it and
+    // this appointment never gets a confirmation call.
+    await syncJobConfirmationStatus(companyId, Number(job_id));
 
     // Mirror to ServiceTrade: create the appointment there and stamp the id back.
     // Best-effort, awaited; never fails the tool (platform is source of truth).
@@ -484,6 +505,11 @@ router.post("/cancel_appointment", async (req, res) => {
           WHERE id = $2 AND company_id = $3`,
         [retellCallId, existing.job_id, companyId]
       );
+    } else {
+      // Cancelling the one unconfirmed visit can leave the rest all confirmed,
+      // which makes the job 'confirmed'. (Skipped for entire_job — the job is
+      // 'cancelled' now and syncJobConfirmationStatus won't touch that status.)
+      await syncJobConfirmationStatus(companyId, existing.job_id);
     }
 
     // ── Mirror to ServiceTrade (best-effort; awaited; never fails the tool) ──
@@ -806,25 +832,34 @@ async function resolveConfirmationRefs(companyId, retellCallId) {
 }
 
 /**
- * Whether the appointment behind this conversation is already confirmed —
- * the code-level gate for sending the service link live, mid-call, instead
- * of waiting for the post-call webhook. Deliberately checked in the DB
+ * Whether ANY upcoming appointment on this conversation's job is confirmed —
+ * the code-level gate for sending the service link live, mid-conversation,
+ * instead of waiting for the post-call webhook. Deliberately checked in the DB
  * (not inferred from conversation/tool-call order) since that ordering is
  * prompt-driven and not reliable to depend on.
- * Only meaningful for scheduled (voice/sms-channel) calls — a raw web-chat-
- * link session has no scheduled_call_id/appointment, and already has its own
- * unconditional instant-send in get_service_link.
+ *
+ * Keyed on the JOB, not on `scheduled_calls.appointment_id`, for two reasons:
+ *   - that column holds the appointment we DISPATCHED about, which in a
+ *     job-centric conversation is often not the one the agent actually
+ *     confirmed (the agent leads with the true next-upcoming);
+ *   - requiring a scheduled_call_id made this return false for every chat
+ *     session, since a web-chat link has no scheduled_calls row.
+ * `refs.job_id` is populated from either source by resolveConfirmationRefs.
  */
 async function isAppointmentConfirmed(companyId, refs) {
-  if (!refs?.scheduled_call_id) return false;
+  const jobId = Number(refs?.job_id);
+  if (!Number.isInteger(jobId) || jobId <= 0) return false; // 'quotation:N' etc.
   const { rows } = await db.query(
-    `SELECT a.customer_confirmed
-       FROM scheduled_calls sc
-       LEFT JOIN appointments a ON a.id = sc.appointment_id
-      WHERE sc.id = $1 AND sc.company_id = $2`,
-    [refs.scheduled_call_id, companyId]
+    `SELECT 1
+       FROM appointments a
+      WHERE a.company_id = $1 AND a.job_id = $2
+        AND a.status IN ('scheduled', 'confirmed', 'rescheduled')
+        AND a.scheduled_start > NOW()
+        AND a.customer_confirmed = true
+      LIMIT 1`,
+    [companyId, jobId]
   );
-  return rows[0]?.customer_confirmed === true;
+  return rows.length > 0;
 }
 
 /**

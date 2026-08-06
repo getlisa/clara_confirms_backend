@@ -42,7 +42,7 @@ const POST_CALL_ANALYSIS_DATA = [
   {
     type: "enum",
     name: "appointment_confirmed",
-    description: "Whether the customer confirmed their upcoming service appointment",
+    description: "Whether the customer confirmed the NEXT upcoming appointment discussed (the lead appointment). A job can have several upcoming appointments — ignore the others here; remaining_appointments_confirmed covers those.",
     choices: ["yes", "no", "unclear"],
   },
   {
@@ -66,7 +66,7 @@ const POST_CHAT_ANALYSIS_DATA = [
   {
     type: "enum",
     name: "appointment_confirmed",
-    description: "Whether the customer confirmed their upcoming service appointment",
+    description: "Whether the customer confirmed the NEXT upcoming appointment discussed (the lead appointment). A job can have several upcoming appointments — ignore the others here; remaining_appointments_confirmed covers those.",
     choices: ["yes", "no", "unclear"],
   },
   {
@@ -141,6 +141,18 @@ const EXTRACT_VARIABLES = {
       type: "string", name: "service_link_email", required: false,
       description: "The email address the customer confirmed for receiving the service link. Only extract if service_link_requested is true.",
       conditional_prompt: "Only extract if service_link_requested is true",
+    },
+    // A job can have several upcoming appointments. The agent confirms the next
+    // one, then must offer to confirm the rest — these two record what happened
+    // with "the rest", which customer_outcome (about the lead appointment) can't.
+    {
+      type: "enum", name: "remaining_appointments_confirmed", required: false,
+      choices: ["all", "some", "none", "not_applicable"],
+      description: "For a job with MORE THAN ONE upcoming appointment: how many of the OTHER upcoming appointments the customer also confirmed. Use 'not_applicable' when the job had only one upcoming appointment, or the others were already confirmed.",
+    },
+    {
+      type: "boolean", name: "remaining_offer_made", required: false,
+      description: "Whether the agent asked the customer if they also wanted to confirm the other upcoming appointments on the job before ending. False if there WERE others still unconfirmed and the agent never asked.",
     },
   ],
   technician_confirmation: [

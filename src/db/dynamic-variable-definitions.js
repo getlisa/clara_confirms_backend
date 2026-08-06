@@ -30,9 +30,18 @@ const VARIABLE_SEEDS = [
   { name: "job_description",     sort_order: 42, resolved_from: "scheduled_calls.job_description", description: "What the job entails — used to answer customer questions." },
   { name: "job_type",            sort_order: 43, resolved_from: "scheduled_calls.job_type",       description: "Category of work, e.g. 'inspection', 'repair', 'maintenance'." },
   { name: "job_date",            sort_order: 44, resolved_from: "scheduled_calls.job_date",       description: "Formatted job date, e.g. 'Thursday, May 28, 2026'." },
+  { name: "job_number",          sort_order: 45, resolved_from: "job-confirmation-context (job details, live at dispatch)", description: "The CRM's own job number, e.g. '48767205' — what a customer would quote back to you. Falls back to the internal job id when the CRM has none." },
+  { name: "job_comments",        sort_order: 46, resolved_from: "job-confirmation-context (job details, live at dispatch)", description: "Scheduling comments the team left on the job, most recent first, joined with ' | '. 'none' when there are none." },
 
   // ── Appointment + quotation ─────────────────────────────────────────────────
-  { name: "appointment_id",      sort_order: 50, resolved_from: "scheduled_calls.appointment_id", description: "Numeric appointment ID for confirm/reschedule tools." },
+  // NOTE: appointment DATA is deliberately not injected as variables. A
+  // confirmation conversation is job-scoped and the agent fetches every
+  // appointment (dates, technicians, services, confirmation state) from the
+  // get_appointments tool, because Retell binds these variables once at
+  // call/chat creation — a queued row can sit for days, and appointments change
+  // mid-conversation as the agent confirms/reschedules/cancels. Only the
+  // identifier below is injected.
+  { name: "appointment_id",      sort_order: 50, resolved_from: "scheduled_calls.appointment_id", description: "The appointment this call was queued for. Used by technician_confirmation, which is appointment-specific. customer_confirmation ignores it and takes every appointment ID from the get_appointments tool instead." },
   { name: "total_amount",        sort_order: 60, resolved_from: "scheduled_calls.total_amount",   description: "Quotation total amount (string) — used in quotation_followup calls." },
 
   // ── Service opportunity follow-up ─────────────────────────────────────────────

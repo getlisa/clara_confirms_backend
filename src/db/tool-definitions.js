@@ -8,38 +8,20 @@ const TOOL_SEEDS = [
   // ── customer_confirmation ───────────────────────────────────────────────────
   {
     call_type: "customer_confirmation",
-    name: "get_job",
-    description: "Retrieve full details of the job this call is about — status, scheduled date, existing appointments, and whether an active appointment exists.",
-    endpoint: "/retell/tools/get_job",
+    name: "get_appointments",
+    description: "Retrieve every appointment on this job — how many are upcoming, which one is next, and for each one its date, assigned technician, service line, services and whether the customer has already confirmed it. Also returns a few past appointments. This is the ONLY source of appointment information: you were given the JOB's details up front, but nothing about its appointments. Call this first and state nothing about dates, counts, technicians or services until you have.",
+    endpoint: "/retell/tools/get_appointments",
     speak_during_execution: true,
     speak_after_execution: false,
-    execution_message_description: "Let me pull up the job details.",
+    execution_message_description: "Let me pull up the appointments on this job.",
     is_write_tool: false,
     sort_order: 1,
     parameters: {
       type: "object",
       properties: {
-        job_id: { type: "string", description: "The job ID for this call. You were given this value at the start of the call — use that exact numeric ID." },
+        job_id: { type: "string", description: "The job ID for this conversation. You were given this value at the start — use that exact numeric ID." },
       },
       required: ["job_id"],
-    },
-  },
-  {
-    call_type: "customer_confirmation",
-    name: "get_appointment",
-    description: "Retrieve details of a specific appointment — scheduled time, confirmation status, assigned technician.",
-    endpoint: "/retell/tools/get_appointment",
-    speak_during_execution: true,
-    speak_after_execution: false,
-    execution_message_description: "Let me check the appointment details.",
-    is_write_tool: false,
-    sort_order: 2,
-    parameters: {
-      type: "object",
-      properties: {
-        appointment_id: { type: "string", description: "The appointment ID for this call. You were given this value at the start of the call — use that exact numeric ID." },
-      },
-      required: ["appointment_id"],
     },
   },
   {
@@ -97,9 +79,29 @@ const TOOL_SEEDS = [
     parameters: {
       type: "object",
       properties: {
-        appointment_id: { type: "string", description: "The appointment ID for this call. You were given this value at the start of the call — use that exact numeric ID." },
+        appointment_id: { type: "string", description: "The numeric ID of the appointment you are acting on. Default to the next upcoming appointment (the one you were given at the start of the conversation), but when the customer is talking about a DIFFERENT appointment on this job, pass that appointment's ID from the get_appointments result instead." },
       },
       required: ["appointment_id"],
+    },
+  },
+  {
+    call_type: "customer_confirmation",
+    name: "confirm_job_appointments",
+    description:
+      "Confirm MORE THAN ONE upcoming appointment on this job in a single step. Use this after the customer says yes to \"would you like to give confirmation for the other appointments as well?\". Set confirm_all=true to confirm every upcoming appointment on the job that isn't confirmed yet, or pass appointment_ids to confirm only the specific ones the customer agreed to. For a single appointment, use confirm_appointment instead.",
+    endpoint: "/retell/tools/confirm_job_appointments",
+    speak_during_execution: false,
+    speak_after_execution: true,
+    is_write_tool: true,
+    sort_order: 8,
+    parameters: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "The job ID for this conversation. You were given this value at the start — use that exact numeric ID." },
+        appointment_ids: { type: "string", description: "Comma-separated appointment IDs to confirm, e.g. \"234,235\". Use the exact IDs from the get_appointments result. Leave this out when confirm_all is true." },
+        confirm_all: { type: "boolean", description: "True to confirm every upcoming appointment on this job that isn't confirmed yet." },
+      },
+      required: ["job_id"],
     },
   },
   {
@@ -115,7 +117,7 @@ const TOOL_SEEDS = [
     parameters: {
       type: "object",
       properties: {
-        appointment_id: { type: "string", description: "The appointment ID for this call. You were given this value at the start of the call — use that exact numeric ID." },
+        appointment_id: { type: "string", description: "The numeric ID of the appointment you are acting on. Default to the next upcoming appointment (the one you were given at the start of the conversation), but when the customer is talking about a DIFFERENT appointment on this job, pass that appointment's ID from the get_appointments result instead." },
         scheduled_start: { type: "string", description: "New start datetime in ISO 8601 format, e.g. 2026-05-28T10:00:00." },
         scheduled_end:   { type: "string", description: "New end datetime in ISO 8601 format (optional — defaults to 2 hours after start)." },
       },
@@ -174,7 +176,7 @@ const TOOL_SEEDS = [
     parameters: {
       type: "object",
       properties: {
-        appointment_id: { type: "string", description: "The appointment ID for this call. You were given this value at the start of the call — use that exact numeric ID." },
+        appointment_id: { type: "string", description: "The numeric ID of the appointment you are acting on. Default to the next upcoming appointment (the one you were given at the start of the conversation), but when the customer is talking about a DIFFERENT appointment on this job, pass that appointment's ID from the get_appointments result instead." },
         scope: { type: "string", enum: ["appointment_only", "entire_job"], description: "Whether the customer wants to cancel just this appointment or the entire job. You must ask this explicitly before calling the tool." },
         reason: { type: "string", description: "The reason the customer gave for cancelling." },
       },
@@ -184,12 +186,12 @@ const TOOL_SEEDS = [
   // ── technician_confirmation ─────────────────────────────────────────────────
   {
     call_type: "technician_confirmation",
-    name: "get_job",
-    description: "Retrieve the job details for this appointment — customer name, address, scheduled date, and job description.",
-    endpoint: "/retell/tools/get_job",
+    name: "get_appointments",
+    description: "Retrieve the appointments on this job — the scheduled date/time, service line and confirmation status of each. Use it to verify the appointment time before you confirm the technician's availability. The job's own details were given to you up front.",
+    endpoint: "/retell/tools/get_appointments",
     speak_during_execution: true,
     speak_after_execution: false,
-    execution_message_description: "Let me pull up the job details.",
+    execution_message_description: "Let me pull up the appointment details.",
     is_write_tool: false,
     sort_order: 1,
     parameters: {

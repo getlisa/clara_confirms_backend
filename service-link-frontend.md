@@ -1,7 +1,7 @@
 # Service Link email after confirmation — Frontend Integration Guide
 
 > Covers the frontend surfaces for the new **Service Link** feature: after a
-> customer **confirms** an appointment on a `customer_confirmation` call, Clara
+> customer **confirms** an appointment on a `customer_confirmation` conversation (the next upcoming one — the link is sent on the **first** confirmation, not once the whole job is confirmed), Clara
 > emails them the job's ServiceTrade Service Link. Everything here is additive.
 
 ## 0. What shipped

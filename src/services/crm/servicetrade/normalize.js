@@ -40,9 +40,15 @@ function normalizeCustomer(row, { companyId }) {
 /**
  * servicetrade_jobs → platform `jobs`
  * Caller is responsible for resolving the platform `customerId` from
- * servicetrade_customer_id → customers.external_ref.
+ * servicetrade_customer_id → customers.external_ref, and the FK ids below from
+ * the job's embedded owner/sales/office/project/contract/currentAppointment/
+ * location/primaryContact (each resolved via its own external_ref lookup
+ * before calling this).
  */
-function normalizeJob(row, { companyId, customerId }) {
+function normalizeJob(row, {
+  companyId, customerId, ownerId, salespersonId, assignedOfficeId, projectId, contractId, currentAppointmentId,
+  locationId, primaryContactId,
+}) {
   if (!row) return null;
   const warnings = [];
   if (!customerId && row.servicetrade_customer_id) {
@@ -50,6 +56,7 @@ function normalizeJob(row, { companyId, customerId }) {
   } else if (!row.servicetrade_customer_id) {
     warnings.push({ code: "no_customer", message: "Job has no associated customer in ServiceTrade." });
   }
+  const payload = row.payload || {};
   return {
     companyId,
     customerId: customerId || null,
@@ -62,6 +69,16 @@ function normalizeJob(row, { companyId, customerId }) {
     scheduledDate:         row.scheduled_date,
     scheduledWindowStart:  row.scheduled_window_start,
     scheduledWindowEnd:    row.scheduled_window_end,
+    jobNumber:             payload.number ?? null,
+    ownerId:               ownerId || null,
+    salespersonId:         salespersonId || null,
+    assignedOfficeId:      assignedOfficeId || null,
+    projectId:             projectId || null,
+    contractId:            contractId || null,
+    currentAppointmentId:  currentAppointmentId || null,
+    locationId:            locationId || null,
+    primaryContactId:      primaryContactId || null,
+    externalIds:           payload.externalIds || {},
     additionalInformation: {
       servicetrade_job_id: row.servicetrade_id,
       servicetrade_customer_id: row.servicetrade_customer_id || null,
@@ -89,6 +106,7 @@ function normalizeAppointment(row, { companyId, jobId, technicianId }) {
   if (!row.scheduled_start) {
     warnings.push({ code: "missing_scheduled_start", message: "Appointment has no scheduled start time." });
   }
+  const payload = row.payload || {};
   return {
     companyId,
     jobId: jobId || null,
@@ -98,6 +116,8 @@ function normalizeAppointment(row, { companyId, jobId, technicianId }) {
     status:          mapAppointmentStatus(row.status),
     scheduledStart:  row.scheduled_start,
     scheduledEnd:    row.scheduled_end,
+    duration:        payload.duration ?? null,
+    released:        payload.released ?? null,
     additionalInformation: {
       servicetrade_appointment_id: row.servicetrade_id,
       servicetrade_job_id: row.servicetrade_job_id || null,
@@ -130,10 +150,82 @@ function normalizeTechnician(row, { companyId }) {
 }
 
 /**
+ * servicetrade_projects → platform `projects`
+ * Sourced from a job's embedded `project` — no dedicated bulk sync.
+ */
+function normalizeProject(row, { companyId }) {
+  if (!row) return null;
+  return {
+    companyId,
+    externalRef: String(row.servicetrade_id),
+    source:      "servicetrade",
+    startDate:   row.start_date,
+    endDate:     row.end_date,
+    additionalInformation: { servicetrade_project_id: row.servicetrade_id },
+  };
+}
+
+/**
+ * servicetrade_users → platform `crm_users`
+ * Sourced from a job's embedded `owner`/`sales` — a ServiceTrade "User", not
+ * the same shape as a `technician` (no phone/first-last split required here).
+ */
+function normalizeCrmUser(row, { companyId }) {
+  if (!row) return null;
+  return {
+    companyId,
+    externalRef: String(row.servicetrade_id),
+    source:      "servicetrade",
+    name:        row.name || null,
+    email:       row.email || null,
+    status:      row.status || null,
+    isTech:      row.is_tech,
+    isHelper:    row.is_helper,
+    additionalInformation: { servicetrade_user_id: row.servicetrade_id },
+  };
+}
+
+/**
+ * A job's embedded `schedulingComments[]` item ({id, uri, job_id, content}) →
+ * platform `scheduling_comments`. Has a real ServiceTrade id, so it's
+ * upserted by external_ref like everything else — no dedicated raw table,
+ * read directly off the parent job's raw `payload`.
+ */
+function normalizeSchedulingComment(item, { companyId, jobId }) {
+  if (!item || item.id == null) return null;
+  return {
+    companyId,
+    jobId,
+    externalRef: String(item.id),
+    source:      "servicetrade",
+    content:     item.content ?? null,
+  };
+}
+
+/**
+ * A job's embedded `notes[]` item ({type, text}) → platform `job_notes`.
+ * No id/stable identity in the payload — caller re-syncs by delete-and-reinsert
+ * per job rather than upserting by external_ref.
+ */
+function normalizeJobNote(item, { companyId, jobId }) {
+  if (!item) return null;
+  return { companyId, jobId, type: item.type ?? null, text: item.text ?? null };
+}
+
+/**
+ * An appointment's embedded `notes[]` item ({type, text}) → platform
+ * `appointment_notes`. Same no-id, delete-and-reinsert pattern as job_notes.
+ */
+function normalizeAppointmentNote(item, { companyId, appointmentId }) {
+  if (!item) return null;
+  return { companyId, appointmentId, type: item.type ?? null, text: item.text ?? null };
+}
+
+/**
  * servicetrade_contacts → platform `contacts`
  * Sourced from a location's embedded `primaryContact` — no dedicated /contact sync.
  */
-function normalizeContact(row, { companyId }) {
+function normalizeContact(row, { companyId, isPrimary = false }) {
   if (!row) return null;
   const warnings = [];
   if (!row.phone && !row.mobile) warnings.push({ code: "missing_phone", message: "Contact has no phone or mobile number." });
@@ -151,6 +243,10 @@ function normalizeContact(row, { companyId }) {
     status:         row.status || null,
     types:          row.types || null,
     externalIds:    row.external_ids || null,
+    // Platform's own classification, distinct from `type`/`types` (which are
+    // the CRM's free-text labels). "primary" means ServiceTrade names this
+    // contact as the primaryContact of a job or a location; caller decides.
+    contactRole:    isPrimary ? "primary" : "general",
     additionalInformation: { servicetrade_contact_id: row.servicetrade_id, warnings },
   };
 }
@@ -314,26 +410,20 @@ function normalizeServiceRecurrence(row, { companyId }) {
 }
 
 /**
- * servicetrade_service_requests → platform `service_opportunities`.
- * Only called for requests that qualify as an opportunity (no job on the
- * ServiceTrade payload) — the caller decides eligibility and resolves all
- * FK ids via their respective external_ref lookups. `location_id` is
- * NOT NULL on the platform table, so this returns null if unresolved.
+ * servicetrade_service_requests → platform `service_requests`.
+ * Covers EVERY request, job-linked or not — the caller resolves all FK ids
+ * via their respective external_ref lookups (any of which may legitimately
+ * be null; only `company_id` is required on this table).
  */
-function normalizeServiceOpportunity(row, {
+function normalizeServiceRequest(row, {
   companyId, locationId, jobId, deficiencyId, changeOrderId, contractId, serviceRecurrenceId, serviceLineId,
 }) {
   if (!row) return null;
-  const warnings = [];
-  if (!locationId) {
-    warnings.push({ code: "unresolved_location", message: `Could not match ServiceTrade location ${row.servicetrade_location_id} to a platform location.` });
-    return null; // location_id is NOT NULL — nothing to insert without it
-  }
   return {
     companyId,
-    locationId,
-    jobId:               jobId || null,
-    deficiencyId:        deficiencyId || null,
+    locationId:           locationId || null,
+    jobId:                jobId || null,
+    deficiencyId:         deficiencyId || null,
     changeOrderId:        changeOrderId || null,
     contractId:           contractId || null,
     serviceRecurrenceId:  serviceRecurrenceId || null,
@@ -352,10 +442,45 @@ function normalizeServiceOpportunity(row, {
     preferredVendor:      row.preferred_vendor,
     asset:                row.asset,
     visibility:           row.visibility,
-    additionalInformation: {
-      servicetrade_service_request_id: row.servicetrade_id,
-      warnings,
-    },
+    additionalInformation: { servicetrade_service_request_id: row.servicetrade_id },
+  };
+}
+
+/**
+ * platform `service_requests` (WHERE job_id IS NULL) → platform
+ * `service_opportunities`. Every FK id on a service_requests row is already a
+ * resolved platform id (it went through normalizeServiceRequest first), so
+ * this just reshapes the row — no external_ref resolution here. `location_id`
+ * is NOT NULL on service_opportunities, so this returns null if the source
+ * row somehow lacks one.
+ */
+function normalizeServiceOpportunity(row) {
+  if (!row) return null;
+  if (!row.location_id) return null; // location_id is NOT NULL — nothing to insert without it
+  return {
+    companyId:            row.company_id,
+    locationId:           row.location_id,
+    jobId:                row.job_id || null,
+    deficiencyId:         row.deficiency_id || null,
+    changeOrderId:        row.change_order_id || null,
+    contractId:           row.contract_id || null,
+    serviceRecurrenceId:  row.service_recurrence_id || null,
+    serviceLineId:        row.service_line_id || null,
+    externalRef:          row.external_ref,
+    source:               row.source,
+    status:               row.status,
+    description:          row.description,
+    windowStart:          row.window_start,
+    windowEnd:            row.window_end,
+    closedOn:             row.closed_on,
+    estimatedPrice:       row.estimated_price,
+    duration:             row.duration,
+    preferredStartTime:   row.preferred_start_time,
+    budget:               row.budget,
+    preferredVendor:      row.preferred_vendor,
+    asset:                row.asset,
+    visibility:           row.visibility,
+    additionalInformation: row.additional_information || {},
   };
 }
 
@@ -433,6 +558,11 @@ module.exports = {
   normalizeJob,
   normalizeAppointment,
   normalizeTechnician,
+  normalizeProject,
+  normalizeCrmUser,
+  normalizeSchedulingComment,
+  normalizeJobNote,
+  normalizeAppointmentNote,
   normalizeContact,
   normalizeOffice,
   normalizeTag,
@@ -442,6 +572,7 @@ module.exports = {
   normalizeChangeOrder,
   normalizeContract,
   normalizeServiceRecurrence,
+  normalizeServiceRequest,
   normalizeServiceOpportunity,
   normalizeAppointmentService,
   mapJobStatus,

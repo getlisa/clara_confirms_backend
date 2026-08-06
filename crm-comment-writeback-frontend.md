@@ -12,7 +12,7 @@ corresponding ServiceTrade entity summarizing the outcome (e.g. *"the customer
 confirmed the appointment"* + the call summary). This is now gated by a
 **per-company setting the user controls from the UI** — not an environment flag.
 
-- **Confirmation calls** → comment on the **appointment** and its **parent job**.
+- **Confirmation calls** → comment on the **appointment(s) confirmed on the call** and their **parent job**. A conversation is job-scoped and can confirm several appointments, so the parent-job comment is what covers them all; per-appointment comments follow the appointments actually confirmed.
 - **Service-opportunity follow-up calls** → comment on each **service request**.
 - **Voicemail / no-answer calls never post.** Unclear outcomes are skipped.
 

@@ -469,7 +469,7 @@ All optional. Validation: `max_attempts` 1–10, `voicemail_behavior` `"leave"` 
 
 **`agent_can_make_changes = false` behavior:**
 - Write tools removed from all subagent nodes: `confirm_appointment`, `reschedule_appointment`, `create_appointment`, `reschedule_job`
-- Read-only tools remain: `get_job`, `get_appointment`, `get_quotation`
+- Read-only tools remain: `get_appointments`, `get_quotation`
 - Agent prompt appended with: *"You are in read-only mode. Collect the customer's intent and let them know a team member will follow up."*
 - Post-call analysis and todos are still created normally
 
@@ -1345,6 +1345,7 @@ export interface Job {
   company_id: number;
   customer_id: number;
   technician_id: number | null;
+  job_number: string | null;              // the CRM's own job number, e.g. "48767205"
   title: string | null;
   description: string | null;
   job_type: JobType | null;
@@ -1363,7 +1364,9 @@ export interface Job {
   customer_address: string | null;        // "142 Oak Street, San Jose, CA"
   technician_name: string | null;
   technician_phone: string | null;
-  // Latest active appointment:
+  // The most recent non-cancelled, non-rescheduled appointment (scheduled_start DESC).
+  // NOT the "next upcoming" one the confirmation agent uses — see the note under
+  // GET /jobs/:id. Use JobDetail.appointments if you need next-upcoming.
   active_appointment: JobAppointment | null;
 }
 
@@ -1388,8 +1391,25 @@ export interface JobAppointment {
   created_at: string;
   updated_at: string;
   // Joined:
-  technician_name: string | null;
+  technician_name: string | null;   // the single/primary technician (appointments.technician_id)
   technician_phone: string | null;
+  // Every technician assigned to THIS visit — a visit can have several; the
+  // single technician_name/technician_phone above only ever shows the first.
+  // Only populated by GET /jobs/:id, not the list endpoint (which only has
+  // the single technician_name/technician_phone on active_appointment).
+  technicians?: Array<{ id: number; name: string | null; phone: string | null; email: string | null }>;
+  // What THIS visit is for. Different appointments on one job are routinely
+  // different services, so don't describe them all with the job title.
+  // Only populated by GET /jobs/:id, not the list endpoint.
+  service_line?: string | null;           // e.g. "Sprinkler / Fire Protection"
+  services?: Array<{
+    service_line: string | null;
+    description: string | null;
+    status: string | null;
+    completion: string | null;
+    estimated_price: string | null;
+    duration: number | null;
+  }>;
 }
 
 // Used in GET /jobs/:id (full detail)
@@ -1410,6 +1430,30 @@ export interface JobDetail extends Job {
     phone: string;
     email: string | null;
   } | null;
+  // Everyone worth contacting about this job, in ONE list, sorted
+  // primary → job_owner → sales → other.
+  //
+  // `source` matters: "contact" is a customer-side person; "crm_user" is
+  // internal staff synced from the CRM (the job owner / salesperson) and has
+  // no phone/name-part fields. The same person can appear twice under two
+  // roles — ServiceTrade commonly sets one user as both owner and sales.
+  contacts: Array<{
+    id: number;
+    source: "contact" | "crm_user";
+    role: "primary" | "job_owner" | "sales" | "general";
+    // Stored classification on the contact record itself, independent of this
+    // job. `null` for crm_user entries. See the caveat below before filtering on it.
+    contact_role: "primary" | "general" | null;
+    name: string | null;
+    first_name: string | null;
+    last_name: string | null;
+    phone: string | null;
+    mobile: string | null;
+    alternate_phone: string | null;
+    email: string | null;
+    contact_type: string | null;      // CRM contact type, e.g. "on-site"
+    contact_types: string[] | null;   // CRM may assign several
+  }>;
   appointments: JobAppointment[];  // full history, newest first
   quotations: Array<{
     id: number;
@@ -1535,7 +1579,51 @@ export async function getTechnicians(
 
 #### `GET /jobs` 🔒
 
-**Query params:** `status`, `job_type`, `customer_id`, `technician_id`, `scheduled_date_from`, `scheduled_date_to`, `search`, `limit` (max 200), `offset`
+**Query params:** `status`, `job_type`, `customer_id`, `location_id`, `technician_id`, `scheduled_date_from`, `scheduled_date_to`, `confirmed`, `search`, `limit` (max 200), `offset`
+
+**New — multi-value filters.** `status`, `job_type`, `customer_id`, and
+`location_id` each accept either a single value (unchanged — `status=scheduled`
+still works exactly as before) or a comma-separated list: `status=scheduled,confirmed`,
+`job_type=inspection,repair,maintenance`. Use this for the Inspections page
+filter bar instead of forcing a single selection.
+
+**Changed — `scheduled_date_from`/`scheduled_date_to` now filter on
+appointments, not the job's own `scheduled_date`.** A job returns if **any** of
+its (non-cancelled) appointments falls within the range — this is what makes
+"show me what's scheduled this week" work for a job with several visits, and
+also catches jobs whose own `scheduled_date` is `null` (common — that column
+isn't kept in sync per-appointment) but that do have a dated appointment in
+range. Dates are compared in the company's timezone, matching every other
+date-window filter in the system. Use this for day view (`from` == `to`) or
+week view (`from`/`to` = the week's Mon–Sun bounds) on the Inspections page —
+there's no separate "group by week" endpoint; bucket the returned rows
+client-side by their appointment date if you need calendar-style columns.
+
+**New — `confirmed` filter.** `confirmed=true` / `confirmed=false` filters on
+whether every one of the job's *upcoming* appointments is customer-confirmed
+(the same definition the confirmation agent itself uses — `scheduled`,
+`confirmed`, or `rescheduled` status with a future `scheduled_start`). This is
+the filter that makes manual job selection actually usable — "show me
+everything that still needs confirming" — rather than reading it off the
+`active_appointment.customer_confirmed` badge per row.
+
+**New — job types dropdown should come from the API, not a hardcoded list.**
+The ServiceTrade sync ingests up to 24 technician-visit job types (buildout,
+cleaning, construction, emergency_service_call, exchange, hookup, inspection,
+inspection_repair, installation, planned_maintenance,
+preventative_maintenance, priority_inspection, priority_service_call,
+reinspection, repair, replacement, retrofit, service_call, start_up, survey,
+testing, upgrade, urgent_service_call, warranty) — the previous 5-option
+hardcoded `TYPE_OPTIONS` (§12.5 below) was silently hiding most jobs from the
+filter.
+
+#### `GET /jobs/job-types` 🔒
+Distinct job types actually present for this company (a subset of the 24
+above — whatever ServiceTrade has actually sent). Use this to populate the
+type filter dropdown instead of a hardcoded list.
+```json
+{ "job_types": ["inspection", "repair", "planned_maintenance"] }
+```
 
 ```json
 {
@@ -1571,12 +1659,32 @@ export async function getTechnicians(
 
 #### `GET /jobs/:id` 🔒
 
-Full detail with nested `customer`, `technician`, `appointments` (full history), and `quotations`.
+Full detail with nested `customer`, `technician`, `contacts`, `appointments` (full history), and `quotations`.
+
+`appointments[]` is the **full history**, newest first — completed, cancelled and upcoming alike. Each entry carries its own `service_line` and `services[]`, because different appointments on one job are routinely different services; use each appointment's own service rather than describing them all with the job title. Each entry also carries `technicians[]` — **every** technician assigned to that visit, not just the single one in `technician_name`/`technician_phone` (which only ever reflects the first/primary tech); a visit assigned to a 3-person crew previously showed only one name. `job_number` is the CRM's own job number (what a customer would quote back to you), `null` when the CRM has none.
+
+> **`active_appointment` on `GET /jobs` means something different.** In the list endpoint it's the job's most recent non-cancelled, non-rescheduled appointment (ordered by `scheduled_start DESC`). That is **not** the "next upcoming" appointment the confirmation agent works on — which is the *earliest* appointment with `scheduled_start` in the future, and *does* include `rescheduled` ones. If you need the true next-upcoming, take it from this endpoint's `appointments[]` rather than the list's `active_appointment`.
+
+**`contacts` — one list, mixed sources.** Sorted `primary` → `job_owner` → `sales` → `general`, so the first entry is the best person to reach. Check `source` before using it:
+
+| `source` | who it is | fields populated |
+|---|---|---|
+| `contact` | customer-side person (CRM contact) | name parts, phone/mobile/alternate_phone, email, contact_type(s) |
+| `crm_user` | internal staff — the job owner / salesperson | `name` + `email` only; phone fields are always `null` |
+
+**Use `role`, not `contact_role`, to decide who to contact for a job.**
+
+- **`role`** is per-job and authoritative: exactly **one** `primary` (the job's own primary contact), then any number of `general` (anyone else linked to the job's customer or location), plus `job_owner` / `sales` for internal staff. The **same person can appear twice** under two roles — ServiceTrade commonly assigns one user as both owner and salesperson.
+- **`contact_role`** is a property of the contact record, not of this job. Someone can be the primary contact at their own location while being merely `general` on this job — so a list can contain several entries with `contact_role: "primary"`. Don't use it to pick the primary.
+
+> **Updated:** the `contacts[]` list is now more complete than it used to be. It previously only ever contained a job/location's single *primary* contact (the CRM's job response doesn't expose a customer's other contacts), so every synced contact had `contact_role: "primary"` and the `general` bucket was always empty. The sync now also pulls each customer's full contact roster directly, so `contacts[]` on a job can include several `role: "general"` entries — a VP, a project manager, an assistant superintendent, etc. — alongside the one `role: "primary"`. A longer list than before is expected, not a bug. `contact_role` can now legitimately be `"general"` too; keep using per-job `role` (not `contact_role`) to decide who's primary, per above.
+
+**Contacts are deduplicated by email at sync time.** The CRM often holds several contact records with distinct ids but one shared email — typically one per location for a role inbox (e.g. 7 separate "Accounts Payable" records all at `ap@goodwillomaha.org`). Those collapse into a single contact, which inherits the customer/location links of every record it absorbed, so nothing is lost. Contacts with **no** email can't be matched this way and are always kept separate — they're never merged on name, since unrelated people share names far more often than they share an inbox.
 
 ```json
 {
   "job": {
-    "id": 1, "title": "Annual HVAC Inspection", "status": "scheduled",
+    "id": 1, "job_number": "48767205", "title": "Annual HVAC Inspection", "status": "scheduled",
     "customer": {
       "id": 1, "full_name": "James Carter", "phone": "+14085551001",
       "email": "james.carter@email.com", "address_line1": "142 Oak Street",
@@ -1585,12 +1693,49 @@ Full detail with nested `customer`, `technician`, `appointments` (full history),
     "technician": {
       "id": 1, "name": "Ryan Brooks", "phone": "+14085552001", "email": "ryan@alexent.com"
     },
+    "contacts": [
+      { "id": 42, "source": "contact", "role": "primary", "contact_role": "primary",
+        "name": "Ray Whitfield", "first_name": "Ray", "last_name": "Whitfield",
+        "phone": null, "mobile": "+14026396265", "alternate_phone": null,
+        "email": null, "contact_type": "On-Site Electrician",
+        "contact_types": ["On-Site Electrician"] },
+      { "id": 7, "source": "crm_user", "role": "job_owner", "contact_role": null,
+        "name": "Dan Andrews", "first_name": null, "last_name": null,
+        "phone": null, "mobile": null, "alternate_phone": null,
+        "email": "dandrews@totalfire-security.com",
+        "contact_type": null, "contact_types": null },
+      { "id": 7, "source": "crm_user", "role": "sales", "contact_role": null,
+        "name": "Dan Andrews", "first_name": null, "last_name": null,
+        "phone": null, "mobile": null, "alternate_phone": null,
+        "email": "dandrews@totalfire-security.com",
+        "contact_type": null, "contact_types": null },
+      { "id": 58, "source": "contact", "role": "general", "contact_role": "primary",
+        "name": "Michelle Kraft", "first_name": "Michelle", "last_name": "Kraft",
+        "phone": "+14025482701", "mobile": null, "alternate_phone": null,
+        "email": "mkraft@example.com", "contact_type": "Accounts Payable",
+        "contact_types": ["Accounts Payable"] },
+      { "id": 91, "source": "contact", "role": "general", "contact_role": "general",
+        "name": "Zack Crabtree", "first_name": "Zack", "last_name": "Crabtree",
+        "phone": "+13039629408", "mobile": "+12172499674", "alternate_phone": "+13039970755",
+        "email": "zcrabtree@example.com", "contact_type": "Vice President",
+        "contact_types": ["Vice President", "project manager"] }
+    ],
     "appointments": [
       {
         "id": 1, "scheduled_start": "2026-05-28T09:00:00Z",
         "status": "scheduled", "customer_confirmed": false,
         "technician_confirmed": false, "reschedule_requested": false,
-        "technician_name": "Ryan Brooks", "technician_phone": "+14085552001"
+        "technician_name": "Ryan Brooks", "technician_phone": "+14085552001",
+        "technicians": [
+          { "id": 1, "name": "Ryan Brooks", "phone": "+14085552001", "email": "ryan@alexent.com" },
+          { "id": 4, "name": "Sam Okafor", "phone": null, "email": "sam@alexent.com" }
+        ],
+        "service_line": "Sprinkler / Fire Protection",
+        "services": [
+          { "service_line": "Sprinkler / Fire Protection",
+            "description": "Annual sprinkler inspection", "status": "open",
+            "completion": null, "estimated_price": null, "duration": null }
+        ]
       }
     ],
     "quotations": [
@@ -1698,12 +1843,14 @@ These rules are enforced server-side. The UI must reflect them to avoid confusin
 |---|---|---|
 | `open` | Job created, no appointment scheduled yet | No |
 | `scheduled` | Appointment exists with a specific date/time | Yes |
-| `confirmed` | Customer (and optionally technician) confirmed | Yes |
+| `confirmed` | **Every upcoming appointment** on the job is customer-confirmed | Yes |
 | `in_progress` | Technician on-site | Yes |
 | `completed` | Work done | Yes |
 | `cancelled` | Job cancelled | Either |
 
 **`open` means no appointment record exists for the job.** A job can only be `open` while it has no appointments.
+
+**`confirmed` is all-or-nothing.** A job reaches `confirmed` only when *every* upcoming appointment on it is customer-confirmed, and it reverts to `scheduled` the moment an unconfirmed upcoming appointment appears (created, or rescheduled to a new time). A job with 4 appointments where 3 are confirmed still reads `scheduled` — see Rule 4.
 
 ---
 
@@ -1712,10 +1859,11 @@ These rules are enforced server-side. The UI must reflect them to avoid confusin
 `POST /jobs/:id/appointments` automatically updates the job status:
 
 ```
-open  ──→  scheduled   (when first appointment is created)
+open       ──→  scheduled   (when first appointment is created)
+confirmed  ──→  scheduled   (the new appointment is unconfirmed, so the job no longer qualifies as confirmed)
 ```
 
-Only fires for `open` jobs. `confirmed`, `in_progress`, and `completed` jobs are never touched.
+`in_progress` and `completed` jobs are never touched.
 
 **UI implication:** After a successful `POST /jobs/:id/appointments`, invalidate/refetch the parent job — its `status` will have changed from `open` to `scheduled`.
 
@@ -1731,14 +1879,22 @@ queryClient.invalidateQueries({ queryKey: ["job", jobId] });
 
 `PATCH /jobs/appointments/:id` triggers automatic job status updates:
 
+Job status is **recomputed from the whole upcoming set**, not toggled by the one appointment you touched:
+
 | Appointment change | Job status transition |
 |---|---|
-| `customer_confirmed = true` | `scheduled` → `confirmed` |
-| `status = "rescheduled"` | `confirmed` → `scheduled` (needs re-confirmation) |
+| `customer_confirmed = true` and **every** upcoming appointment is now confirmed | `scheduled` → `confirmed` |
+| `customer_confirmed = true` but other upcoming appointments are still unconfirmed | **no change** — stays `scheduled` |
+| a new upcoming appointment is created (always unconfirmed) | `confirmed` → `scheduled` |
+| `status = "rescheduled"` | `confirmed` → `scheduled` — a reschedule also **clears `customer_confirmed`**, since the customer agreed to the old time |
 | `status = "cancelled"` AND no other active appointments remain | `scheduled` / `confirmed` → `open` |
-| `status = "cancelled"` AND other active appointments exist | no change |
+| `status = "cancelled"` AND the remaining upcoming appointments are all confirmed | `scheduled` → `confirmed` |
+
+**"Upcoming"** means `status IN ('scheduled','confirmed','rescheduled')` **and** `scheduled_start` in the future. Past, cancelled and completed appointments never affect job status. `open`, `in_progress`, `completed` and `cancelled` jobs are never touched by this recompute.
 
 **UI implication:** Always invalidate/refetch the parent job after updating an appointment — the job status may have changed.
+
+**UI implication:** Don't use job status as a per-appointment confirmation indicator. On a multi-appointment job, confirming one visit leaves the job at `scheduled`, so a UI that only shows job status will look like the confirmation didn't save. Surface each appointment's own `customer_confirmed`.
 
 ```typescript
 // After updateAppointment() succeeds:
@@ -1855,9 +2011,8 @@ Replace `Inspection` type with `Job`. New layout when a row is clicked → open 
 Replace `source` filter (CRM/CSV) with `job_type` filter. Replace `InspectionStatus` options with `JobStatus` options.
 
 ```typescript
-// Status filter options
+// Status filter — now multi-select (comma-joined into the status query param)
 const STATUS_OPTIONS = [
-  { value: "all", label: "All statuses" },
   { value: "open", label: "Open" },
   { value: "scheduled", label: "Scheduled" },
   { value: "confirmed", label: "Confirmed" },
@@ -1866,20 +2021,93 @@ const STATUS_OPTIONS = [
   { value: "cancelled", label: "Cancelled" },
 ];
 
-// Job type filter options
-const TYPE_OPTIONS = [
-  { value: "all", label: "All types" },
-  { value: "inspection", label: "Inspection" },
-  { value: "repair", label: "Repair" },
-  { value: "maintenance", label: "Maintenance" },
-  { value: "installation", label: "Installation" },
-  { value: "estimate", label: "Estimate" },
+// Job type filter — populate from GET /jobs/job-types, NOT a hardcoded list.
+// The previous 5-option hardcoded list silently hid most of the 24 synced
+// types (see §12.5's GET /jobs docs for the full type list) — fetch on mount:
+const { data } = useQuery(["job-types"], () => getJobTypes());
+// const TYPE_OPTIONS = data?.job_types.map(t => ({ value: t, label: startCase(t) })) ?? [];
+
+// Confirmed filter — new. Ties directly to the bulk-send workflow below:
+// "everything still needing confirmation" is confirmed=false.
+const CONFIRMED_OPTIONS = [
+  { value: undefined, label: "All" },
+  { value: true, label: "Confirmed" },
+  { value: false, label: "Needs confirmation" },
 ];
+
+// Location filter — new, populate from GET /locations (existing endpoint).
 ```
+
+Also add a **row-selection checkbox column** and a **"Send Confirmation"**
+bulk action button (enabled once ≥1 row is selected) — see §12.7 below, this
+is new.
 
 ---
 
-### 12.6 Checklist
+### 12.6 Automatic vs. manual scheduling — new toggle on THIS page
+
+`call_settings.auto_schedule_enabled` already exists and is documented in
+§17 (Automation) as a Settings-page toggle — that's still where the
+company-wide default lives. **In addition**, put the same toggle at the top
+of the Inspections page itself (a switch: *"Auto-schedule confirmations"* /
+*"Manual — I'll select which jobs to confirm"*), reading/writing the same
+`GET`/`PATCH /call-settings` field. Rationale: a service manager deciding
+"I want to hand-pick today's confirmations" shouldn't have to leave the page
+they're already looking at jobs on. When it's off, the bulk "Send
+Confirmation" action (§12.7) is how confirmations go out at all for that
+company — make that relationship clear in the empty/off state copy.
+
+---
+
+### 12.7 Bulk "Send Confirmation" — new
+
+#### `POST /jobs/bulk-send-confirmation` 🔒
+
+Called after selecting one or more rows on the Inspections page and clicking
+"Send Confirmation."
+
+```json
+{ "items": [{ "type": "job", "id": 44417109 }, { "type": "appointment", "id": 9981 }] }
+```
+`{type: "appointment"}` items resolve to their parent job — one confirmation
+conversation now covers every upcoming appointment on a job, so there's
+nothing to address at the individual-appointment level. If an appointment's
+job is also separately selected, it's only queued once.
+
+**Important — this queues, it doesn't send immediately.** The row is created
+in `scheduled_calls` and picked up by the same dispatcher (cron, or a manual
+poke) as every other confirmation — so office hours and per-tenant
+concurrency caps still apply. Expect a short delay before it actually goes
+out; don't treat this response as "sent."
+
+```json
+{
+  "results": [
+    { "type": "job", "id": 44417109, "requestedAs": "job", "status": "queued",
+      "channel": "voice", "scheduled_call_id": 5821, "scheduled_at": "2026-08-05T14:00:00Z" },
+    { "type": "job", "id": 51002, "requestedAs": "appointment", "status": "skipped", "reason": "missing_email", "channel": "web_chat" },
+    { "type": "job", "id": 51003, "requestedAs": "job", "status": "skipped", "reason": "already_queued" },
+    { "type": "job", "id": 51004, "requestedAs": "job", "status": "skipped", "reason": "no_upcoming_appointment" }
+  ]
+}
+```
+Partial success is expected and normal — report per-item status, don't treat
+any `skipped`/`failed` item as failing the whole batch. `reason` values:
+`missing_phone`, `missing_email`, `already_queued` (a scheduled_calls row for
+this job already exists — not an error, just a no-op), `no_upcoming_appointment`
+(nothing to confirm), `appointment_not_found`, `invalid_item`. `channel` /
+`link_delivery` (`"email"`|`"sms"`|`"both"`, only present for `channel:"web_chat"`)
+reflect what was actually resolved from the customer's `is_voice`/`is_sms`/`is_email`
+flags (`chat-sms-channel-frontend.md` §2) — worth surfacing so staff aren't
+surprised a "voice" customer with exhausted retries queues as a link send.
+
+`missing_phone`/`missing_email` skips also create the same `todos` entries the
+automatic sweep would — check the Todos page rather than expecting this
+response to be the only signal something needs attention.
+
+---
+
+### 12.8 Checklist
 
 - [ ] Create `src/types/job.ts` — `Job`, `JobDetail`, `JobAppointment`, `JobStatus`, `JobType`, `AppointmentStatus`
 - [ ] Add `getJobs()`, `getJob()`, `createJob()`, `updateJob()` to `src/lib/auth-api.ts`
@@ -1893,6 +2121,11 @@ const TYPE_OPTIONS = [
 - [ ] **Invalidate job query after `createJobAppointment()`** — job status auto-changes `open` → `scheduled`
 - [ ] **Invalidate job query after `updateAppointment()`** — job status may have changed (confirmed/rescheduled/cancelled)
 - [ ] Delete `src/mocks/inspections.ts` and `src/types/inspection.ts` once migration is complete
+- [ ] Add `getJobTypes()` to `src/lib/auth-api.ts` (`GET /jobs/job-types`); populate the type filter from it, not a hardcoded list
+- [ ] Update `src/components/inspections/InspectionsFilters.tsx` — `status`/`job_type`/`location_id` become multi-select; add the `confirmed` (needs-confirmation) filter
+- [ ] Add row-selection checkboxes + a "Send Confirmation" bulk action bar to `InspectionsTable.tsx`, calling `POST /jobs/bulk-send-confirmation` (§12.7)
+- [ ] Add the auto/manual `auto_schedule_enabled` toggle to the Inspections page header (§12.6), bound to the same `call_settings` field as the Settings-page toggle (§17)
+- [ ] Show every assigned technician on an appointment (`appointment.technicians[]`), not just `technician_name` — a visit with a multi-person crew previously only showed one name
 
 ---
 

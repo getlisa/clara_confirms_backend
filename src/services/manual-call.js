@@ -23,6 +23,7 @@ const db = require("../db");
 const { toE164 } = require("../utils/phone");
 const { localToUTC } = require("../utils/timezone");
 const { resolveOutboundChannel } = require("./channel-resolver");
+const { resolveConfirmationRecipients } = require("./confirmation-recipients");
 const logger = require("../utils/logger");
 
 const VALID_TRIGGER_TYPES = Object.keys(HYDRATORS);
@@ -111,17 +112,57 @@ async function triggerManualCall({
   hydrated.params.callType = callType;
 
   // Fetched here (rather than in step 4, where it originally lived) because
-  // step 2b's web_chat gate below needs chat_link_delivery_method.
+  // step 2b's web_chat gate below needs chat_link_delivery_method, and channel
+  // resolution (also moved up, see below) needs smsLive + channel_strategy.
   const callSettings = await callSettingsDb.getByCompanyId(companyId);
+  const { rows: co } = await db.query(`SELECT default_timezone, sms_status FROM companies WHERE id = $1`, [companyId]);
+  const smsLive = co[0]?.sms_status === "live";
+
+  // An explicit channel request still has to respect SMS readiness — unlike
+  // the automatic scheduler/retry paths (where resolveOutboundChannel's own
+  // smsLive check silently falls back to voice), a human explicitly asking
+  // for "Text Now" should get a clear error instead of a send attempt Retell
+  // would likely reject (or worse, a confusing silent no-op) against a
+  // not-yet-approved number.
+  if (channel === "sms" && !smsLive) {
+    return { ok: false, status: 422, error: "SMS is not yet enabled for this company — it must reach 'live' status before texts can be sent." };
+  }
+
+  // Resolved BEFORE the 2b contact gate below, which needs to know whether
+  // this send is a web_chat (link) send or a voice dial to pick the right
+  // required-contact-info check. Explicit channel (e.g. "Text Now"/"Email
+  // Now" button) wins outright — legacy 'sms' maps onto the web_chat+sms link
+  // path; 'web_chat' keeps using the company's chat_link_delivery_method
+  // (there's no per-customer flag concept in an explicit single-target
+  // override). No explicit channel -> resolve from the customer's own
+  // is_voice/is_sms/is_email flags, same as the automatic scheduler.
+  let resolvedChannel, linkDelivery = null;
+  if (channel === "sms") {
+    resolvedChannel = "web_chat"; linkDelivery = "sms";
+  } else if (channel === "web_chat") {
+    resolvedChannel = "web_chat"; linkDelivery = callSettings.chat_link_delivery_method;
+  } else if (channel === "voice") {
+    resolvedChannel = "voice";
+  } else {
+    const { rows: custRows } = await db.query(
+      `SELECT c.is_voice, c.is_sms, c.is_email
+         FROM jobs j JOIN customers c ON c.id = j.customer_id
+        WHERE j.id = $1 AND j.company_id = $2`,
+      [hydrated.jobId, companyId]
+    );
+    const flags = custRows[0] ? { is_voice: custRows[0].is_voice, is_sms: custRows[0].is_sms, is_email: custRows[0].is_email } : null;
+    const resolved = resolveOutboundChannel({ smsLive, flags, channelStrategy: callSettings.channel_strategy });
+    resolvedChannel = resolved.channel;
+    linkDelivery = resolved.linkDelivery;
+  }
 
   // ── 2b. Resolve who/what to contact ────────────────────────────────────────
-  // "Email Now" (channel: web_chat) needs at least one of email/phone,
-  // depending on the company's configured chat_link_delivery_method —
-  // checked separately below, once the resolved channel is known, instead of
-  // the phone-required gate voice/sms use.
+  // A web_chat send (explicit "Email Now"/"Text Now", or flags resolving that
+  // way) needs at least one of email/phone, depending on linkDelivery —
+  // checked here instead of the phone-required gate voice uses.
   let overrideEmail = null;
   let overridePhone = null;
-  if (channel === "web_chat") {
+  if (resolvedChannel === "web_chat") {
     const { rows: contactRows } = await db.query(
       `SELECT c.email, c.phone FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
       [hydrated.jobId, companyId]
@@ -131,8 +172,8 @@ async function triggerManualCall({
     // Mirrors the phoneNumber override below: ServiceTrade-synced customers
     // almost never have an email on the *customer* record (that lives on a
     // separate ServiceTrade Contact) — a manually-supplied email/phone rescues
-    // that, same as phone_number does for the voice/sms channels below.
-    const deliveryMethod = callSettings.chat_link_delivery_method;
+    // that, same as phone_number does for the voice channel below.
+    const deliveryMethod = linkDelivery;
     const email = manualEmail || onFileEmail;
     const phone = manualPhone || onFilePhone;
     const subject = hydrated.phoneSubject || "customer";
@@ -149,7 +190,7 @@ async function triggerManualCall({
         error: `No ${subject} phone number on file. Pass phone_number to text a chat confirmation to a specific number.`,
       };
     }
-    if (deliveryMethod === "both" && !email && !phone) {
+    if ((deliveryMethod === "both" || !deliveryMethod) && !email && !phone) {
       return {
         ok: false, status: 422, code: "missing_contact_info", subject,
         error: `No ${subject} email or phone on file. Pass email and/or phone_number to send a chat confirmation.`,
@@ -203,9 +244,6 @@ async function triggerManualCall({
   }
 
   // ── 4. Determine when ──────────────────────────────────────────────────────
-  const { rows: co } = await db.query(`SELECT default_timezone, sms_status FROM companies WHERE id = $1`, [companyId]);
-  const smsLive = co[0]?.sms_status === "live";
-
   let fireAt;
   if (immediate) {
     fireAt = new Date(); // bypass office hours — user clicked Call Now.
@@ -216,19 +254,6 @@ async function triggerManualCall({
     fireAt = scheduler.isWithinActiveHours(callSettings, tz, requested)
       ? requested
       : scheduler.getNextWindowStart(callSettings, tz, requested);
-  }
-
-  // Explicit channel (e.g. "Text Now" button) wins; otherwise fall back to the
-  // company's channel strategy exactly like the scheduler does.
-  const resolvedChannel = channel || resolveOutboundChannel({ smsLive, channelStrategy: callSettings.channel_strategy });
-
-  // An explicit channel request still has to respect SMS readiness — unlike the
-  // automatic scheduler/retry paths (where resolveOutboundChannel's own smsLive
-  // check silently falls back to voice), a human explicitly asking for "Text Now"
-  // should get a clear error instead of a send attempt Retell would likely reject
-  // (or worse, a confusing silent no-op) against a not-yet-approved number.
-  if (resolvedChannel === "sms" && !smsLive) {
-    return { ok: false, status: 422, error: "SMS is not yet enabled for this company — it must reach 'live' status before texts can be sent." };
   }
 
   // ── 5. Insert ──────────────────────────────────────────────────────────────
@@ -248,6 +273,7 @@ async function triggerManualCall({
       callPriority:      "high",
       bypassOfficeHours: immediate === true,
       channel:           resolvedChannel,
+      linkDelivery,
       // Carries the manual email override through to the dispatcher (which
       // runs as a separate step below and re-reads the row from the DB —
       // it has no other way to see a value that was never persisted).
@@ -270,13 +296,76 @@ async function triggerManualCall({
     immediate, fireAt: fireAt.toISOString(),
   });
 
+  // ── 5b. Fan out to additional confirmation recipients (link-send only) ────
+  // Manual "Call Now" (voice) stays single-target — dials only this one
+  // number, exactly like today; confirmation_contact_ids has no effect on
+  // this button (decided: firing several simultaneous LIVE calls from one
+  // click is a bigger surprise than the same fan-out happening invisibly
+  // overnight). A manual link-send ("Text Now"/"Email Now"), though, is
+  // already N-independent-sends under the hood — no override was given and
+  // no override was needed, so also queue one row per OTHER opted-in
+  // contact, same as the automatic sweep does. Only applies to real
+  // customer-facing call types with a real numeric job — technician/
+  // quotation targets have no `confirmation_contact_ids` concept.
+  const additionalRecipients = [];
+  if (
+    resolvedChannel === "web_chat" && !manualPhone && !manualEmail &&
+    scheduledCallsDb.CUSTOMER_CALL_TYPES.includes(callType) &&
+    /^\d+$/.test(String(hydrated.jobId || ""))
+  ) {
+    const { rows: custRows } = await db.query(
+      `SELECT c.full_name, c.phone, c.email,
+              c.confirmation_include_customer, c.confirmation_contact_ids
+         FROM jobs j JOIN customers c ON c.id = j.customer_id
+        WHERE j.id = $1 AND j.company_id = $2`,
+      [hydrated.jobId, companyId]
+    );
+    if (custRows[0]) {
+      const recipients = await resolveConfirmationRecipients(companyId, custRows[0]);
+      // The customer themselves (recipientContactId: null) is already the
+      // row just inserted above — only fan out to the EXTRA contacts.
+      const extras = recipients.filter((r) => r.recipientContactId != null);
+      for (const recipient of extras) {
+        if (!recipient.phone && !recipient.email) continue; // nothing to send to
+        try {
+          const extraRow = await scheduledCallsDb.create({
+            companyId,
+            ...hydrated.params,
+            phoneNumber: recipient.phone,
+            scheduledAt: fireAt,
+            isTest: false,
+            maxAttempts: callSettings.max_attempts ?? 3,
+            callPriority: "high",
+            bypassOfficeHours: immediate === true,
+            channel: "web_chat",
+            linkDelivery,
+            recipientContactId: recipient.recipientContactId,
+            recipientName: recipient.name,
+            recipientEmail: recipient.email,
+          });
+          additionalRecipients.push({ recipientContactId: recipient.recipientContactId, scheduledCallId: extraRow.id });
+        } catch (err) {
+          if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") {
+            additionalRecipients.push({ recipientContactId: recipient.recipientContactId, skipped: "already_queued" });
+          } else {
+            logger.warn("Manual call: extra recipient enqueue failed", { companyId, jobId: hydrated.jobId, recipientContactId: recipient.recipientContactId, error: err.message });
+          }
+        }
+      }
+    }
+  }
+
   // ── 6. Immediate dispatch (best-effort) ───────────────────────────────────
   if (!immediate) {
     return { ok: true, status: 201, scheduledCall: row, dialed: false };
   }
 
   try {
-    await scheduler.runDispatcher(1, { companyId, respectAutoFlag: false });
+    // batchSize covers this row plus any additional recipients queued in 5b,
+    // so a manual link-send with extra recipients dispatches all of them
+    // within this same request instead of leaving the extras for the next
+    // cron tick.
+    await scheduler.runDispatcher(1 + additionalRecipients.length, { companyId, respectAutoFlag: false });
   } catch (err) {
     logger.warn("Manual call: dispatcher poke failed; row remains pending for next cron", {
       scheduledCallId: row.id, error: err.message,
@@ -290,14 +379,14 @@ async function triggerManualCall({
   );
   const finalRow = after[0] || row;
   const dialed = !!finalRow.retell_call_id;
-  // web_chat and sms ("Text Now") both text/email a chat_links link now —
-  // neither has a retell_call_id until the customer opens it (sms no longer
-  // starts a live Retell conversation). Their success signal is the row
+  // web_chat (which now covers the legacy "sms" explicit channel too — see
+  // channel resolution above) texts/emails a chat_links link — it has no
+  // retell_call_id until the customer opens it. Its success signal is the row
   // completing with a chat_link_token instead. Note: this reflects the row
-  // completing, not which medium(s) actually succeeded (same coarse signal
-  // for both fields — the underlying dispatch sends email and/or SMS
-  // independently and best-effort; see scheduler.js).
-  const linkDispatched = (resolvedChannel === "web_chat" || resolvedChannel === "sms") && finalRow.status === "completed";
+  // completing, not which medium(s) actually succeeded (same coarse signal —
+  // the underlying dispatch sends email and/or SMS independently and
+  // best-effort; see scheduler.js).
+  const linkDispatched = resolvedChannel === "web_chat" && finalRow.status === "completed";
   return {
     ok: true,
     status: 201,
@@ -305,14 +394,14 @@ async function triggerManualCall({
     dialed,
     retellCallId: finalRow.retell_call_id || null,
     ...(resolvedChannel === "web_chat" && {
-      emailSent: linkDispatched,
-      smsSent: linkDispatched,
+      emailSent: linkDispatched && (linkDelivery === "email" || linkDelivery === "both"),
+      smsSent: linkDispatched && (linkDelivery === "sms" || linkDelivery === "both"),
       chatLinkToken: finalRow.chat_link_token || null,
     }),
-    ...(resolvedChannel === "sms" && {
-      smsSent: linkDispatched,
-      chatLinkToken: finalRow.chat_link_token || null,
-    }),
+    // Other confirmation-contact recipients queued alongside this one — see
+    // step 5b. Empty/omitted for the common case (no extra recipients, or
+    // channel voice, or an explicit override was given).
+    ...(additionalRecipients.length > 0 && { additionalRecipients }),
   };
 }
 

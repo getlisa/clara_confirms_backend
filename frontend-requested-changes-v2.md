@@ -54,7 +54,7 @@ would be nicer long-term but polling is fine for v1).
     final resolution, or timed out)
 - `outcome`: `confirmed | rescheduled | canceled` — only meaningful once
   `state=ended`.
-- `job_id`, `appointment_id`, `customer_id` — scope to one entity.
+- `job_id`, `appointment_id`, `customer_id` — scope to one entity. Note a confirmation conversation is job-scoped: an `appointment_id` filter matches the link's originating appointment, not every appointment the conversation actually covered.
 - `created_after`, `created_before` — ISO date range.
 - `limit`, `offset` — pagination.
 
@@ -117,12 +117,19 @@ ended conversation.
 
 ---
 
-## 3. `POST /jobs/bulk-send-confirmation` — new
+## 3. `POST /jobs/bulk-send-confirmation` — ✅ DONE (shape differs from the ask — see below)
 
 Called from the Inspections & Jobs page after a service manager selects one
-or more customers/jobs/appointments and clicks "Send Confirmation."
+or more customers/jobs/appointments and clicks "Send Confirmation." Full
+contract in `frontend-implementation-guide.md` §12.7 — summary of what
+differs from the original request:
 
-**Request:**
+`{type:"job"}` is the natural unit now that one conversation covers **all** of a
+job's upcoming appointments. `{type:"appointment"}` items de-duplicate to their
+parent job — selecting three appointments of the same job yields ONE row, so
+that's reported in `results` keyed by the job rather than silently dropping rows.
+
+**Request** (built as requested):
 ```json
 {
   "items": [
@@ -132,37 +139,31 @@ or more customers/jobs/appointments and clicks "Send Confirmation."
 }
 ```
 
-**Response:**
+**Response — QUEUES rather than sends,** unlike the original ask. This route
+reuses the exact same per-job enqueue logic the automatic nightly sweep uses
+(`scheduler.enqueueJobConfirmation` in the backend), so the two paths can
+never diverge on channel resolution, contact-completeness gating, or dedupe.
+That means the row still goes through the normal dispatcher — respecting
+office hours and per-tenant concurrency caps — rather than sending inline
+within this request. Consequently there's no `token`/`sent_via` per item (those
+only exist once actually dispatched, not at queue time):
 ```json
 {
   "results": [
-    {
-      "type": "job",
-      "id": 44417109,
-      "token": "abc123",
-      "sent_via": ["email", "sms"],
-      "status": "sent"
-    },
-    {
-      "type": "appointment",
-      "id": 9981,
-      "token": "def456",
-      "sent_via": ["email"],
-      "status": "failed",
-      "error": "no contact email on file"
-    }
+    { "type": "job", "id": 44417109, "requestedAs": "job", "status": "queued",
+      "channel": "voice", "scheduled_call_id": 5821, "scheduled_at": "2026-08-05T14:00:00Z" },
+    { "type": "job", "id": 51002, "requestedAs": "appointment", "status": "skipped", "reason": "missing_email", "channel": "web_chat" }
   ]
 }
 ```
-- For each item, creates a chat-link the same way `POST /chat-links/:kind/:id`
-  already does, **then actually dispatches it** — by email and/or SMS,
-  depending on what contact info is available — rather than requiring the
-  frontend to copy/paste a URL manually (current `SendChatLinkButton`
-  behavior, which this supersedes for bulk use; the single-item button can
-  either keep its clipboard-copy behavior or also switch to this endpoint —
-  frontend's choice).
+- Channel per item comes from the target customer's `is_voice`/`is_sms`/`is_email`
+  flags (see the new `chat-sms-channel-frontend.md` §2 — this shipped alongside
+  this endpoint, replacing the old single-valued `preferred_channel`), not a
+  fixed "email and/or SMS depending on what's available" rule.
 - Partial success is expected and fine — report per-item status rather than
-  failing the whole batch.
+  failing the whole batch. `status`: `"queued"` | `"skipped"` | `"failed"`;
+  `reason` on skip/fail: `missing_phone`, `missing_email`, `already_queued`,
+  `no_upcoming_appointment`, `appointment_not_found`, `invalid_item`.
 
 ---
 
@@ -192,13 +193,19 @@ computed the same way the existing `calls` block is period-scoped:
 
 ---
 
-## 5. Prompt fix: drop the "No" quick reply
+## 5. Prompt fix: drop the "No" quick reply — ✅ DONE
 
-The initial `quick_replies` `input_hint` at `chat_started` is currently
-`["Yes", "No", "Reschedule", "Cancel"]`. Please change it to
+The initial `quick_replies` `input_hint` at `chat_started` was
+`["Yes", "No", "Reschedule", "Cancel"]`; it is now
 `["Yes", "Reschedule", "Cancel"]` — "No" and "Cancel" mean the same thing here
 and having both is confusing for the customer and for a frontend trying to
 render a clean 3-button choice.
+
+Extra reason it had to go: with job-centric confirmations a bare "No" is now
+genuinely ambiguous — no to *which* appointment? Note `quick_replies` is also
+state-dependent now, and at `confirmation_accepted` it can be
+`["Yes, confirm the rest", "No, just this one"]`, where "No" *is* unambiguous
+and is therefore kept. See `chat-link-widget-frontend.md`.
 
 ---
 

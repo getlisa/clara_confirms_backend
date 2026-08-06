@@ -20,6 +20,7 @@
 
 const db = require("./../db");
 const scheduledCallsDb = require("../db/scheduled-calls");
+const { toLocalDateOnly } = require("../utils/timezone");
 
 function joinAddress(row) {
   return [row.address_line1, row.city, row.state].filter(Boolean).join(", ") || null;
@@ -171,6 +172,68 @@ async function hydrateOpenJobDueSoon(companyId, jobIdInput) {
   };
 }
 
+// ── job_confirmation (customer) — by job_id ─────────────────────────────────
+/**
+ * The job-centric confirmation hydrator: one conversation covers every upcoming
+ * appointment on a job, leads with the next one, and offers to confirm the rest.
+ *
+ * Separate from `hydrateScheduledUnconfirmed` rather than an extension of it —
+ * that one is keyed by appointment_id and its 422s (`appointment_cancelled`,
+ * `appointment_in_past`) are per-appointment eligibility, which is exactly right
+ * for `POST /calls/manual`. "Callable if ANY upcoming appointment is
+ * unconfirmed" is a different predicate; overloading one function makes both wrong.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.allowNoUpcoming=false] — set by the chat READ path. A
+ *   link that's already been delivered must still open even if its appointments
+ *   have since been cancelled or slipped into the past; the agent then offers to
+ *   book a new visit. Creation paths keep the strict check.
+ */
+async function hydrateJobConfirmation(companyId, jobIdInput, { allowNoUpcoming = false } = {}) {
+  const { buildJobConfirmationContext } = require("./job-confirmation-context");
+  const ctx = await buildJobConfirmationContext(companyId, jobIdInput);
+  if (!ctx.ok) return { ok: false, status: ctx.status || 404, code: ctx.code, error: ctx.error };
+
+  if (ctx.job.status === "cancelled" || ctx.job.status === "completed") {
+    return { ok: false, status: 422, code: "job_closed", error: `Job is ${ctx.job.status}` };
+  }
+  if (!allowNoUpcoming && ctx.counts.upcoming === 0) {
+    return {
+      ok: false, status: 422, code: "job_no_upcoming_appointments",
+      error: "Job has no upcoming appointments to confirm",
+    };
+  }
+
+  const jobId = String(ctx.job.id);
+  const next = ctx.appointments.next;
+  return {
+    ok: true,
+    jobId,
+    phoneSubject: "customer",
+    callType: "customer_confirmation",
+    // `params` stays flat scheduled_calls columns ONLY — manual-call.js spreads
+    // it straight into scheduledCallsDb.create(). The nested context rides on a
+    // sibling key so callers that want the rich view can opt in.
+    params: {
+      callType:        "customer_confirmation",
+      phoneNumber:     ctx.job.customer.phone || null,
+      jobId,
+      // The lead appointment's real day, not a window boundary — this column
+      // gates retry/callback scheduling and drives call priority. It's a DATE,
+      // so convert in the company's timezone rather than letting Postgres
+      // truncate a UTC instant (which can land a day late).
+      jobDate:         next ? toLocalDateOnly(next.scheduled_start, ctx.tz) : null,
+      appointmentId:   next ? next.appointment_id : null,
+      customerName:    ctx.job.customer.name,
+      customerAddress: ctx.job.customer.address,
+      jobName:         ctx.job.title || null,
+      jobDescription:  ctx.job.description || null,
+      jobType:         ctx.job.job_type || null,
+    },
+    context: ctx,
+  };
+}
+
 // ── quotation_pending (customer) — by quotation_id ──────────────────────────
 async function hydrateQuotationPending(companyId, quotationId) {
   const { rows } = await db.query(
@@ -211,6 +274,7 @@ const HYDRATORS = {
   scheduled_unconfirmed:  hydrateScheduledUnconfirmed,
   technician_unconfirmed: hydrateTechnicianUnconfirmed,
   open_job_due_soon:      hydrateOpenJobDueSoon,
+  job_confirmation:       hydrateJobConfirmation,
   quotation_pending:      hydrateQuotationPending,
 };
 
@@ -218,6 +282,7 @@ const TARGET_FIELD = {
   scheduled_unconfirmed:  "appointment_id",
   technician_unconfirmed: "appointment_id",
   open_job_due_soon:      "job_id",
+  job_confirmation:       "job_id",
   quotation_pending:      "quotation_id",
 };
 
@@ -225,6 +290,7 @@ module.exports = {
   hydrateScheduledUnconfirmed,
   hydrateTechnicianUnconfirmed,
   hydrateOpenJobDueSoon,
+  hydrateJobConfirmation,
   hydrateQuotationPending,
   HYDRATORS,
   TARGET_FIELD,

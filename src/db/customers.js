@@ -17,7 +17,11 @@ function rowToObject(row) {
     country:                row.country ?? "US",
     is_active:              row.is_active,
     source:                 row.source ?? null,
-    preferred_channel:      row.preferred_channel ?? null,
+    is_voice:               row.is_voice,
+    is_sms:                 row.is_sms,
+    is_email:               row.is_email,
+    confirmation_include_customer: row.confirmation_include_customer,
+    confirmation_contact_ids:      row.confirmation_contact_ids ?? [],
     additional_information: row.additional_information ?? {},
     created_at:             row.created_at,
     updated_at:             row.updated_at,
@@ -126,7 +130,8 @@ async function update(id, companyId, fields) {
   const allowed = [
     "first_name", "last_name", "full_name", "email", "phone", "alternate_phone",
     "address_line1", "city", "state", "zipcode", "country", "is_active", "additional_information",
-    "preferred_channel",
+    "is_voice", "is_sms", "is_email",
+    "confirmation_include_customer", "confirmation_contact_ids",
   ];
   const provided = Object.keys(fields).filter((k) => allowed.includes(k) && k in fields);
   if (provided.length === 0) return getById(id, companyId);
@@ -148,4 +153,47 @@ async function update(id, companyId, fields) {
   return result.rows[0] ? rowToObject(result.rows[0]) : null;
 }
 
-module.exports = { list, getById, create, update };
+/**
+ * Contacts linked to this customer via `contact_companies` — the checklist
+ * of people who could additionally receive this customer's confirmations.
+ * Same join `getJobContacts` (src/db/jobs.js) uses, without the job-scoped
+ * primary-contact/location union — there's no job in play here, just "every
+ * contact tied to this customer."
+ */
+async function getConfirmationContacts(customerId, companyId) {
+  const { rows } = await db.query(
+    `SELECT c.id, c.first_name, c.last_name, c.phone, c.mobile,
+            c.alternate_phone, c.email, c.contact_role
+       FROM contacts c
+       JOIN contact_companies cc ON cc.contact_id = c.id
+      WHERE c.company_id = $1 AND cc.customer_id = $2
+      ORDER BY c.last_name NULLS LAST, c.first_name NULLS LAST`,
+    [companyId, customerId]
+  );
+  return rows.map((c) => ({
+    id: c.id,
+    name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim() || null,
+    first_name: c.first_name ?? null,
+    last_name: c.last_name ?? null,
+    phone: c.phone ?? null,
+    mobile: c.mobile ?? null,
+    alternate_phone: c.alternate_phone ?? null,
+    email: c.email ?? null,
+    contact_role: c.contact_role ?? null,
+  }));
+}
+
+/** Every id in `contactIds` that's actually linked to this customer via contact_companies. */
+async function getLinkedContactIds(customerId, companyId, contactIds) {
+  if (!contactIds.length) return [];
+  const { rows } = await db.query(
+    `SELECT c.id
+       FROM contacts c
+       JOIN contact_companies cc ON cc.contact_id = c.id
+      WHERE c.company_id = $1 AND cc.customer_id = $2 AND c.id = ANY($3::int[])`,
+    [companyId, customerId, contactIds]
+  );
+  return rows.map((r) => r.id);
+}
+
+module.exports = { list, getById, create, update, getConfirmationContacts, getLinkedContactIds };

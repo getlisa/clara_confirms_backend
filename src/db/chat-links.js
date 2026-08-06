@@ -5,37 +5,44 @@ function generateToken() {
   return crypto.randomBytes(24).toString("hex"); // 48 hex chars — unguessable
 }
 
-async function findByAppointment(companyId, appointmentId) {
+// recipientContactId (null = the customer themselves) scopes the lookup to
+// THAT recipient's token — same COALESCE(x, 0) convention as
+// scheduled_calls_active_uniq (migration 081), so "the customer's" link and
+// "contact #8842's" link never cross-serve or get treated as duplicates of
+// each other.
+async function findByAppointment(companyId, appointmentId, recipientContactId = null) {
   const result = await db.query(
     `SELECT * FROM chat_links
      WHERE company_id = $1 AND appointment_id = $2 AND (expires_at IS NULL OR expires_at > NOW())
+       AND COALESCE(recipient_contact_id, 0) = COALESCE($3, 0)
      ORDER BY created_at DESC LIMIT 1`,
-    [companyId, appointmentId]
+    [companyId, appointmentId, recipientContactId]
   );
   return result.rows[0] || null;
 }
 
-async function findByJob(companyId, jobId) {
+async function findByJob(companyId, jobId, recipientContactId = null) {
   const result = await db.query(
     `SELECT * FROM chat_links
      WHERE company_id = $1 AND job_id = $2 AND appointment_id IS NULL
        AND (expires_at IS NULL OR expires_at > NOW())
+       AND COALESCE(recipient_contact_id, 0) = COALESCE($3, 0)
      ORDER BY created_at DESC LIMIT 1`,
-    [companyId, jobId]
+    [companyId, jobId, recipientContactId]
   );
   return result.rows[0] || null;
 }
 
-async function create({ companyId, jobId = null, appointmentId = null, callType = "customer_confirmation", expiresAt = null }) {
+async function create({ companyId, jobId = null, appointmentId = null, callType = "customer_confirmation", expiresAt = null, recipientContactId = null }) {
   // Collision probability with 24 random bytes is negligible, but retry once
   // defensively rather than surface a 500 on the 1-in-2^192 case.
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const result = await db.query(
-        `INSERT INTO chat_links (company_id, token, job_id, appointment_id, call_type, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO chat_links (company_id, token, job_id, appointment_id, call_type, expires_at, recipient_contact_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING *`,
-        [companyId, generateToken(), jobId, appointmentId, callType, expiresAt]
+        [companyId, generateToken(), jobId, appointmentId, callType, expiresAt, recipientContactId]
       );
       return result.rows[0];
     } catch (err) {
@@ -51,6 +58,17 @@ async function getByToken(token) {
   if (!row) return null;
   if (row.expires_at && new Date(row.expires_at) < new Date()) return null;
   return row;
+}
+
+/**
+ * Same lookup, but doesn't hide an expired row — lets the caller (the public
+ * widget route) tell "never existed" (404) apart from "existed, but the link
+ * died" (410), which reads very differently to a customer clicking a stale
+ * text/email.
+ */
+async function getByTokenRaw(token) {
+  const result = await db.query(`SELECT * FROM chat_links WHERE token = $1`, [token]);
+  return result.rows[0] || null;
 }
 
 async function markOpened(id) {
@@ -101,6 +119,6 @@ async function reopen(id, oldChatId, newChatId) {
 }
 
 module.exports = {
-  findByAppointment, findByJob, create, getByToken, markOpened,
+  findByAppointment, findByJob, create, getByToken, getByTokenRaw, markOpened,
   getByRetellChatId, claimRetellChatId, setState, reopen,
 };
