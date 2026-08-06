@@ -103,6 +103,18 @@ async function setState(chatId, state) {
 }
 
 /**
+ * Same as setState, but keyed by the link's own token — the confirmation
+ * agent's thread_id IS the token directly (it never sets retell_chat_id).
+ */
+async function setStateByToken(token, state) {
+  const result = await db.query(
+    `UPDATE chat_links SET state = $1 WHERE token = $2 RETURNING *`,
+    [state, token]
+  );
+  return result.rows[0] || null;
+}
+
+/**
  * Atomically swap in a fresh chat_id for a link whose previous Retell session
  * can no longer accept new turns (ended/errored), resetting state back to
  * chat_started for the new session. Compare-and-swap on the OLD chat_id, same
@@ -120,5 +132,5 @@ async function reopen(id, oldChatId, newChatId) {
 
 module.exports = {
   findByAppointment, findByJob, create, getByToken, getByTokenRaw, markOpened,
-  getByRetellChatId, claimRetellChatId, setState, reopen,
+  getByRetellChatId, claimRetellChatId, setState, setStateByToken, reopen,
 };

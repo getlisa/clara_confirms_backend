@@ -10,6 +10,7 @@
 
 const express = require("express");
 const customersDb = require("../db/customers");
+const callSettingsDb = require("../db/call-settings");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localizeFields, localizeRows } = require("../utils/timezone");
@@ -125,6 +126,39 @@ router.post("/", async (req, res) => {
     }
     logger.error("POST /customers failed", { error: err.message });
     return res.status(500).json({ error: "Failed to create customer" });
+  }
+});
+
+/**
+ * POST /customers/bulk-apply-channel-strategy
+ * Body: none — target flags are derived server-side from the company's own
+ * call_settings.channel_strategy + chat_link_delivery_method, so this can
+ * never drift from what dispatch actually honors.
+ *
+ * Overwrites is_voice/is_sms/is_email for every customer of this company,
+ * unconditionally (including customers individually customized via the
+ * confirmation-recipients checklist — a deliberate product choice, see
+ * customer-confirmation-contact-backend.md §4). Replaces the frontend's
+ * previous client-side loop (`handleApplyStrategyToCustomers`) that
+ * PATCHed every customer one at a time.
+ */
+router.post("/bulk-apply-channel-strategy", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const callSettings = await callSettingsDb.getByCompanyId(companyId);
+    const flags = customersDb.channelStrategyToFlags(callSettings.channel_strategy, callSettings.chat_link_delivery_method);
+    const result = await customersDb.bulkApplyChannelStrategy(companyId, flags);
+
+    logger.info("POST /customers/bulk-apply-channel-strategy", {
+      companyId, channelStrategy: callSettings.channel_strategy, chatLinkDeliveryMethod: callSettings.chat_link_delivery_method,
+      ...result,
+    });
+    return res.json(result);
+  } catch (err) {
+    logger.error("POST /customers/bulk-apply-channel-strategy failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to apply channel strategy to customers" });
   }
 });
 

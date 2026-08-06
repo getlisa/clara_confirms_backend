@@ -1,12 +1,16 @@
 # Frontend-Requested Backend Changes — Per-Customer Confirmation Recipients
 
-> ✅ **IMPLEMENTED** (migration `081_confirmation_recipients.sql`). Everything
-> in this doc shipped as proposed, with the deviations/decisions noted inline
-> below in **bold callouts** — read those before wiring the frontend up, a
-> couple of response shapes differ slightly from the original ask.
->
 > Written from the frontend (`clara-confirms`), same convention as
-> `frontend-requested-changes-v2.md`.
+> `frontend-requested-changes-v2.md`: this describes what the backend needs to
+> build, nothing here is implemented server-side yet. The frontend is
+> proceeding to build its UI against this proposed contract immediately — the
+> Customers page (`CustomersPage.tsx`'s "Customer Snapshot" sheet, and
+> `CustomerDetailPage.tsx`) already has a multi-select recipients checklist
+> wired up and calling `PATCH /customers/:id` with the two new fields below.
+> Until the backend ships this, the "customer's own phone/email" checkbox
+> still works (it maps to a plain boolean field), but the other-contacts list
+> degrades to a "not available on this server yet" note (see
+> `getCustomerContacts` in `src/lib/auth-api.ts`) rather than erroring.
 
 ## Context
 
@@ -36,6 +40,22 @@ and one contact-id array on `customers`, one new read endpoint to populate the
 checklist, and the dispatch-side fan-out to actually honor a multi-recipient
 list.
 
+**Separately discovered while scoping this**: every customer's
+`is_voice`/`is_sms`/`is_email` currently sits at the same literal default
+(`true`/`false`/`false` — voice only), regardless of the company's own
+`call_settings.channel_strategy` (Settings → Channel). That default appears to
+have been applied uniformly when the three flags replaced the old
+single-valued `preferred_channel` (migration 080), rather than backfilled from
+each company's actual chosen strategy. Practically, a company running
+`sms_only` still has every customer individually flagged voice-only until
+someone opens each one and fixes it by hand. §4 below covers this. (The
+`channel_strategy` selector on the settings page previously also offered a
+`web_chat_only` option; it's been removed there since the chat-link delivery
+method it controlled — `chat_link_delivery_method` — applies whenever a link
+send happens regardless of this strategy, not just under that one option. The
+type only has three values now: `voice_only | sms_only |
+voice_then_sms_fallback`.)
+
 ---
 
 ## 1. Two new `customers` columns
@@ -52,20 +72,17 @@ list.
   `customers.phone`/`customers.email` exactly as it does today, in addition
   to whatever's in `confirmation_contact_ids`.
 - `confirmation_include_customer: false` — the customer's own phone/email is
-  **not** a dispatch target; only the listed contacts receive it.
-  **✅ Built as a hard `400`, not a silent no-op** — `PATCH /customers/:id`
-  rejects `include_customer: false` + an empty `confirmation_contact_ids`
-  with `{"error": "At least one confirmation recipient is required — include
-  the customer or select at least one contact."}`. Same shape/precedent as
-  the existing `is_voice`/`is_sms`/`is_email` "at least one channel" check.
+  **not** a dispatch target; only the listed contacts receive it. The
+  frontend surfaces a warning when this is false and `confirmation_contact_ids`
+  is also empty (nobody would receive anything), but does not block saving
+  that state — treat it the same as today's "all three channels off" case if
+  you'd rather reject it with a `400` than silently no-op.
 - `confirmation_contact_ids: []` (default) — no extra recipients, unchanged
   from today's behavior.
-- **✅ Built the ownership check** (was cheap) — every id in
-  `confirmation_contact_ids` must resolve via `contact_companies` for *this*
-  customer, or the whole PATCH is rejected with a `400` listing which id(s)
-  didn't match: `{"error": "These contact ids are not linked to this
-  customer: 8843, 9012"}`. Bad ids are never silently dropped from the saved
-  array.
+- No validation requiring each referenced contact belong to this customer's
+  own company/`contact_companies` linkage is assumed necessary from the
+  frontend's side, but flagging it in case it's cheap to add as a safety net
+  against cross-tenant mistakes.
 
 **Expose via the existing customer endpoints** — no new shape needed beyond
 adding the two fields:
@@ -148,39 +165,74 @@ channels fire, unchanged):
 - **`voice`** — a live call is inherently one-to-one, so "voice to 2
   recipients" means **two separate scheduled call attempts**, one per
   recipient's phone, not one call with multiple parties. This multiplies call
-  volume/cost linearly with recipient count.
-
-  > **✅ Decided: automatic sweep fans out (as above); manual "Call Now" does
-  > not.** For the nightly sweep and `POST /jobs/bulk-send-confirmation`,
-  > voice fans out exactly as proposed — N recipients = N scheduled calls,
-  > queued hours apart via the normal dispatcher. For a **manual, synchronous**
-  > "Call Now" click with no explicit `phone_number` override, though, we
-  > decided that dialing several simultaneous LIVE calls from one button press
-  > is a bigger cost/UX surprise than the same fan-out happening invisibly
-  > overnight — so manual Call Now still dials **only the customer's own
-  > number**, ignoring `confirmation_contact_ids` for that one action.
-  > Manual "Text Now"/"Email Now" (link-send) DO fan out to every recipient,
-  > same as the automatic path — see the `additionalRecipients` note below.
-
+  volume/cost linearly with recipient count — worth deciding whether that's
+  actually desired for voice specifically, versus e.g. always falling back to
+  link-send once more than one recipient is selected. Flagging this as a
+  product decision rather than assuming the obvious fan-out is what you want;
+  the frontend doesn't currently warn the user about this cost when they
+  check multiple boxes with Call enabled.
 - Per-recipient skip semantics (`missing_phone`/`missing_email`) apply
   per-recipient, not to the whole customer — one recipient missing a phone
-  shouldn't block sending to the others. Verified live: a customer with no
-  email on file (but `is_email` selected) correctly got a `missing_email` todo
-  and was skipped, while a linked contact who does have an email still queued
-  and received its own confirmation email.
+  shouldn't block sending to the others.
 - The manual-trigger free-text `phone_number`/`email` override (already
-  supported today) keeps taking precedence over the resolved recipient
+  supported today) should keep taking precedence over the resolved recipient
   list when present — it's a one-off, more specific override that bypasses
-  the customer's saved preferences entirely, and disables the recipient
-  fan-out for that call (single-target, as before).
+  the customer's saved preferences entirely.
 
-> **New in `POST /calls/manual`'s response:** an `additionalRecipients` array
-> (only present when non-empty) reports any extra confirmation contacts
-> queued alongside the primary target for a link-send — e.g.
-> `[{ "recipientContactId": 8842, "scheduledCallId": 5821 }]`. The main
-> response fields (`scheduledCall`, `dialed`, `chatLinkToken`, etc.) still
-> describe only the primary target, exactly as documented elsewhere —
-> `additionalRecipients` is purely additive, not a breaking shape change.
+---
+
+## 4. `POST /customers/bulk-apply-channel-strategy` — new endpoint (replaces a frontend workaround)
+
+The frontend has already shipped a stopgap for the default-drift problem
+described above: Settings → Call Settings has an "Apply to all customers"
+button (`CallSettings.tsx`, `handleApplyStrategyToCustomers`, behind a
+confirmation dialog since it's a broad overwrite) that paginates through
+every customer via `GET /customers` and issues an individual
+`PATCH /customers/:id` with the flags computed from the company's current
+`channel_strategy` AND `chat_link_delivery_method` (`channelStrategyToFlags`,
+same file): `is_voice`/`is_sms` come from `channel_strategy` alone;
+`is_email` comes from `chat_link_delivery_method` being `email`/`both`, since
+no `channel_strategy` option involves email — without this, `is_email` would
+be unreachable through the bulk action even when the company clearly wants
+email as a delivery channel. **This applies
+unconditionally to every customer, every time it's run** — including
+customers who've had their channels individually customized via the
+Customers page recipients checklist. That's a deliberate product choice (the
+per-customer picker is for choosing *who* receives a confirmation, not for
+overriding the company's *channel* strategy long-term), but it does mean
+running this after enabling per-customer channel overrides will blow those
+overrides away — worth deciding whether that's the behavior you want at the
+database level too, or whether per-customer channel customization should be
+exempted the way the frontend's very first version of this action did (only
+touching customers still on the untouched default). Only a customer whose
+flags already exactly equal the target is skipped, since that's a genuine
+no-op write.
+
+This works but doesn't scale: it's O(customers) individual round-trips from
+the browser, serialized, with no server-side transaction — a page reload
+mid-run just leaves the rest undone until re-triggered. A real bulk endpoint
+would let this run as a single request:
+
+**Request:** `POST /customers/bulk-apply-channel-strategy`, empty body — the
+target flags are derived server-side from the company's own already-saved
+`call_settings.channel_strategy` AND `chat_link_delivery_method`, not passed
+in, so this can never drift from what dispatch actually honors.
+
+**Response:**
+```json
+{ "scanned": 812, "updated": 630, "skipped": 182 }
+```
+- `updated`: every customer whose flags didn't already equal the target and
+  got overwritten to match it — regardless of prior individual customization.
+- `skipped`: customers already matching the target (a no-op either way).
+- Runs as a single DB statement/transaction if feasible
+  (`UPDATE customers SET is_voice=..., is_sms=..., is_email=... WHERE
+  company_id=$1 AND NOT (is_voice=$2 AND is_sms=$3 AND is_email=$4)`) rather
+  than row-by-row, given this is meant to run for on the order of hundreds to
+  thousands of customers per company.
+
+Once this exists, the frontend's `handleApplyStrategyToCustomers` loop can be
+deleted in favor of one call to this endpoint.
 
 ---
 

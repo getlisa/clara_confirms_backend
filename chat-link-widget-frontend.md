@@ -209,7 +209,7 @@ shape from a normal resume — treat it the same way, just render the returned
 | `reschedule_needed` | Customer wants to reschedule, no date picked yet |
 | `reschedule_pending_confirmation` | New date picked and applied — needs reconfirmation later |
 | `canceled` | Customer canceled |
-| `chat_ended` | Session closed (inactivity timeout) |
+| `chat_ended` | **Changed** — the conversation is genuinely over. Historically this only ever meant "session timed out from inactivity"; it now *also* fires the moment the agent explicitly wraps up a conversation (far and away the more common case — see §6) |
 
 ### `input_hint` reference — what to render for the next input
 | `type` | Fields | Render |
@@ -217,6 +217,7 @@ shape from a normal resume — treat it the same way, just render the returned
 | `quick_replies` | `options: string[]` | Buttons instead of a text box — send the clicked label as `content`. **State-dependent**: `["Yes","Reschedule","Cancel"]` at `chat_started`; `["Yes, confirm the rest","No, just this one"]` at `confirmation_accepted` when the job still has other unconfirmed upcoming appointments |
 | `date_picker` | `min`, `max` (YYYY-MM-DD) | Calendar/time picker constrained to before the job's due date. Rescheduling moves **one** appointment — the job's other appointments are untouched — send the picked value as a plain formatted string through the same `content` field (e.g. `"August 5th at 2pm"`) — the flow already parses natural-language dates, no special payload needed |
 | `email_form` | — | Single email field |
+| `ended` | — **new** | Conversation is over — see §6. No further input expected |
 | `free_text` | — | Normal chat input (default/fallback) |
 
 ### Service-link messages — a distinct message shape
@@ -275,7 +276,48 @@ it optimistically the moment the user hits send, same as any chat UI).
 
 ---
 
-## 6. Not in this build
+## 6. Conversation ending — NEW, frontend action required
+
+**What changed:** the backend now reliably tells you when a conversation is
+truly over. Previously, once the agent wrapped up, `state`/`input_hint`
+stayed at whatever they last were (e.g. `service_link_sent`/`free_text`)
+forever — there was no way to distinguish "still going" from "done," so the
+text input never went away even though nothing more would happen.
+
+**What to build:** when a `done` event (SSE, §4) or a `GET` response carries
+`state: "chat_ended"` / `input_hint: { "type": "ended" }`, treat the
+conversation as terminal:
+- Hide or disable the text input / quick-reply buttons.
+- Show a short "This conversation has ended." message (or similar) in place
+  of the input control.
+- No further `POST /chat-links/:token/messages` calls are expected once
+  this state is reached — the widget's job for this session is done.
+
+This can now arrive at any point mid-conversation, not just after
+inactivity — e.g. right after a customer says "no, that's all" following a
+confirmation. A real example `done` payload:
+```json
+{ "state": "chat_ended", "input_hint": { "type": "ended" } }
+```
+Note the final turn that reaches this state may carry an **empty**
+`messages` array in the SSE response (the agent's last internal step was
+just calling its end-of-conversation tool, with no new text to say) — that's
+expected, not an error; just apply the terminal `state`/`input_hint` from
+the `done` event regardless of whether any `message_complete` events
+preceded it in that same turn.
+
+**Also fixed (no frontend change needed, just confirming the contract now
+actually holds):** the SSE stream from `POST /chat-links/:token/messages`
+was, in one specific case, incorrectly echoing the customer's own
+just-sent message back as a `role: "user"` `message_delta`/`message_complete`
+event — a violation of §4's documented promise that every event in that
+stream is `role: "agent"`. This is now fixed backend-side; no defensive
+role-filtering was ever supposed to be necessary on your end, and now it
+genuinely isn't.
+
+---
+
+## 7. Not in this build
 - Automatic re-engagement — right now a chat link is only ever created when
   staff explicitly click "Send chat link." Wiring `web_chat` into the same
   automatic scheduler/channel-strategy voice and SMS use (e.g. auto-emailing a
