@@ -19,6 +19,8 @@ const stCredsDb       = require("../../../db/servicetrade-credentials");
 const techDb          = require("../../../db/technicians");
 const db              = require("../../../db");
 const normalize       = require("./normalize");
+const callSettingsDb  = require("../../../db/call-settings");
+const { inferJobConfirmations } = require("../../job-confirmation-inference");
 const logger          = require("../../../utils/logger");
 
 class ServiceTradeProvider extends CrmProvider {
@@ -103,6 +105,7 @@ class ServiceTradeProvider extends CrmProvider {
       serviceLines: 0, deficiencies: 0, changeOrders: 0, contracts: 0, serviceRecurrences: 0,
       serviceRequests: 0, serviceOpportunities: 0, appointmentServices: 0,
       schedulingComments: 0, jobNotes: 0, appointmentNotes: 0,
+      confirmationAssessments: 0,
     };
 
     counts.customers   = await this._normalizeCustomers(companyId, engine);
@@ -172,6 +175,18 @@ class ServiceTradeProvider extends CrmProvider {
     await this._normalizeAppointmentTechnicians(companyId, rawAppointments);
     await this._normalizeAppointmentOffices(companyId, rawAppointments);
     counts.appointmentNotes = await this._normalizeAppointmentNotes(companyId, rawAppointments);
+
+    // Infer confirmation status from ServiceTrade's own human-entered
+    // comments/notes (just normalized above) — off by default per company,
+    // since a wrong inference could silently suppress a real confirmation
+    // dispatch (see job-confirmation-inference.js).
+    const callSettings = await callSettingsDb.getByCompanyId(companyId).catch(() => null);
+    if (callSettings?.job_confirmation_inference_enabled) {
+      counts.confirmationAssessments = await inferJobConfirmations(companyId).catch((err) => {
+        logger.error("ServiceTradeProvider.normalizeAll: job confirmation inference failed", { companyId, error: err.message });
+        return 0;
+      });
+    }
 
     // Service-request-derived entities — independent of each other, so order
     // among them doesn't matter, but all must run before service_requests

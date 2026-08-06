@@ -20,8 +20,8 @@ const OpenAI = require("openai");
 const db = require("../src/db");
 const jobsDb = require("../src/db/jobs");
 const locationsDb = require("../src/db/locations");
+const { fetchJobComments, analyzeJob: analyzeJobShared, OPENAI_MODEL } = require("../src/services/job-confirmation-inference");
 
-const OPENAI_MODEL = "gpt-4o-mini";
 const LLM_CONCURRENCY = 5;
 const OUTPUT_DIR = path.join(__dirname, "..", "out");
 
@@ -36,38 +36,6 @@ async function fetchJobIds(companyId) {
     [companyId]
   );
   return rows.map((r) => r.id);
-}
-
-/** scheduling_comments + job_notes + this job's appointment_notes, oldest first. */
-async function fetchJobComments(companyId, jobId, appointmentIds) {
-  const [comments, notes, apptNotes] = await Promise.all([
-    db.query(
-      `SELECT content, created_at FROM scheduling_comments
-        WHERE company_id = $1 AND job_id = $2 AND content IS NOT NULL AND content <> ''
-        ORDER BY created_at ASC`,
-      [companyId, jobId]
-    ),
-    db.query(
-      `SELECT type, text, created_at FROM job_notes
-        WHERE company_id = $1 AND job_id = $2 AND text IS NOT NULL AND text <> ''
-        ORDER BY created_at ASC`,
-      [companyId, jobId]
-    ),
-    appointmentIds.length
-      ? db.query(
-          `SELECT type, text, created_at FROM appointment_notes
-            WHERE company_id = $1 AND appointment_id = ANY($2::int[]) AND text IS NOT NULL AND text <> ''
-            ORDER BY created_at ASC`,
-          [companyId, appointmentIds]
-        )
-      : { rows: [] },
-  ]);
-
-  return [
-    ...comments.rows.map((r) => ({ source: "scheduling_comment", type: null, text: r.content, created_at: r.created_at })),
-    ...notes.rows.map((r) => ({ source: "job_note", type: r.type ?? null, text: r.text, created_at: r.created_at })),
-    ...apptNotes.rows.map((r) => ({ source: "appointment_note", type: r.type ?? null, text: r.text, created_at: r.created_at })),
-  ].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 }
 
 /** Full context for one job: customer/technician/appointments/contacts/quotations (via getJobById), plus location and comments. */
@@ -86,51 +54,15 @@ async function buildJobContext(companyId, jobId) {
   return { ...job, location, owner, comments };
 }
 
-const CONFIRMATION_SCHEMA = {
-  name: "job_confirmation_assessment",
-  strict: true,
-  schema: {
-    type: "object",
-    properties: {
-      confirmed: { type: "string", enum: ["yes", "no", "unclear"] },
-      confidence: { type: "number" },
-      reasoning: { type: "string" },
-      evidence: { type: ["string", "null"] },
-    },
-    required: ["confirmed", "confidence", "reasoning", "evidence"],
-    additionalProperties: false,
-  },
-};
-
-function buildPrompt(job) {
-  const commentLines = job.comments
-    .map((c) => `[${c.created_at}] (${c.source}${c.type ? `/${c.type}` : ""}) ${c.text}`)
-    .join("\n");
-  return `Job #${job.job_number ?? job.id} for customer "${job.customer?.full_name ?? "unknown"}".
-
-Comments and notes on this job, oldest first:
-${commentLines || "(none)"}
-
-Based ONLY on the comments and notes above, decide whether the customer has confirmed this job/appointment.
-- "yes" if a comment clearly states the customer confirmed (e.g. spoke to customer, confirmed via call/text/email).
-- "no" if a comment clearly states the customer declined, cancelled, or asked to reschedule.
-- "unclear" if there are no comments, or nothing in them addresses confirmation status.
-Quote the specific comment text that supports your answer in "evidence" (or null if unclear).`;
-}
-
 async function analyzeJob(openai, job) {
   if (job.comments.length === 0) {
     return { confirmed: "unclear", confidence: 1, reasoning: "No comments or notes on this job.", evidence: null };
   }
-  const completion = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    messages: [
-      { role: "system", content: "You audit field-service job comments to determine customer confirmation status. Be conservative — only say yes/no when the comments say so explicitly." },
-      { role: "user", content: buildPrompt(job) },
-    ],
-    response_format: { type: "json_schema", json_schema: CONFIRMATION_SCHEMA },
+  return analyzeJobShared(openai, {
+    jobNumber: job.job_number ?? job.id,
+    customerName: job.customer?.full_name,
+    comments: job.comments,
   });
-  return JSON.parse(completion.choices[0].message.content);
 }
 
 /** Runs `items` through `fn` with at most `limit` in flight at once. */
