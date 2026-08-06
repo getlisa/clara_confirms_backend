@@ -60,7 +60,7 @@ fetched by the agent at call time via a custom tool**,
 `get_service_opportunities` (returns each item's id, work, *why it's
 recommended* / inspection deficiency, estimated price, recurring-service flag,
 and requested window) — not passed as a giant variable, exactly like the other
-agents call `get_job` / `get_quotation`. The agent then books accepted items
+agents call `get_appointments` / `get_quotation`. The agent then books accepted items
 with the `book_service_opportunity` write tool. All of this is server-side; the
 frontend just posts the selected IDs (§2).
 

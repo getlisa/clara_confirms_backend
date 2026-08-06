@@ -3,7 +3,10 @@ const db = require("./index");
 const TECHNICIAN_FIELDS = [
   { column: "first_name", key: "firstName" },
   { column: "last_name", key: "lastName" },
-  { column: "phone", key: "phone" },
+  // appointment.techs[] (the only technician source now — see servicetrade-sync.js)
+  // doesn't always carry a phone number; don't let a sync pass with no phone
+  // clobber one a prior sync already found.
+  { column: "phone", key: "phone", updateExpr: "phone = COALESCE(EXCLUDED.phone, technicians.phone)" },
   { column: "email", key: "email" },
   { column: "is_active", key: "isActive", transform: (v) => v !== false },
 ];

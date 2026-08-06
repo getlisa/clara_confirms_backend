@@ -38,10 +38,31 @@ async function sendSms({ to, body }) {
       from: config.twilio.fromNumber,
       body,
     });
-    logger.info("SMS sent", { to: to?.slice(0, 4) + "***", sid: message.sid });
+    // `status` here is Twilio's IMMEDIATE queueing status ("queued"/"accepted"/
+    // "sending"/"sent") — NOT final delivery. Twilio delivers the real
+    // delivered/undelivered verdict asynchronously (carrier DLR), which we
+    // don't currently receive (no statusCallback configured) — check the
+    // Twilio console/API for a message's final status by its `sid`.
+    logger.info("SMS sent", {
+      to: to?.slice(0, 4) + "***",
+      sid: message.sid,
+      status: message.status,
+      errorCode: message.errorCode,
+      errorMessage: message.errorMessage,
+      numSegments: message.numSegments,
+    });
     return true;
   } catch (err) {
-    logger.error("Twilio error", { error: err.message, to: to?.slice(0, 4) + "***" });
+    // Twilio's synchronous rejection shape (e.g. invalid/unreachable number,
+    // account/permission errors) — code/moreInfo point at the specific
+    // Twilio error (see twilio.com/docs/errors/<code>).
+    logger.error("Twilio error", {
+      error: err.message,
+      to: to?.slice(0, 4) + "***",
+      code: err.code,
+      status: err.status,
+      moreInfo: err.moreInfo,
+    });
     throw err;
   }
 }

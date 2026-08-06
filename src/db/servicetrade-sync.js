@@ -568,6 +568,55 @@ async function upsertServiceRequestsBatch(companyId, rows) {
   }
 }
 
+async function upsertProjectsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(companyId, r.servicetrade_id, r.start_date ?? null, r.end_date ?? null, r.payload ? JSON.stringify(r.payload) : "{}");
+    });
+    await db.query(
+      `INSERT INTO servicetrade_projects (company_id, servicetrade_id, start_date, end_date, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
+         payload = EXCLUDED.payload, updated_at = NOW()`,
+      params
+    );
+  }
+}
+
+async function upsertUsersBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(
+        companyId, r.servicetrade_id, r.name ?? null, r.email ?? null, r.status ?? null,
+        r.is_tech ?? null, r.is_helper ?? null,
+        r.payload ? JSON.stringify(r.payload) : "{}"
+      );
+    });
+    await db.query(
+      `INSERT INTO servicetrade_users (company_id, servicetrade_id, name, email, status, is_tech, is_helper, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         name = EXCLUDED.name, email = EXCLUDED.email, status = EXCLUDED.status,
+         is_tech = EXCLUDED.is_tech, is_helper = EXCLUDED.is_helper,
+         payload = EXCLUDED.payload, updated_at = NOW()`,
+      params
+    );
+  }
+}
+
 /** Insert-only (never overwrite) — guarantees FK-resolvability for a job referenced by a service request but not yet seen by the dedicated /job sync. */
 async function upsertJobStubsBatch(companyId, rows) {
   if (rows.length === 0) return;
@@ -715,6 +764,8 @@ async function listServiceRequests(companyId, { status = null, page = 1, perPage
 // ── Cleanup ─────────────────────────────────────────────────────────────────
 
 async function deleteAllSyncData(companyId) {
+  await db.query("DELETE FROM servicetrade_users               WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_projects             WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_service_requests    WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_service_recurrences WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_contracts           WHERE company_id = $1", [companyId]);
@@ -751,6 +802,8 @@ module.exports = {
   upsertContractsBatch,
   upsertServiceRecurrencesBatch,
   upsertServiceRequestsBatch,
+  upsertProjectsBatch,
+  upsertUsersBatch,
   upsertJobStubsBatch,
   upsertLocationStubsBatch,
   // Reads

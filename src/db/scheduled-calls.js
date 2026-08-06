@@ -14,9 +14,9 @@ function quotationDedupeKeys(quotationId, linkedJobId) {
   return [...new Set(keys)];
 }
 
-async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest = false, maxAttempts = 3, callPriority, bypassOfficeHours, channel }) {
+async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest = false, maxAttempts = 3, callPriority, bypassOfficeHours, channel, linkDelivery, retryCount, recipientContactId, recipientName, recipientEmail }) {
   try {
-    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest, maxAttempts, callPriority, bypassOfficeHours, channel });
+    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest, maxAttempts, callPriority, bypassOfficeHours, channel, linkDelivery, recipientContactId, recipientName, recipientEmail, ...(retryCount != null && { retryCount }) });
   } catch (err) {
     if (err.code === "23505") {
       const dup = new Error("Duplicate active scheduled call");
@@ -33,7 +33,11 @@ async function insertScheduledCall({
   jobName, jobDescription, jobType, totalAmount, callContext,
   scheduledAt, isTest = false, maxAttempts = 3,
   callPriority = "normal", parentCallId = null, retryCount = 0,
-  bypassOfficeHours = false, channel = "voice",
+  bypassOfficeHours = false, channel = "voice", linkDelivery = null,
+  // recipientContactId null = the customer themselves (today's only case
+  // until migration 081's confirmation-recipients feature). recipientName/
+  // recipientEmail are a snapshot at enqueue time — see migration 081.
+  recipientContactId = null, recipientName = null, recipientEmail = null,
 }) {
   const result = await db.query(
     `INSERT INTO scheduled_calls
@@ -41,15 +45,17 @@ async function insertScheduledCall({
         customer_name, technician_name, customer_address,
         job_name, job_description, job_type, total_amount, call_context,
         scheduled_at, is_test, max_attempts,
-        call_priority, parent_call_id, retry_count, bypass_office_hours, channel)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21,$22)
+        call_priority, parent_call_id, retry_count, bypass_office_hours, channel, link_delivery,
+        recipient_contact_id, recipient_name, recipient_email)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
      RETURNING *`,
     [companyId, callType, phoneNumber, jobId ?? null, jobDate ?? null, appointmentId ?? null,
      customerName ?? null, technicianName ?? null, customerAddress ?? null,
      jobName ?? null, jobDescription ?? null, jobType ?? null, totalAmount ?? null,
      callContext ? JSON.stringify(callContext) : null,
      scheduledAt, isTest, maxAttempts,
-     callPriority, parentCallId ?? null, retryCount, !!bypassOfficeHours, channel || "voice"]
+     callPriority, parentCallId ?? null, retryCount, !!bypassOfficeHours, channel || "voice", linkDelivery ?? null,
+     recipientContactId ?? null, recipientName ?? null, recipientEmail ?? null]
   );
   return result.rows[0];
 }
@@ -91,6 +97,55 @@ async function scheduleRetry(originalRow, nextWindowAt, jobDueDate, maxRetries =
       parentCallId:    originalRow.id,
       retryCount:      originalRow.retry_count + 1,
       channel:         channel || originalRow.channel || "voice",
+      recipientContactId: originalRow.recipient_contact_id,
+      recipientName:      originalRow.recipient_name,
+      recipientEmail:     originalRow.recipient_email,
+    });
+  } catch (err) {
+    if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return null;
+    throw err;
+  }
+}
+
+/**
+ * Voice retries are exhausted for this customer (retry_count hit
+ * MAX_NO_ANSWER_RETRIES) and they also have an sms/email flag on file — send
+ * one chat-link confirmation instead of going silently terminal. Deliberately
+ * NOT routed through scheduleRetry: that function's own retry-count cap would
+ * refuse to insert anything once exhausted, and a link send isn't another
+ * voice retry attempt anyway — it's a channel switch, so retryCount resets.
+ *
+ * Caller must guard against calling this on a row that is itself already a
+ * link row (originalRow.channel !== 'voice') — falling back from a fallback
+ * is how a voice<->link ping-pong would start.
+ */
+async function fallbackToLink(originalRow, linkDelivery) {
+  try {
+    return await insertScheduledCall({
+      companyId:       originalRow.company_id,
+      callType:        originalRow.call_type,
+      phoneNumber:     originalRow.phone_number,
+      jobId:           originalRow.job_id,
+      jobDate:         originalRow.job_date,
+      appointmentId:   originalRow.appointment_id,
+      customerName:    originalRow.customer_name,
+      technicianName:  originalRow.technician_name,
+      customerAddress: originalRow.customer_address,
+      jobName:         originalRow.job_name,
+      jobDescription:  originalRow.job_description,
+      jobType:         originalRow.job_type,
+      totalAmount:     originalRow.total_amount,
+      scheduledAt:     new Date(),
+      isTest:          originalRow.is_test,
+      maxAttempts:     originalRow.max_attempts,
+      callPriority:    "retry",
+      parentCallId:    originalRow.id,
+      retryCount:      0,
+      channel:         "web_chat",
+      linkDelivery,
+      recipientContactId: originalRow.recipient_contact_id,
+      recipientName:      originalRow.recipient_name,
+      recipientEmail:     originalRow.recipient_email,
     });
   } catch (err) {
     if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return null;
@@ -127,6 +182,9 @@ async function scheduleCallback(originalRow, callbackAt, jobDueDate, channel = n
       parentCallId:    originalRow.id,
       retryCount:      0,
       channel:         channel || originalRow.channel || "voice",
+      recipientContactId: originalRow.recipient_contact_id,
+      recipientName:      originalRow.recipient_name,
+      recipientEmail:     originalRow.recipient_email,
     });
   } catch (err) {
     if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return null;
@@ -375,17 +433,31 @@ async function advanceToNextWindow(id, nextWindowAt) {
  * Returns true if a row already exists for this dedupe key.
  * Production: blocks pending, in_progress, completed, and cancelled (only `failed` allows re-schedule).
  * Preview: blocks only active queue rows.
+ *
+ * `recipientContactId` (null = the customer themselves) narrows the dedupe
+ * to that specific recipient — matches the COALESCE(recipient_contact_id, 0)
+ * collapsing rule of `scheduled_calls_active_uniq` (migration 081) exactly,
+ * so this app-level check and the DB constraint never disagree. Passing it
+ * as `undefined` (the default) preserves the OLD job-wide behavior for
+ * callers that don't have a recipient concept (quotations, technician calls).
  */
-async function existsForJob(companyId, jobId, callType, isPreview = false) {
+async function existsForJob(companyId, jobId, callType, isPreview = false, recipientContactId = undefined) {
   const statusClause = isPreview
     ? `AND status IN ('pending','in_progress')`
     : `AND status NOT IN ('failed','cancelled', 'completed')`;
+  const recipientClause = recipientContactId === undefined
+    ? ""
+    : `AND COALESCE(recipient_contact_id, 0) = COALESCE($4, 0)`;
+  const params = recipientContactId === undefined
+    ? [companyId, jobId, callType]
+    : [companyId, jobId, callType, recipientContactId];
   const result = await db.query(
     `SELECT 1 FROM scheduled_calls
      WHERE company_id = $1 AND job_id = $2 AND call_type = $3
        ${statusClause}
+       ${recipientClause}
      LIMIT 1`,
-    [companyId, jobId, callType]
+    params
   );
   return result.rows.length > 0;
 }
@@ -400,12 +472,14 @@ async function existsForQuotation(companyId, quotationId, linkedJobId, callType,
 
 /**
  * Customer triggers (cases 1–3): skip if this call type or another customer call type
- * is already scheduled for the same job.
+ * is already scheduled for the same job, FOR THIS RECIPIENT. One recipient
+ * already queued/completed never blocks queuing a different recipient on
+ * the same job.
  */
-async function existsForCustomerJob(companyId, jobId, callType, isPreview = false) {
-  if (await existsForJob(companyId, jobId, callType, isPreview)) return true;
+async function existsForCustomerJob(companyId, jobId, callType, isPreview = false, recipientContactId = null) {
+  if (await existsForJob(companyId, jobId, callType, isPreview, recipientContactId)) return true;
   for (const ct of CUSTOMER_CALL_TYPES) {
-    if (ct !== callType && (await existsForJob(companyId, jobId, ct, isPreview))) return true;
+    if (ct !== callType && (await existsForJob(companyId, jobId, ct, isPreview, recipientContactId))) return true;
   }
   return false;
 }
@@ -423,6 +497,7 @@ module.exports = {
   advanceToNextWindow,
   scheduleRetry,
   scheduleCallback,
+  fallbackToLink,
   existsForJob,
   existsForQuotation,
   existsForCustomerJob,

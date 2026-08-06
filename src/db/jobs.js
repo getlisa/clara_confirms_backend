@@ -1,11 +1,18 @@
 const db = require("./index");
 
+// Must match services/job-confirmation-context.js's UPCOMING_STATUSES exactly —
+// not imported directly to avoid a circular require (that module requires this
+// one for getJobById). Kept here as a literal, checked against the other by
+// the verification pass in the confirmation-scheduling plan.
+const UPCOMING_APPOINTMENT_STATUSES = ["scheduled", "confirmed", "rescheduled"];
+
 function jobRow(row) {
   return {
     id:                     row.id,
     company_id:             row.company_id,
     customer_id:            row.customer_id,
     technician_id:          row.technician_id ?? null,
+    job_number:             row.job_number ?? null,
     title:                  row.title ?? null,
     description:            row.description ?? null,
     job_type:               row.job_type ?? null,
@@ -50,26 +57,76 @@ function apptRow(row) {
 
 // ── Jobs ──────────────────────────────────────────────────────────────────────
 
+// Accepts either a single value or a comma-separated list (or an array) and
+// always pushes an array param — lets the frontend send status=scheduled
+// (unchanged single-value behavior) or status=scheduled,confirmed without a
+// separate code path.
+function toList(value) {
+  if (value == null || value === "") return null;
+  if (Array.isArray(value)) return value;
+  return String(value).split(",").map((v) => v.trim()).filter(Boolean);
+}
+
 async function listJobs(companyId, {
-  status, jobType, customerId, technicianId,
-  scheduledDateFrom, scheduledDateTo,
-  dueSoonDays,
+  status, jobType, customerId, technicianId, locationId,
+  scheduledDateFrom, scheduledDateTo, tz,
+  dueSoonDays, confirmed,
   search, limit = 50, offset = 0,
 } = {}) {
   const conditions = ["j.company_id = $1"];
   const values = [companyId];
   let i = 2;
 
-  if (status)          { conditions.push(`j.status = $${i++}`);          values.push(status); }
-  if (jobType)         { conditions.push(`j.job_type = $${i++}`);         values.push(jobType); }
-  if (customerId)      { conditions.push(`j.customer_id = $${i++}`);      values.push(customerId); }
-  if (technicianId)    { conditions.push(`j.technician_id = $${i++}`);    values.push(technicianId); }
-  if (scheduledDateFrom) { conditions.push(`j.scheduled_date >= $${i++}`); values.push(scheduledDateFrom); }
-  if (scheduledDateTo)   { conditions.push(`j.scheduled_date <= $${i++}`); values.push(scheduledDateTo); }
+  const statusList = toList(status);
+  const jobTypeList = toList(jobType);
+  const customerIdList = toList(customerId);
+  const locationIdList = toList(locationId);
+
+  if (statusList)      { conditions.push(`j.status = ANY($${i++}::varchar[])`);      values.push(statusList); }
+  if (jobTypeList)     { conditions.push(`j.job_type = ANY($${i++}::varchar[])`);     values.push(jobTypeList); }
+  if (customerIdList)  { conditions.push(`j.customer_id = ANY($${i++}::int[])`);      values.push(customerIdList.map(Number)); }
+  if (technicianId)    { conditions.push(`j.technician_id = $${i++}`);                values.push(technicianId); }
+  if (locationIdList)  { conditions.push(`j.location_id = ANY($${i++}::int[])`);      values.push(locationIdList.map(Number)); }
+  // Filters on any of the job's APPOINTMENTS falling in this date range, not
+  // jobs.scheduled_date — a job with several appointments should show up for
+  // a date-range query ("what's scheduled this week?") if ANY of its visits
+  // lands in that window, not just its own single scheduled_date field, which
+  // doesn't track per-visit dates. Dates are compared in the company's
+  // timezone (same convention as the confirmation sweep's date windows), not
+  // UTC, so a late-evening appointment isn't miscounted onto the next day.
+  // Cancelled appointments don't count as "scheduled" for this purpose.
+  if (scheduledDateFrom || scheduledDateTo) {
+    const apptConditions = ["a2.company_id = j.company_id", "a2.job_id = j.id", "a2.status != 'cancelled'"];
+    const companyTz = tz || "America/New_York";
+    if (scheduledDateFrom) {
+      apptConditions.push(`DATE(a2.scheduled_start AT TIME ZONE $${i++}) >= $${i++}::date`);
+      values.push(companyTz, scheduledDateFrom);
+    }
+    if (scheduledDateTo) {
+      apptConditions.push(`DATE(a2.scheduled_start AT TIME ZONE $${i++}) <= $${i++}::date`);
+      values.push(companyTz, scheduledDateTo);
+    }
+    conditions.push(`EXISTS (SELECT 1 FROM appointments a2 WHERE ${apptConditions.join(" AND ")})`);
+  }
   if (dueSoonDays != null) {
     // Jobs whose scheduled_date falls between today and today + N days (inclusive)
     conditions.push(`j.scheduled_date >= CURRENT_DATE AND j.scheduled_date <= CURRENT_DATE + ($${i++} || ' days')::interval`);
     values.push(dueSoonDays);
+  }
+  // confirmed=false is the filter that makes manual job selection usable
+  // ("show me what still needs confirming") — checked against the job's
+  // upcoming appointments as a set (any unconfirmed upcoming => not
+  // confirmed), not just the single "active" appointment used for display.
+  if (confirmed === true || confirmed === false) {
+    const cmp = confirmed ? "= 0" : "> 0";
+    conditions.push(`(
+      SELECT COUNT(*) FROM appointments up
+       WHERE up.job_id = j.id AND up.company_id = j.company_id
+         AND up.status = ANY($${i++}::varchar[])
+         AND up.scheduled_start > NOW()
+         AND COALESCE(up.customer_confirmed, false) = false
+    ) ${cmp}`);
+    values.push(UPCOMING_APPOINTMENT_STATUSES);
   }
   if (search) {
     conditions.push(`(j.title ILIKE $${i} OR c.full_name ILIKE $${i})`);
@@ -124,6 +181,20 @@ async function listJobs(companyId, {
   }));
 }
 
+// Distinct job types actually present for this company — the sync ingests up
+// to 24 ServiceTrade technician-visit types (servicetrade-sync.js's
+// TECHNICIAN_JOB_TYPES), but the frontend's filter dropdown had hardcoded only
+// 5, silently hiding most jobs from that filter.
+async function listJobTypes(companyId) {
+  const { rows } = await db.query(
+    `SELECT DISTINCT job_type FROM jobs
+      WHERE company_id = $1 AND job_type IS NOT NULL
+      ORDER BY job_type`,
+    [companyId]
+  );
+  return rows.map((r) => r.job_type);
+}
+
 async function getJobById(id, companyId) {
   const result = await db.query(
     `SELECT j.*,
@@ -176,6 +247,26 @@ async function getJobById(id, companyId) {
   );
   job.appointments = appts.rows.map(apptRow);
 
+  // What each visit is actually FOR. Attached per appointment rather than as one
+  // flat job-level list, because different appointments on the same job are
+  // routinely different services.
+  const servicesByAppt = await fetchServicesByAppointment(
+    companyId,
+    job.appointments.map((a) => a.id)
+  );
+  // Every technician assigned to the visit, not just the one on
+  // appointments.technician_id (that column holds only the first/primary
+  // tech — a visit can have several, tracked in the appointment_technicians
+  // junction table; see migration 075).
+  const techsByAppt = await fetchTechniciansByAppointment(
+    job.appointments.map((a) => a.id)
+  );
+  for (const appt of job.appointments) {
+    appt.services = servicesByAppt.get(appt.id) || [];
+    appt.service_line = appt.services[0]?.service_line ?? null;
+    appt.technicians = techsByAppt.get(appt.id) || [];
+  }
+
   // Quotations for this job
   const quotes = await db.query(
     `SELECT id, quote_number, title, status, total_amount, currency, valid_until, created_at
@@ -184,7 +275,196 @@ async function getJobById(id, companyId) {
   );
   job.quotations = quotes.rows;
 
+  job.contacts = await getJobContacts(id, companyId, row);
+
   return job;
+}
+
+/**
+ * Services grouped by appointment → Map<appointment_id, service[]>.
+ *
+ * Keyed on `appointment_id`, deliberately NOT on `appointment_services.job_id`:
+ * that column is nullable (migrations/065) and is frequently NULL, because
+ * `normalizeAppointmentService` only requires an appointmentId and resolves
+ * jobId through an external-ref map that can miss. A job-keyed query therefore
+ * silently loses services that are correctly attached to an appointment.
+ */
+async function fetchServicesByAppointment(companyId, appointmentIds) {
+  const grouped = new Map();
+  if (!appointmentIds || appointmentIds.length === 0) return grouped;
+  const { rows } = await db.query(
+    `SELECT aps.appointment_id, aps.description, aps.status, aps.completion,
+            aps.estimated_price, aps.duration,
+            sl.name AS service_line_name, sl.trade AS service_line_trade
+       FROM appointment_services aps
+       LEFT JOIN service_lines sl ON sl.id = aps.service_line_id
+      WHERE aps.company_id = $1 AND aps.appointment_id = ANY($2::int[])
+      ORDER BY aps.appointment_id, aps.id`,
+    [companyId, appointmentIds]
+  );
+  for (const r of rows) {
+    const serviceLine = [r.service_line_name, r.service_line_trade].filter(Boolean).join(" / ") || null;
+    if (!grouped.has(r.appointment_id)) grouped.set(r.appointment_id, []);
+    grouped.get(r.appointment_id).push({
+      service_line:    serviceLine,
+      description:     r.description ?? null,
+      status:          r.status ?? null,
+      completion:      r.completion ?? null,
+      estimated_price: r.estimated_price ?? null,
+      duration:        r.duration ?? null,
+    });
+  }
+  return grouped;
+}
+
+/**
+ * Every technician assigned to each appointment → Map<appointment_id, tech[]>.
+ * `appointment_technicians` has no company_id — tenant scoping comes from the
+ * appointment ids, which the caller already scoped by company.
+ */
+async function fetchTechniciansByAppointment(appointmentIds) {
+  const grouped = new Map();
+  if (!appointmentIds || appointmentIds.length === 0) return grouped;
+  const { rows } = await db.query(
+    `SELECT at.appointment_id, t.id, t.first_name || ' ' || t.last_name AS name, t.phone, t.email
+       FROM appointment_technicians at
+       JOIN technicians t ON t.id = at.technician_id
+      WHERE at.appointment_id = ANY($1::int[])`,
+    [appointmentIds]
+  );
+  for (const r of rows) {
+    if (!grouped.has(r.appointment_id)) grouped.set(r.appointment_id, []);
+    grouped.get(r.appointment_id).push({
+      id:    r.id,
+      name:  (r.name || "").trim() || null,
+      phone: r.phone ?? null,
+      email: r.email ?? null,
+    });
+  }
+  return grouped;
+}
+
+/**
+ * Service lines known at the JOB level, from `service_requests` (which has a
+ * job_id but no appointment_id). Used only as a fallback to name the work when
+ * an appointment has no `appointment_services` rows — never to invent
+ * per-appointment services.
+ */
+async function fetchJobServiceLines(companyId, jobId) {
+  const { rows } = await db.query(
+    `SELECT DISTINCT sl.name, sl.trade
+       FROM service_requests sr
+       JOIN service_lines sl ON sl.id = sr.service_line_id
+      WHERE sr.company_id = $1 AND sr.job_id = $2`,
+    [companyId, jobId]
+  );
+  return rows.map((r) => [r.name, r.trade].filter(Boolean).join(" / ")).filter(Boolean);
+}
+
+/**
+ * Every person worth contacting about a job, as ONE list with a `role`.
+ *
+ * Two different underlying entity types are deliberately merged here, so
+ * `source` distinguishes them:
+ *   - `contact`  — a customer-side contact (platform `contacts` table)
+ *   - `crm_user` — internal staff synced from the CRM (`crm_users`), i.e. the
+ *                  job owner / salesperson, NOT someone at the customer
+ *
+ * Roles: exactly one `primary` — the job's own primary contact — then any
+ * number of `general` contacts (everyone else linked to the job's customer or
+ * location), plus `job_owner` (jobs.owner_id) and `sales` (jobs.salesperson_id)
+ * for internal staff.
+ *
+ * `primary` is decided PER JOB from jobs.primary_contact_id, not from
+ * contacts.contact_role. A person flagged `contact_role = 'primary'` is the
+ * primary somewhere on the account, which isn't necessarily on this job — so
+ * using the column directly could yield several primaries in one list. The
+ * column is still returned as `contact_role` for callers that want it.
+ *
+ * One person can legitimately hold two roles (ServiceTrade commonly sets the
+ * same user as both owner and salesperson) — they appear once per role rather
+ * than being collapsed, so the caller can render each role independently.
+ */
+async function getJobContacts(jobId, companyId, jobRowData = null) {
+  const row = jobRowData || (await db.query(
+    "SELECT customer_id, location_id, primary_contact_id, owner_id, salesperson_id FROM jobs WHERE id = $1 AND company_id = $2",
+    [jobId, companyId]
+  )).rows[0];
+  if (!row) return [];
+
+  const contacts = [];
+
+  // Customer-side contacts: the job's own primary contact plus anyone linked
+  // to its customer or its location. `is_primary` is computed here rather than
+  // filtered so a single query covers both the primary and the general ones.
+  const { rows: contactRows } = await db.query(
+    `SELECT DISTINCT ON (c.id)
+            c.id, c.first_name, c.last_name, c.phone, c.mobile, c.alternate_phone,
+            c.email, c.type, c.types, c.contact_role,
+            (c.id = $2) AS is_primary
+     FROM contacts c
+     LEFT JOIN contact_companies cc ON cc.contact_id = c.id
+     LEFT JOIN contact_locations cl ON cl.contact_id = c.id
+     WHERE c.company_id = $1
+       AND (c.id = $2 OR cc.customer_id = $3 OR cl.location_id = $4)
+     ORDER BY c.id`,
+    [companyId, row.primary_contact_id, row.customer_id, row.location_id]
+  );
+  for (const c of contactRows) {
+    const name = [c.first_name, c.last_name].filter(Boolean).join(" ").trim() || null;
+    contacts.push({
+      id: c.id,
+      source: "contact",
+      role: c.is_primary ? "primary" : "general",
+      contact_role: c.contact_role ?? "general",
+      name,
+      first_name: c.first_name ?? null,
+      last_name: c.last_name ?? null,
+      phone: c.phone ?? null,
+      mobile: c.mobile ?? null,
+      alternate_phone: c.alternate_phone ?? null,
+      email: c.email ?? null,
+      contact_type: c.type ?? null,
+      contact_types: c.types ?? null,
+    });
+  }
+
+  // Internal staff (job owner / salesperson) — same person may fill both.
+  const staffRoles = [
+    { id: row.owner_id, role: "job_owner" },
+    { id: row.salesperson_id, role: "sales" },
+  ].filter((s) => s.id);
+  if (staffRoles.length) {
+    const { rows: userRows } = await db.query(
+      "SELECT id, name, email, status, is_tech, is_helper FROM crm_users WHERE company_id = $1 AND id = ANY($2::int[])",
+      [companyId, staffRoles.map((s) => s.id)]
+    );
+    const byId = new Map(userRows.map((u) => [u.id, u]));
+    for (const { id: userId, role } of staffRoles) {
+      const u = byId.get(userId);
+      if (!u) continue;
+      contacts.push({
+        id: u.id,
+        source: "crm_user",
+        role,
+        contact_role: null,   // classification applies to customer contacts only
+        name: u.name ?? null,
+        first_name: null,
+        last_name: null,
+        phone: null,
+        mobile: null,
+        alternate_phone: null,
+        email: u.email ?? null,
+        contact_type: null,
+        contact_types: null,
+      });
+    }
+  }
+
+  // primary → job_owner → sales → general, so the caller can just take the head.
+  const rank = { primary: 0, job_owner: 1, sales: 2, general: 3 };
+  contacts.sort((a, b) => (rank[a.role] ?? 9) - (rank[b.role] ?? 9));
+  return contacts;
 }
 
 async function createJob(companyId, fields) {
@@ -350,6 +630,7 @@ async function getAppointmentById(id, companyId) {
 }
 
 module.exports = {
-  listJobs, getJobById, createJob, updateJob,
+  listJobs, listJobTypes, getJobById, createJob, updateJob, getJobContacts,
+  fetchServicesByAppointment, fetchJobServiceLines,
   listAppointmentsByJob, createAppointment, updateAppointment, getAppointmentById,
 };

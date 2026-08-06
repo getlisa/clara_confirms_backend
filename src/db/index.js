@@ -2,6 +2,12 @@ const { Pool } = require("pg");
 const config = require("../config");
 const logger = require("../utils/logger");
 
+// Server-side cancel must fire BEFORE the client gives up, otherwise the
+// client abandons a query the backend is still executing. Both are also
+// applied per-session in the pool's `connect` handler — see the note there.
+const STATEMENT_TIMEOUT_MS = 30000;
+const QUERY_TIMEOUT_MS     = 35000;
+
 class Database {
   constructor() {
     const isServerless = process.env.VERCEL === "1";
@@ -15,8 +21,8 @@ class Database {
       max: isServerless ? 2 : config.database.poolMax,
       idleTimeoutMillis: isPgBouncer ? 0 : 30000,
       connectionTimeoutMillis: isServerless ? 30000 : 15000,
-      statement_timeout: 30000,
-      query_timeout: 35000,
+      statement_timeout: STATEMENT_TIMEOUT_MS,
+      query_timeout: QUERY_TIMEOUT_MS,
       keepAlive: true,
       keepAliveInitialDelayMillis: 10000,
       ssl:
@@ -34,11 +40,20 @@ class Database {
     });
 
     this.pool.on("connect", (client) => {
-      client.query("SET timezone = 'UTC'").catch((err) => {
-        logger.warn("Failed to set timezone on connection", {
-          error: err.message,
+      // `statement_timeout` passed as a Pool constructor option is sent as a
+      // startup parameter, which Supabase's transaction-mode pooler (:6543)
+      // silently drops — `SHOW statement_timeout` came back as the server
+      // default (2min), so Postgres never cancelled a slow query and only the
+      // client-side query_timeout fired ("Query read timeout"), leaving the
+      // backend still working. Setting it per-session here actually applies,
+      // so the server cancels first and the connection is reusable after.
+      client
+        .query(`SET timezone = 'UTC'; SET statement_timeout = ${STATEMENT_TIMEOUT_MS}`)
+        .catch((err) => {
+          logger.warn("Failed to set session defaults on connection", {
+            error: err.message,
+          });
         });
-      });
     });
 
     this.pool.on("error", (err) => {
@@ -152,6 +167,65 @@ class Database {
     }
     logger.info("bulkUpsertByExternalRef: table upserted", { table, rows: rows.length, batchSize, queries: queryCount });
     return rows.length;
+  }
+
+  /**
+   * Fetch every row of a company's rows from `table` via keyset pagination on
+   * the primary key, returning them all as one array.
+   *
+   * Needed for tables carrying a large TOASTed `payload` JSONB (the
+   * servicetrade_* raw mirrors): a single unbounded SELECT has to stream
+   * multiple MB in one round trip, which on a remote pooled connection is
+   * slow and erratic enough to blow past query_timeout — measured on the same
+   * 843 kB / 207-row query at 2.7s, 4.4s, 11.5s and one outright timeout,
+   * with the database completely idle each time (server-side execution:
+   * 0.16ms). Chunking keeps every individual round trip small and bounded, so
+   * a slow link degrades throughput instead of failing the whole sync.
+   *
+   * Keyset (`id > lastId`) rather than OFFSET — OFFSET re-scans and re-sorts
+   * the skipped rows on every page.
+   *
+   * @param {number|string} companyId
+   * @param {string} table
+   * @param {object} [opts]
+   * @param {string} [opts.columns="*"] — column list; keep `id` in it or paging can't advance.
+   * @param {number} [opts.chunkSize=50] — ~5kB/row of payload on the raw
+   *   ServiceTrade tables, so 50 rows ≈ 250kB per round trip. 100 was tried
+   *   first and still timed out on a slow link (~500kB/chunk); the extra round
+   *   trips cost ~250ms each, which is far cheaper than a failed sync.
+   * @param {string} [opts.extraWhere] — additional static SQL predicate ANDed
+   *   onto the company/keyset conditions (e.g. "servicetrade_appointment_id IS
+   *   NOT NULL"). Callers pass literals only; never interpolate user input.
+   * @returns {Promise<Array<object>>}
+   */
+  async fetchAllByCompanyChunked(companyId, table, { columns = "*", chunkSize = 50, extraWhere = null } = {}) {
+    const all = [];
+    let lastId = 0;
+    let queryCount = 0;
+    const start = Date.now();
+    while (true) {
+      const { rows } = await this.query(
+        `SELECT ${columns} FROM ${table}
+          WHERE company_id = $1 AND id > $2${extraWhere ? ` AND ${extraWhere}` : ""}
+          ORDER BY id
+          LIMIT ${chunkSize}`,
+        [companyId, lastId]
+      );
+      queryCount++;
+      all.push(...rows);
+      if (rows.length < chunkSize) break;
+      const next = rows[rows.length - 1].id;
+      // Guard against a caller that projected `id` away — without it the
+      // same page would be re-fetched forever.
+      if (next == null) {
+        throw new Error(`fetchAllByCompanyChunked(${table}): 'id' must be included in columns to paginate`);
+      }
+      lastId = next;
+    }
+    logger.info("fetchAllByCompanyChunked: table fetched", {
+      table, companyId, rows: all.length, chunkSize, queries: queryCount, durationMs: Date.now() - start,
+    });
+    return all;
   }
 
   /**

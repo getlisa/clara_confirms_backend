@@ -131,7 +131,7 @@ router.options("/:token", openCors);
 router.get("/:token", openCors, async (req, res) => {
   try {
     const result = await chatLinksService.resolveChatLink(req.params.token);
-    if (!result.ok) return res.status(result.status || 404).json({ error: result.error });
+    if (!result.ok) return res.status(result.status || 404).json({ error: result.error, ...(result.code && { code: result.code }) });
     return res.json(result);
   } catch (err) {
     logger.error("GET /chat-links/:token failed", { error: err.message });

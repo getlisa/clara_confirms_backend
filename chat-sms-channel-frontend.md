@@ -9,14 +9,17 @@
 ## 0. What shipped
 
 Four scenarios, one mechanism:
-1. **No-answer fallback** — a voice call isn't picked up → the next retry goes
-   out as SMS instead.
-2. **SMS-only companies** — a company can go text-only for every outbound
-   attempt.
-3. **Per-customer preference** — an individual customer can be pinned to voice
-   or SMS regardless of the company default.
-4. **Callback → chat** — when a customer says "call me back later," the
-   follow-up can go out as a text instead of another phone call.
+1. **No-answer fallback** — once **every** voice retry is exhausted with no
+   answer (not after the first miss), a single chat-link confirmation goes
+   out instead, if the customer has `is_sms`/`is_email` on file.
+2. **SMS-only companies** — superseded by per-customer channel flags (§2) —
+   set every customer's `is_sms`/`is_email` instead of a company-wide setting
+   to go text/email-first.
+3. **Per-customer channels** — a customer can be voice-only, link-only
+   (sms/email, alone or together), or voice-with-link-fallback (§2).
+4. **Callback → voice** — when a customer says "call me back later," the
+   follow-up is always another phone call — a callback only ever happens
+   because the customer was just on a live voice call in the first place.
 
 **Important caveat — read this first:** SMS is **not instantly available**.
 Retell requires A2P 10DLC approval for a company's number to send/receive SMS,
@@ -53,6 +56,13 @@ change.
 ---
 
 ## 1. Channel strategy — `call_settings`
+
+**Superseded for customer confirmations by §2's per-customer flags** — those
+are now authoritative whenever a customer record exists. `channel_strategy`
+remains as: the seed value for brand-new customers, and the fallback for call
+types with no customer row to read flags from (e.g. quotation follow-up
+targets without a linked customer). Keep the setting and its UI; just don't
+expect changing it to move an existing customer's channel — Section 2 does.
 
 Two new fields alongside the existing toggles (`service_link_enabled`,
 `crm_comment_writeback_enabled`, etc.) on the same object.
@@ -103,19 +113,43 @@ by role, so that gate needs to live in the frontend or be added later).
 
 ---
 
-## 2. Per-customer override — `customers`
+## 2. Per-customer channels — `customers`
+
+**Breaking change:** `preferred_channel` is gone (migration 080). It's
+replaced by three independent booleans, because a customer can now want more
+than one channel at once — e.g. "text and email me" — which a single-valued
+field couldn't express.
 
 ### `GET /customers/:id` / `PATCH /customers/:id`
 ```json
-{ "preferred_channel": null }
+{ "is_voice": true, "is_sms": false, "is_email": false }
 ```
-`preferred_channel`: `"voice"` | `"sms"` | `null` (null = use the company's
-`channel_strategy`). `PATCH` rejects any other value with `400`.
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `is_voice` | boolean | `true` | Reach this customer with a real phone call. |
+| `is_sms` | boolean | `false` | Reach this customer by texting a confirmation link. |
+| `is_email` | boolean | `false` | Reach this customer by emailing a confirmation link. |
 
-**Suggested UI:** a dropdown on the customer detail page — *"Use company
-default"* / *"Always call"* / *"Always text"*. This overrides the company
-strategy for that customer on every future attempt (subject to the same SMS
-readiness gate — if SMS isn't live, "Always text" has no effect yet).
+**Combination rule — not a free-for-all:**
+- `is_voice = true` → **voice only**, until every voice retry is exhausted.
+  `is_sms`/`is_email` are then used as a one-time fallback — they never fire
+  *alongside* a live voice attempt.
+- `is_voice = false` → `is_sms` and `is_email` fire **simultaneously** (both
+  are just delivery methods for the same chat-link confirmation — there's
+  nothing to conflict).
+
+**At least one flag must be true.** `PATCH` returns `400` if the resulting
+state (existing values merged with whatever you send) would leave all three
+false — a customer needs at least one contact channel. The error message
+names the rule, so it's safe to surface directly.
+
+**Suggested UI:** three checkboxes/toggles on the customer detail page —
+*"Call"* / *"Text"* / *"Email"* — with the mutual-exclusivity rule enforced
+in copy, not by disabling checkboxes (e.g. a note: "Text and Email are only
+used if Call is off, or after we've tried calling and gotten no answer").
+`is_sms` is still subject to the same SMS-readiness gate as before — if the
+company's SMS isn't `"live"`, an `is_sms`-only customer degrades to voice
+server-side (never silently to nothing).
 
 ---
 
@@ -126,6 +160,9 @@ New optional field:
 ```json
 { "trigger_type": "scheduled_unconfirmed", "appointment_id": 123, "channel": "sms" }
 ```
+
+> **The conversation is job-scoped.** `appointment_id` identifies the trigger, but the agent discusses every upcoming appointment on the parent job and confirms the **next** one first — which may not be the appointment you passed, if a sooner one exists on the same job. It also offers to confirm the remaining appointments before ending.
+
 `channel`: `"voice"` | `"sms"` | `"web_chat"` (omit to let the backend resolve
 it the same way the scheduler would). When the frontend already shows
 distinct buttons, send the explicit value — it always wins over any

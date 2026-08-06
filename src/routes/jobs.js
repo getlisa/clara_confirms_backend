@@ -17,6 +17,9 @@ const jobsDb = require("../db/jobs");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localToUTC, localizeFields, localizeRows } = require("../utils/timezone");
+const { syncJobConfirmationStatus } = require("../services/job-confirmation-status");
+const scheduler = require("../services/scheduler");
+const callSettingsDb = require("../db/call-settings");
 
 const router = express.Router();
 router.use(authenticate);
@@ -76,31 +79,150 @@ router.get("/", async (req, res) => {
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
     const {
-      status, job_type, customer_id, technician_id,
+      status, job_type, customer_id, technician_id, location_id,
       scheduled_date_from, scheduled_date_to,
-      due_soon,
+      due_soon, confirmed,
       search, limit, offset,
     } = req.query;
 
+    // scheduled_date_from/to need the company timezone up front — they filter
+    // on appointment scheduled_start (a timestamptz), compared as a LOCAL date,
+    // same convention the confirmation sweep uses for its date windows.
+    const tz = await getCompanyTimezone(companyId);
+
+    // status/job_type/customer_id/location_id all accept a single value or a
+    // comma-separated list — jobsDb.listJobs handles both the same way, so a
+    // single status=scheduled request behaves exactly as it always has.
     const jobs = await jobsDb.listJobs(companyId, {
       status:            status || undefined,
       jobType:           job_type || undefined,
-      customerId:        customer_id ? Number(customer_id) : undefined,
+      customerId:        customer_id || undefined,
       technicianId:      technician_id ? Number(technician_id) : undefined,
+      locationId:        location_id || undefined,
       scheduledDateFrom: scheduled_date_from || undefined,
       scheduledDateTo:   scheduled_date_to || undefined,
+      tz,
       dueSoonDays:       due_soon != null ? Number(due_soon) : undefined,
+      confirmed:         confirmed === "true" ? true : confirmed === "false" ? false : undefined,
       search:            search || undefined,
       limit:             limit  ? Math.min(Number(limit), 200) : 50,
       offset:            offset ? Number(offset) : 0,
     });
 
     // const jobsWithAppointments = jobs.filter((j) => j.active_appointment != null);
-    const tz = await getCompanyTimezone(companyId);
     return res.json({ jobs: jobs.map((j) => localizeJob(j, tz)) });
   } catch (err) {
     logger.error("GET /jobs failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load jobs" });
+  }
+});
+
+// Must be declared BEFORE /:id — same reasoning as /technicians above.
+router.get("/job-types", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const jobTypes = await jobsDb.listJobTypes(companyId);
+    return res.json({ job_types: jobTypes });
+  } catch (err) {
+    logger.error("GET /jobs/job-types failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to load job types" });
+  }
+});
+
+/**
+ * POST /jobs/bulk-send-confirmation
+ * Body: { items: [{ type: "job"|"appointment", id: number }, ...] }
+ *
+ * Tenant-selected "send confirmation" for specific inspections (manual mode —
+ * see call_settings.auto_schedule_enabled). Queues one scheduled_calls row per
+ * job through the SAME per-job enqueue logic the nightly sweep uses
+ * (scheduler.enqueueJobConfirmation), so channel resolution, contact gates
+ * and dedupe never diverge between the automatic and manual paths.
+ *
+ * Unlike the requested v2 §3 contract, this QUEUES rather than sends — the
+ * dispatcher (cron or a manual poke) still fires it, respecting office hours
+ * and concurrency caps — so the response reports queued/skipped/failed per
+ * item, not a token/sent_via pair (those only exist once actually dispatched).
+ *
+ * {type:"appointment"} items collapse to their parent job — one conversation
+ * now covers every upcoming appointment on a job, so there's nothing to
+ * address at the individual-appointment level.
+ */
+router.post("/bulk-send-confirmation", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "items must be a non-empty array of { type, id }" });
+    }
+
+    const db = require("../db");
+    const jobIds = new Map(); // jobId -> the first item that resolved to it (for reporting)
+    const results = [];
+
+    for (const item of items) {
+      const { type, id } = item || {};
+      if (type === "job" && id != null) {
+        if (!jobIds.has(Number(id))) jobIds.set(Number(id), item);
+      } else if (type === "appointment" && id != null) {
+        const { rows } = await db.query(
+          `SELECT job_id FROM appointments WHERE id = $1 AND company_id = $2`,
+          [id, companyId]
+        );
+        const jobId = rows[0]?.job_id;
+        if (!jobId) {
+          results.push({ type, id, status: "failed", reason: "appointment_not_found" });
+          continue;
+        }
+        // Collapsing to the parent job: if that job is already in the batch
+        // (as its own item or via another appointment), don't queue it twice —
+        // just note this item resolved to the same job.
+        if (!jobIds.has(jobId)) jobIds.set(jobId, item);
+      } else {
+        results.push({ type, id, status: "failed", reason: "invalid_item — type must be 'job' or 'appointment' with a numeric id" });
+      }
+    }
+
+    const callSettings = await callSettingsDb.getByCompanyId(companyId);
+    const { rows: coRows } = await db.query(`SELECT default_timezone, sms_status FROM companies WHERE id = $1`, [companyId]);
+    const tz = coRows[0]?.default_timezone || "America/New_York";
+    const smsLive = coRows[0]?.sms_status === "live";
+
+    for (const [jobId, item] of jobIds) {
+      // One entry per resolved recipient (the customer and/or their opted-in
+      // confirmation contacts) — a job with 2 recipients reports 2 results.
+      const recipientResults = await scheduler.enqueueJobConfirmation(companyId, jobId, {
+        callType: "customer_confirmation",
+        callSettings, tz, smsLive,
+        callPriority: "high",
+      });
+      for (const result of recipientResults) {
+        results.push({
+          type: "job", id: jobId, requestedAs: item.type,
+          status: result.status,
+          ...(result.recipientContactId != null && { recipient_contact_id: result.recipientContactId }),
+          ...(result.reason && { reason: result.reason }),
+          ...(result.channel && { channel: result.channel }),
+          ...(result.linkDelivery && { link_delivery: result.linkDelivery }),
+          ...(result.scheduled_call_id && { scheduled_call_id: result.scheduled_call_id }),
+          ...(result.scheduled_at && { scheduled_at: result.scheduled_at }),
+        });
+      }
+    }
+
+    logger.info("POST /jobs/bulk-send-confirmation", {
+      companyId, requested: items.length, jobs: jobIds.size,
+      queued: results.filter((r) => r.status === "queued").length,
+    });
+
+    return res.status(200).json({ results });
+  } catch (err) {
+    logger.error("POST /jobs/bulk-send-confirmation failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to send confirmations" });
   }
 });
 
@@ -217,13 +339,17 @@ router.post("/:id/appointments", async (req, res) => {
     const appointment = await jobsDb.createAppointment(companyId, jobId, fields);
 
     // An appointment can't exist without being tied to a scheduled job.
-    // Promote job status open → scheduled only. Never demote a confirmed/completed job.
+    // Promote job status open → scheduled only. Never demote a completed job.
     const db = require("../db");
     await db.query(
       `UPDATE jobs SET status = 'scheduled', updated_at = NOW()
        WHERE id = $1 AND company_id = $2 AND status = 'open'`,
       [jobId, companyId]
     );
+    // The new appointment is unconfirmed, so a job sitting at 'confirmed' must
+    // drop back to 'scheduled' — otherwise the confirmation sweep skips the job
+    // and this appointment never gets confirmed with the customer.
+    await syncJobConfirmationStatus(companyId, jobId);
 
     return res.status(201).json({ appointment: localizeAppointment(appointment, tz) });
   } catch (err) {
@@ -288,27 +414,13 @@ router.patch("/appointments/:id", async (req, res) => {
     if (!appointment) return res.status(404).json({ error: "Appointment not found" });
 
     // ── Sync job status based on appointment outcome ──────────────────────────
-    // Determine effective values after the update
-    const effectiveCustomerConfirmed = req.body.customer_confirmed ?? current.customer_confirmed;
-    const effectiveStatus            = req.body.status            ?? current.status;
+    const effectiveStatus = req.body.status ?? current.status;
     const db = require("../db");
 
-    if (effectiveStatus === "rescheduled") {
-      // Customer asked to reschedule — job needs re-confirmation
-      await db.query(
-        `UPDATE jobs SET status = 'scheduled', updated_at = NOW()
-         WHERE id = $1 AND company_id = $2 AND status = 'confirmed'`,
-        [current.job_id, companyId]
-      );
-    } else if (effectiveCustomerConfirmed === true) {
-      // Customer confirmed — promote job to confirmed
-      await db.query(
-        `UPDATE jobs SET status = 'confirmed', updated_at = NOW()
-         WHERE id = $1 AND company_id = $2 AND status = 'scheduled'`,
-        [current.job_id, companyId]
-      );
-    } else if (effectiveStatus === "cancelled") {
-      // Appointment cancelled — if no other active appointments, revert job to open
+    if (effectiveStatus === "cancelled") {
+      // Appointment cancelled — if no other active appointments, revert job to open.
+      // Checked before the confirmation recompute because 'open' outranks it:
+      // syncJobConfirmationStatus deliberately won't move a job out of 'open'.
       const { rows } = await db.query(
         `SELECT COUNT(*) AS cnt FROM appointments
          WHERE job_id = $1 AND status NOT IN ('cancelled','rescheduled')
@@ -323,6 +435,13 @@ router.patch("/appointments/:id", async (req, res) => {
         );
       }
     }
+
+    // Recompute from the whole upcoming set rather than reacting to this one
+    // appointment: the job is 'confirmed' only when EVERY upcoming appointment
+    // is, and drops back to 'scheduled' otherwise. This replaces the old
+    // flip-on-first-confirmation and the separate rescheduled→scheduled branch,
+    // both of which only looked at the appointment in front of them.
+    await syncJobConfirmationStatus(companyId, current.job_id);
 
     return res.json({ appointment: localizeAppointment(appointment, tz) });
   } catch (err) {

@@ -29,13 +29,22 @@ const chatLinkEmail = require("./chat-link-email");
 const chatLinkSms = require("./chat-link-sms");
 const { toE164 } = require("../utils/phone");
 const { formatSpokenDateTime, formatSpokenDateOnly } = require("../utils/timezone");
+const { toDynamicVariables } = require("./job-confirmation-context");
 
 // Sent as the synthetic first "user" turn to reliably trigger the agent's
 // opening message in the right (chat) register — filtered out of everything
 // returned to the frontend by filterVisibleMessages, so the customer never sees it.
 const CHAT_TRIGGER_MESSAGE = "(This is a text chat, not a phone call. Please begin now with your chat-appropriate opening message.)";
 
-function buildDynamicVariables(params, { callType, isAppointment, tz }) {
+/**
+ * `context` is the nested job-confirmation context (present for
+ * customer_confirmation links). When it's there, the job-centric variables —
+ * appointment count, the next appointment's date/service/technician, the summary
+ * of the others — come from the shared adapter, so chat and voice inject exactly
+ * the same values. `appointment_id` from that adapter is the LEAD appointment,
+ * which is why it's spread after the params-derived one.
+ */
+function buildDynamicVariables(params, { callType, isAppointment, tz, context = null }) {
   return {
     call_type: callType,
     is_chat_session: "true",
@@ -51,6 +60,7 @@ function buildDynamicVariables(params, { callType, isAppointment, tz }) {
     }),
     ...(params.appointmentId && { appointment_id: String(params.appointmentId) }),
     job_id: String(params.jobId),
+    ...(context ? toDynamicVariables(context) : {}),
   };
 }
 
@@ -98,10 +108,19 @@ function filterVisibleMessages(messages) {
  * derived from the link's current state. Kept as a pure function of
  * (state, context) — no I/O — so it's trivially testable.
  */
-function computeInputHint(state, { jobDueDate } = {}) {
+function computeInputHint(state, { jobDueDate, remainingUnconfirmed = 0 } = {}) {
   switch (state) {
     case "chat_started":
-      return { type: "quick_replies", options: ["Yes", "No", "Reschedule", "Cancel"] };
+      // "No" is dropped deliberately: on a job with several appointments it's
+      // ambiguous (no to which one?), and Cancel already covers refusal.
+      return { type: "quick_replies", options: ["Yes", "Reschedule", "Cancel"] };
+    case "confirmation_accepted":
+      // At least one appointment is confirmed. If the job still has other
+      // unconfirmed upcoming appointments, the agent is required to ask whether
+      // to confirm those too — offer that answer as buttons.
+      return remainingUnconfirmed > 0
+        ? { type: "quick_replies", options: ["Yes, confirm the rest", "No, just this one"] }
+        : { type: "free_text" };
     case "reschedule_needed":
       return {
         type: "date_picker",
@@ -119,28 +138,42 @@ function computeInputHint(state, { jobDueDate } = {}) {
   }
 }
 
-async function createChatLinkForAppointment(companyId, appointmentId, callType = "customer_confirmation") {
+// A link is only good for one business day — after that a stale confirmation
+// conversation (job maybe rescheduled/cancelled since) is worse than none.
+// The unopened-chat-link watchdog (scheduler.js's processUnopenedChatLinks)
+// re-queues on this same cadence, so the two stay in lockstep.
+const CHAT_LINK_TTL_MS = 24 * 60 * 60 * 1000;
+
+// recipientContactId (null = the customer themselves) — a property manager
+// and the customer each get their own independent token/conversation for
+// the same appointment/job, per migration 081's confirmation-recipients
+// feature. Default null preserves every existing caller unchanged.
+async function createChatLinkForAppointment(companyId, appointmentId, callType = "customer_confirmation", recipientContactId = null) {
   const hydrated = await HYDRATORS.scheduled_unconfirmed(companyId, appointmentId);
   if (!hydrated.ok) return hydrated;
 
-  const existing = await chatLinksDb.findByAppointment(companyId, appointmentId);
+  const existing = await chatLinksDb.findByAppointment(companyId, appointmentId, recipientContactId);
   if (existing) return { ok: true, token: existing.token };
 
   const row = await chatLinksDb.create({
     companyId, jobId: Number(hydrated.jobId), appointmentId, callType,
+    expiresAt: new Date(Date.now() + CHAT_LINK_TTL_MS),
+    recipientContactId,
   });
   return { ok: true, token: row.token };
 }
 
-async function createChatLinkForJob(companyId, jobId, callType = "customer_confirmation") {
+async function createChatLinkForJob(companyId, jobId, callType = "customer_confirmation", recipientContactId = null) {
   const hydrated = await HYDRATORS.open_job_due_soon(companyId, jobId);
   if (!hydrated.ok) return hydrated;
 
-  const existing = await chatLinksDb.findByJob(companyId, jobId);
+  const existing = await chatLinksDb.findByJob(companyId, jobId, recipientContactId);
   if (existing) return { ok: true, token: existing.token };
 
   const row = await chatLinksDb.create({
     companyId, jobId: Number(jobId), appointmentId: null, callType,
+    expiresAt: new Date(Date.now() + CHAT_LINK_TTL_MS),
+    recipientContactId,
   });
   return { ok: true, token: row.token };
 }
@@ -159,9 +192,21 @@ async function loadLinkContext(link) {
     return { ok: false, status: 503, error: "Chat is not yet available for this company" };
   }
 
-  const hydrated = link.appointment_id
-    ? await HYDRATORS.scheduled_unconfirmed(link.company_id, link.appointment_id)
-    : await HYDRATORS.open_job_due_soon(link.company_id, link.job_id);
+  // A confirmation conversation is job-scoped, so hydrate by JOB even when the
+  // link was created from an appointment — `appointment_id` becomes payload
+  // (which appointment prompted the link), exactly as it already is on
+  // scheduled_calls. Other call types keep their original hydrator.
+  //
+  // allowNoUpcoming: this is the READ path for a link that has ALREADY been
+  // delivered to a customer. Previously a link whose only appointment was
+  // cancelled or had slipped into the past returned 422 here and the whole page
+  // died; now it opens and the agent offers to book a new visit. Creation paths
+  // (createChatLinkFor*) keep the strict check.
+  const hydrated = link.call_type === "customer_confirmation"
+    ? await HYDRATORS.job_confirmation(link.company_id, link.job_id, { allowNoUpcoming: true })
+    : link.appointment_id
+      ? await HYDRATORS.scheduled_unconfirmed(link.company_id, link.appointment_id)
+      : await HYDRATORS.open_job_due_soon(link.company_id, link.job_id);
   if (!hydrated.ok) return hydrated;
 
   return { ok: true, company, hydrated };
@@ -366,7 +411,15 @@ async function getOrCreateSession(link, dynamicVariables, chatAgentId) {
 
 async function resolveChatLink(token) {
   const link = await chatLinksDb.getByToken(token);
-  if (!link) return { ok: false, status: 404, error: "Chat link not found or expired" };
+  if (!link) {
+    // Distinguish "never existed" from "existed, but the 24h link expired" —
+    // very different messages for a customer clicking a stale text/email.
+    const raw = await chatLinksDb.getByTokenRaw(token);
+    if (raw && raw.expires_at && new Date(raw.expires_at) < new Date()) {
+      return { ok: false, status: 410, code: "link_expired", error: "This confirmation link has expired." };
+    }
+    return { ok: false, status: 404, error: "Chat link not found" };
+  }
 
   const ctx = await loadLinkContext(link);
   if (!ctx.ok) return ctx;
@@ -379,6 +432,7 @@ async function resolveChatLink(token) {
     callType: link.call_type,
     isAppointment: !!link.appointment_id,
     tz,
+    context: hydrated.context || null,
   });
 
   const { messages } = await getOrCreateSession(link, dynamicVariables, company.retell_chat_agent_id);
@@ -395,7 +449,10 @@ async function resolveChatLink(token) {
     customer_name: hydrated.params.customerName || null,
     messages,
     state: fresh.state,
-    input_hint: computeInputHint(fresh.state, { jobDueDate: hydrated.params.jobDate }),
+    input_hint: computeInputHint(fresh.state, {
+      jobDueDate: hydrated.params.jobDate,
+      remainingUnconfirmed: hydrated.context?.counts.unconfirmed ?? 0,
+    }),
   };
 }
 
@@ -417,6 +474,7 @@ async function sendChatMessage(token, content) {
     callType: link.call_type,
     isAppointment: !!link.appointment_id,
     tz,
+    context: hydrated.context || null,
   });
 
   // Always routed through getOrCreateSession (not just when no chat_id exists
@@ -435,7 +493,10 @@ async function sendChatMessage(token, content) {
     ok: true,
     messages,
     state: fresh.state,
-    input_hint: computeInputHint(fresh.state, { jobDueDate: hydrated.params.jobDate }),
+    input_hint: computeInputHint(fresh.state, {
+      jobDueDate: hydrated.params.jobDate,
+      remainingUnconfirmed: hydrated.context?.counts.unconfirmed ?? 0,
+    }),
   };
 }
 

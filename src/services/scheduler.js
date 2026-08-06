@@ -6,6 +6,9 @@ const scheduledCallsDb = require("../db/scheduled-calls");
 const todosDb = require("../db/todos");
 const { computeInitialPriority } = require("./call-priority");
 const { resolveOutboundChannel } = require("./channel-resolver");
+const { buildJobConfirmationContext, toDynamicVariables } = require("./job-confirmation-context");
+const { resolveConfirmationRecipients } = require("./confirmation-recipients");
+const { toLocalDateOnly } = require("../utils/timezone");
 const retell = require("./retell");
 const chatLinksService = require("./chat-links");
 const chatLinkEmail = require("./chat-link-email");
@@ -141,6 +144,26 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         ...(row.call_context && typeof row.call_context === "object" ? row.call_context : {}),
       };
 
+      // ── Job-centric confirmation context ────────────────────────────────
+      // Computed HERE, at dispatch, not when the row was queued: a pending row
+      // can sit for days, during which appointments get added, moved, cancelled
+      // or confirmed elsewhere. Reading it fresh is the only way the agent opens
+      // with a count that's actually true.
+      //
+      // Confirmation calls only, and only for a real numeric job id —
+      // scheduled_calls.job_id also carries 'quotation:N' and
+      // 'service_opportunity:N-N', which aren't jobs.
+      if (row.call_type === "customer_confirmation" && /^\d+$/.test(String(row.job_id || ""))) {
+        const jobCtx = await buildJobConfirmationContext(row.company_id, row.job_id, { tz: callTz });
+        if (jobCtx.ok) {
+          Object.assign(dynVars, toDynamicVariables(jobCtx));
+        } else {
+          logger.warn("Dispatcher: job confirmation context unavailable, falling back to flat row vars", {
+            scheduledCallId: row.id, jobId: row.job_id, code: jobCtx.code,
+          });
+        }
+      }
+
       // Resolve call-type-specific voicemail message with actual values
       const callTypeCfg = await callTypeConfigsDb.getByType(row.company_id, row.call_type);
       const vmTemplate = callTypeCfg?.voicemail_message
@@ -159,12 +182,16 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         .replace(/\{\{location_name\}\}/g,       (row.call_context && row.call_context.location_name) || "your location");
 
       if (row.channel === "web_chat") {
-        // One shared chat_links token, delivered by email and/or SMS per
-        // chat_link_delivery_method — a plain text with a link, same idea as
-        // the email. Same underlying mechanism the plain "sms" channel now
-        // uses too (below) — retell_call_id stays null until the customer
-        // actually opens the link, regardless of medium.
-        const deliveryMethod = (await callSettingsDb.getByCompanyId(row.company_id)).chat_link_delivery_method;
+        // One shared chat_links token, delivered by email and/or SMS.
+        // row.link_delivery is the per-customer resolution made at queue time
+        // (migration 080 — customers.is_sms/is_email); the company-level
+        // chat_link_delivery_method is only a fallback for rows queued before
+        // a customer's flags were resolvable (e.g. no customers join for that
+        // trigger). Same underlying mechanism the plain "sms" channel below
+        // uses too — retell_call_id stays null until the customer actually
+        // opens the link, regardless of medium.
+        const deliveryMethod = row.link_delivery
+          || (await callSettingsDb.getByCompanyId(row.company_id)).chat_link_delivery_method;
 
         // A manually-supplied email/phone (e.g. the "Email Now" button, when
         // the customer record itself has none — the common case for
@@ -174,12 +201,25 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         // see it.
         const overrideEmail = row.call_context?.override_email || null;
         const overridePhone = row.call_context?.override_phone || null;
-        const { rows: custRows } = await db.query(
-          `SELECT c.email, c.phone FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
-          [row.job_id, row.company_id]
-        );
-        const customerEmail = overrideEmail || custRows[0]?.email || null;
-        const customerPhone = overridePhone || custRows[0]?.phone || null;
+
+        // recipient_contact_id NULL = the customer themselves — re-query
+        // fresh (ServiceTrade sync can update the customer's own contact
+        // info between queue and dispatch). A non-null recipient uses the
+        // snapshot taken at enqueue time (recipient_name/recipient_email,
+        // phone_number) instead — a contacts row's phone/email is low-churn,
+        // so re-fetching fresh buys nothing a snapshot doesn't already cover.
+        let customerEmail, customerPhone;
+        if (row.recipient_contact_id != null) {
+          customerEmail = overrideEmail || row.recipient_email || null;
+          customerPhone = overridePhone || row.phone_number || null;
+        } else {
+          const { rows: custRows } = await db.query(
+            `SELECT c.email, c.phone FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
+            [row.job_id, row.company_id]
+          );
+          customerEmail = overrideEmail || custRows[0]?.email || null;
+          customerPhone = overridePhone || custRows[0]?.phone || null;
+        }
 
         const wantEmail = deliveryMethod === "email" || deliveryMethod === "both";
         const wantSms = deliveryMethod === "sms" || deliveryMethod === "both";
@@ -198,8 +238,8 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         }
 
         const linkResult = row.appointment_id
-          ? await chatLinksService.createChatLinkForAppointment(row.company_id, row.appointment_id, row.call_type)
-          : await chatLinksService.createChatLinkForJob(row.company_id, row.job_id, row.call_type);
+          ? await chatLinksService.createChatLinkForAppointment(row.company_id, row.appointment_id, row.call_type, row.recipient_contact_id)
+          : await chatLinksService.createChatLinkForJob(row.company_id, row.job_id, row.call_type, row.recipient_contact_id);
         if (!linkResult.ok) throw new Error(linkResult.error || "Failed to create chat link");
 
         // Each leg is caught independently — for 'both', one leg throwing
@@ -207,12 +247,15 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         // re-send whichever leg already succeeded (e.g. re-emailing the
         // customer while only the sms leg actually needs another attempt).
         let emailSent = false, smsSent = false, emailError = null, smsError = null;
+        // Address the actual recipient by name when this row is for a
+        // confirmation contact (a property manager, etc.), not the customer.
+        const greetingName = row.recipient_name || row.customer_name;
 
         if (wantEmail && customerEmail) {
           try {
             await chatLinkEmail.sendConfirmationLinkEmail({
               email: customerEmail,
-              customerName: row.customer_name,
+              customerName: greetingName,
               companyName: co.company_name || "our company",
               jobName: row.job_name,
               token: linkResult.token,
@@ -229,7 +272,7 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
           try {
             await chatLinkSms.sendConfirmationLinkSms({
               phone: customerPhone,
-              customerName: row.customer_name,
+              customerName: greetingName,
               companyName: co.company_name || "our company",
               jobName: row.job_name,
               token: linkResult.token,
@@ -272,13 +315,13 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         // for now; retell.createSmsChat is left defined, just unused, in
         // case this needs to be re-enabled later.
         const linkResult = row.appointment_id
-          ? await chatLinksService.createChatLinkForAppointment(row.company_id, row.appointment_id, row.call_type)
-          : await chatLinksService.createChatLinkForJob(row.company_id, row.job_id, row.call_type);
+          ? await chatLinksService.createChatLinkForAppointment(row.company_id, row.appointment_id, row.call_type, row.recipient_contact_id)
+          : await chatLinksService.createChatLinkForJob(row.company_id, row.job_id, row.call_type, row.recipient_contact_id);
         if (!linkResult.ok) throw new Error(linkResult.error || "Failed to create chat link");
 
         await chatLinkSms.sendConfirmationLinkSms({
           phone: row.phone_number,
-          customerName: row.customer_name,
+          customerName: row.recipient_name || row.customer_name,
           companyName: co.company_name || "our company",
           jobName: row.job_name,
           token: linkResult.token,
@@ -405,9 +448,9 @@ async function runDailyJob({ companyId = null, respectAutoFlag = true, engine = 
 
 // ── Trigger processors ────────────────────────────────────────────────────────
 
-async function scheduleCall(params) {
+async function tryScheduleCall(params) {
   try {
-    await scheduledCallsDb.create(params);
+    const row = await scheduledCallsDb.create(params);
     logger.info("Scheduler: call queued", {
       companyId: params.companyId,
       callType: params.callType,
@@ -419,26 +462,235 @@ async function scheduleCall(params) {
       scheduledAt: params.scheduledAt,
       isTest: params.isTest,
     });
-    return true;
+    return row;
   } catch (err) {
-    if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return false;
+    if (err.code === "DUPLICATE_SCHEDULED_CALL" || err.code === "23505") return null;
     throw err;
   }
 }
 
-// A web_chat confirmation whose link has sat unopened this long is treated
-// as the "no answer" equivalent — there's no chat_ended/chat_analyzed webhook
-// to react to if the customer never opened it at all, so this can't reuse the
-// existing webhook-driven retry path and instead falls back to voice.
-const CHAT_LINK_UNOPENED_WINDOW_HOURS = 48;
+// Back-compat boolean wrapper — most call sites only care whether the row
+// was actually inserted (vs. deduped away), not the row itself.
+async function scheduleCall(params) {
+  return !!(await tryScheduleCall(params));
+}
+
+/**
+ * Everything it takes to turn one "here's a job + its customer" row into
+ * queued scheduled_calls rows (or skips-with-reason): resolve the channel
+ * ONCE per customer, then fan out to every resolved recipient (the customer
+ * themselves and/or their opted-in confirmation_contact_ids — migration 081)
+ * — one row per recipient, each gated/deduped/inserted independently, so one
+ * recipient missing a phone never blocks another. Shared by the nightly
+ * sweep (processScheduledUnconfirmed) and the manual
+ * POST /jobs/bulk-send-confirmation route — the two must never diverge on
+ * this logic, or a job that's fine for one path silently isn't for the other.
+ *
+ * @param {object} row  — must carry: job_id, job_name, job_description, job_type,
+ *   appointment_id (lead), lead_scheduled_start, scheduled_date (job fallback date),
+ *   customer_id, customer_phone, customer_email, customer_name, address_line1, city, state,
+ *   is_voice, is_sms, is_email, confirmation_include_customer, confirmation_contact_ids
+ * @param {object} [opts]
+ * @param {boolean} [opts.devOverride]     — defaults to the module's isDev
+ * @param {string}  [opts.callPriority]    — defaults to computeInitialPriority's result
+ * @param {boolean} [opts.bypassOfficeHours=false] — true fires scheduledAt = now
+ * @returns {Promise<Array<object>>} one result per resolved recipient
+ */
+async function enqueueConfirmationForJobRow(companyId, callType, callSettings, tz, smsLive, row, opts = {}) {
+  const { devOverride = null, callPriority = null, bypassOfficeHours = false } = opts;
+  const dev = devOverride ?? isDev;
+  const jobId = String(row.job_id);
+
+  // Channel is a single per-customer decision — resolved once, before the
+  // contact-completeness gate below (resolveOutboundChannel only depends on
+  // the customer's flags/settings, never on any one recipient's contact
+  // info, so this ordering is always safe) and applies to every recipient.
+  const { channel, linkDelivery } = resolveOutboundChannel({
+    smsLive,
+    flags: { is_voice: row.is_voice, is_sms: row.is_sms, is_email: row.is_email },
+    channelStrategy: callSettings.channel_strategy,
+  });
+
+  const recipients = await resolveConfirmationRecipients(companyId, {
+    full_name: row.customer_name,
+    phone: row.customer_phone,
+    email: row.customer_email,
+    confirmation_include_customer: row.confirmation_include_customer,
+    confirmation_contact_ids: row.confirmation_contact_ids,
+  });
+
+  const scheduledAt = bypassOfficeHours || dev
+    ? new Date()
+    : snapToWindowStart(callSettings, tz, new Date());
+
+  // The LEAD APPOINTMENT's own day, not the trigger window's end — job_date
+  // isn't cosmetic: scheduleRetry/scheduleCallback gate on
+  // `nextWindowAt >= jobDueDate`, and computeInitialPriority uses it for
+  // urgency. Falls back to the job's own scheduled_date when there's no lead
+  // (shouldn't happen for a job with an eligible appointment, but a job-level
+  // date beats nothing).
+  const leadJobDate = toLocalDateOnly(row.lead_scheduled_start, tz)
+    || (row.scheduled_date ? toLocalDateOnly(row.scheduled_date, tz) : null);
+
+  const results = [];
+  for (const recipient of recipients) {
+    results.push(await enqueueConfirmationForRecipient({
+      companyId, callType, callSettings, tz, dev, jobId, row, recipient,
+      channel, linkDelivery, scheduledAt, leadJobDate, callPriority, bypassOfficeHours,
+    }));
+  }
+  return results;
+}
+
+/**
+ * One recipient's worth of enqueueConfirmationForJobRow — the
+ * missing_phone/missing_email gate and the dedupe check are evaluated
+ * per-recipient (a recipient missing what the resolved channel needs is
+ * skipped/todo'd on their own; other recipients still queue).
+ */
+async function enqueueConfirmationForRecipient({
+  companyId, callType, callSettings, tz, dev, jobId, row, recipient,
+  channel, linkDelivery, scheduledAt, leadJobDate, callPriority, bypassOfficeHours,
+}) {
+  const { recipientContactId, name: recipientName, phone: recipientPhone, email: recipientEmail } = recipient;
+  const subjectName = recipientName || row.customer_name;
+
+  if (channel !== "web_chat" && !recipientPhone) {
+    await todosDb.createMissingPhone({
+      companyId, jobId, subjectKind: "customer",
+      subjectName, callType,
+      reason: "Phone number not provided — confirmation call could not be placed.",
+      isTest: dev,
+    });
+    return { status: "skipped", reason: "missing_phone", channel, linkDelivery, recipientContactId };
+  }
+
+  // Contact-completeness gate for web_chat — required contact info depends on
+  // the customer's is_sms/is_email flags, resolved above into linkDelivery
+  // ('email' needs an email on file; 'sms' needs a phone; 'both' needs at
+  // least one) — evaluated against THIS recipient's own phone/email.
+  if (channel === "web_chat") {
+    const needsEmail = linkDelivery === "email" && !recipientEmail;
+    const needsPhone = linkDelivery === "sms" && !recipientPhone;
+    const needsEither = linkDelivery === "both" && !recipientEmail && !recipientPhone;
+
+    if (needsEmail || needsEither) {
+      await todosDb.createMissingEmail({
+        companyId, jobId, subjectKind: "customer",
+        subjectName, callType,
+        reason: "Email not provided — confirmation chat link could not be sent.",
+        isTest: dev,
+      });
+      return { status: "skipped", reason: "missing_email", channel, linkDelivery, recipientContactId };
+    }
+    if (needsPhone) {
+      await todosDb.createMissingPhone({
+        companyId, jobId, subjectKind: "customer",
+        subjectName, callType,
+        reason: "Phone number not provided — confirmation chat could not be texted.",
+        isTest: dev,
+      });
+      return { status: "skipped", reason: "missing_phone", channel, linkDelivery, recipientContactId };
+    }
+  }
+
+  if (await scheduledCallsDb.existsForCustomerJob(companyId, jobId, callType, dev, recipientContactId)) {
+    return { status: "skipped", reason: "already_queued", channel, linkDelivery, recipientContactId };
+  }
+
+  const insertedRow = await tryScheduleCall({
+    companyId, callType,
+    phoneNumber: recipientPhone,
+    jobId, jobDate: leadJobDate,
+    appointmentId: row.appointment_id || null,
+    customerName: row.customer_name,
+    customerAddress: [row.address_line1, row.city, row.state].filter(Boolean).join(", ") || null,
+    jobName: row.job_name || null,
+    jobDescription: row.job_description || null,
+    jobType: row.job_type || null,
+    scheduledAt, isTest: dev, maxAttempts: callSettings.max_attempts,
+    callPriority: callPriority || computeInitialPriority({ triggerType: "scheduled_unconfirmed", jobDate: leadJobDate, tz }),
+    bypassOfficeHours,
+    channel, linkDelivery,
+    recipientContactId, recipientName, recipientEmail,
+  });
+
+  if (!insertedRow) return { status: "skipped", reason: "already_queued", channel, linkDelivery, recipientContactId };
+
+  return {
+    status: "queued", channel, linkDelivery, recipientContactId,
+    scheduled_call_id: insertedRow.id,
+    scheduled_at: insertedRow.scheduled_at,
+  };
+}
+
+/**
+ * Single-job entry point for the manual "Send Confirmation" flow
+ * (POST /jobs/bulk-send-confirmation calls this once per selected job).
+ * Unlike the nightly sweep, there's no eligibility/date-window gate — the
+ * tenant explicitly chose this job — but a job with no upcoming appointment
+ * still has nothing to confirm, so that's still a skip, not a queue.
+ */
+async function enqueueJobConfirmation(companyId, jobId, { callType = "customer_confirmation", callSettings, tz, smsLive = false, callPriority = null, bypassOfficeHours = false } = {}) {
+  const { rows } = await db.query(
+    `SELECT j.id AS job_id, j.scheduled_date, j.status AS job_status,
+            j.title AS job_name, j.description AS job_description, j.job_type,
+            lead.id AS appointment_id, lead.status AS appointment_status,
+            lead.scheduled_start AS lead_scheduled_start,
+            c.phone AS customer_phone, c.email AS customer_email, c.full_name AS customer_name,
+            c.address_line1, c.city, c.state, c.is_voice, c.is_sms, c.is_email,
+            c.confirmation_include_customer, c.confirmation_contact_ids
+       FROM jobs j
+       JOIN customers c ON c.id = j.customer_id
+       LEFT JOIN LATERAL (
+         SELECT a.id, a.status, a.scheduled_start
+           FROM appointments a
+          WHERE a.company_id = j.company_id AND a.job_id = j.id
+            AND a.status IN ('scheduled','confirmed','rescheduled')
+            AND a.scheduled_start > NOW()
+          ORDER BY a.scheduled_start ASC
+          LIMIT 1
+       ) lead ON true
+      WHERE j.company_id = $1 AND j.id = $2`,
+    [companyId, jobId]
+  );
+  const row = rows[0];
+  // Returns an array (one entry per resolved recipient) for consistency with
+  // enqueueConfirmationForJobRow — these two early-exit cases wrap a single
+  // failure/skip in a one-element array rather than returning a bare object.
+  if (!row) return [{ status: "failed", reason: "job_not_found" }];
+  if (!row.appointment_id) return [{ status: "skipped", reason: "no_upcoming_appointment" }];
+
+  const cs = callSettings || await callSettingsDb.getByCompanyId(companyId);
+  const tzResolved = tz || (await (async () => {
+    const { rows: co } = await db.query(`SELECT default_timezone FROM companies WHERE id = $1`, [companyId]);
+    return co[0]?.default_timezone || "America/New_York";
+  })());
+
+  return enqueueConfirmationForJobRow(companyId, callType, cs, tzResolved, smsLive, row, { callPriority, bypassOfficeHours });
+}
+
+// A web_chat/sms confirmation whose link has sat unopened this long is
+// treated as the "no answer" equivalent — there's no chat_ended/chat_analyzed
+// webhook to react to if the customer never opened it at all, so this can't
+// reuse the existing webhook-driven retry path. Matches the chat-link TTL
+// (createChatLinkForJob/Appointment) so the watchdog fires right as the link
+// dies rather than 24h after it's already unusable.
+const CHAT_LINK_UNOPENED_WINDOW_HOURS = 24;
 
 async function processUnopenedChatLinks(companyId) {
+  const { rows: coRows } = await db.query(`SELECT sms_status FROM companies WHERE id = $1`, [companyId]);
+  const smsLive = coRows[0]?.sms_status === "live";
+
   const { rows } = await db.query(
     `SELECT sc.id, sc.job_id, sc.appointment_id, sc.call_type, sc.customer_name,
             sc.job_name, sc.job_description, sc.job_type, sc.job_date,
-            sc.is_test, sc.max_attempts, sc.phone_number
+            sc.is_test, sc.max_attempts, sc.retry_count, sc.phone_number,
+            c.is_voice, c.is_sms, c.is_email
      FROM scheduled_calls sc
      JOIN chat_links cl ON cl.token = sc.chat_link_token
+     LEFT JOIN jobs j      ON j.id::text = sc.job_id AND j.company_id = sc.company_id
+     LEFT JOIN customers c ON c.id = j.customer_id
      WHERE sc.company_id = $1
        AND sc.channel IN ('web_chat', 'sms')
        AND sc.status = 'completed'
@@ -455,6 +707,28 @@ async function processUnopenedChatLinks(companyId) {
       logger.info("Scheduler [unopened_chat_link]: skipped — a call already exists for this job", { companyId, jobId });
       continue;
     }
+    // Cap re-sends — a customer who never engages on any channel shouldn't be
+    // messaged forever. parent_call_id chains carry retry_count forward
+    // (fallbackToLink resets it, this path doesn't — a stale link warrants
+    // the same cap as a stale voice attempt).
+    if ((row.retry_count || 0) >= row.max_attempts) {
+      logger.info("Scheduler [unopened_chat_link]: capped — max_attempts reached, not re-sending", { companyId, jobId, retryCount: row.retry_count, maxAttempts: row.max_attempts });
+      continue;
+    }
+
+    // Re-resolve from the customer's own flags rather than hardcoding voice:
+    // an is_voice customer gets a real call; a link-only customer gets a
+    // fresh link (the old one is dead — expired tokens 404). No customer row
+    // resolvable (shouldn't happen for a job-scoped confirmation) defaults to
+    // voice, same as the old unconditional behavior.
+    const flags = row.is_voice != null ? { is_voice: row.is_voice, is_sms: row.is_sms, is_email: row.is_email } : null;
+    const wantVoice = flags ? flags.is_voice : true;
+    const channel = wantVoice ? "voice" : "web_chat";
+    const linkDelivery = wantVoice
+      ? null
+      : (flags.is_sms && smsLive && flags.is_email) ? "both"
+      : (flags.is_sms && smsLive) ? "sms"
+      : "email"; // is_email, or the last-resort default when neither survived the smsLive check
 
     const inserted = await scheduleCall({
       companyId, callType: row.call_type,
@@ -467,7 +741,8 @@ async function processUnopenedChatLinks(companyId) {
       jobType: row.job_type || null,
       scheduledAt: new Date(), isTest: row.is_test, maxAttempts: row.max_attempts,
       callPriority: "retry",
-      channel: "voice",
+      retryCount: (row.retry_count || 0) + 1,
+      channel, linkDelivery,
     });
     if (!inserted) continue;
 
@@ -503,31 +778,66 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz,
   const endDate = new Date();
   endDate.setDate(endDate.getDate() + trigger.days_before);
   const endDateStr = formatDateInTz(endDate, tz);
-  const targetDate = new Date(endDateStr);
 
   const dateFilter = isDev
     ? "a.scheduled_start >= NOW()"
     : "DATE(a.scheduled_start AT TIME ZONE $2) BETWEEN $3::date AND $4::date";
   const params = isDev ? [companyId] : [companyId, tz, todayStr, endDateStr];
 
-  // Include both scheduled and rescheduled jobs/appointments — both still need
-  // customer confirmation. A rescheduled appointment is the new time the customer
-  // must confirm.
+  // One call per JOB, covering every upcoming appointment on it.
+  //
+  // Eligibility and lead selection are deliberately separate concerns:
+  //   • ELIGIBLE (the EXISTS clause) — does this job have at least one
+  //     unconfirmed upcoming appointment inside the trigger's date window? That
+  //     decides *whether* we reach out.
+  //   • LEAD (the first LATERAL) — the earliest upcoming appointment, period,
+  //     confirmed or not. That decides *which one the agent talks about first*.
+  //
+  // The previous DISTINCT ON form conflated the two: it joined only unconfirmed
+  // appointments, so on a job whose first visit was already confirmed it named
+  // the SECOND visit as the subject of the call, and it could never see
+  // status='confirmed' appointments at all when counting. 'confirmed' counts as
+  // upcoming here for exactly that reason.
   const { rows } = await db.query(
-    `SELECT DISTINCT ON (j.id)
-            j.id AS job_id, j.scheduled_date, j.status AS job_status,
+    `SELECT j.id AS job_id, j.job_number, j.scheduled_date, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
-            a.id AS appointment_id, a.status AS appointment_status,
+            lead.id AS appointment_id, lead.status AS appointment_status,
+            lead.scheduled_start AS lead_scheduled_start,
+            cnt.upcoming_count, cnt.unconfirmed_count,
             c.phone AS customer_phone, c.email AS customer_email, c.full_name AS customer_name,
-            c.address_line1, c.city, c.state, c.preferred_channel
+            c.address_line1, c.city, c.state, c.is_voice, c.is_sms, c.is_email,
+            c.confirmation_include_customer, c.confirmation_contact_ids
      FROM jobs j
-     JOIN appointments a ON a.job_id = j.id AND a.status IN ('scheduled','rescheduled')
      JOIN customers c ON c.id = j.customer_id
+     JOIN LATERAL (
+       SELECT a.id, a.status, a.scheduled_start
+         FROM appointments a
+        WHERE a.company_id = j.company_id AND a.job_id = j.id
+          AND a.status IN ('scheduled','confirmed','rescheduled')
+          AND a.scheduled_start > NOW()
+        ORDER BY a.scheduled_start ASC
+        LIMIT 1
+     ) lead ON true
+     JOIN LATERAL (
+       SELECT count(*) AS upcoming_count,
+              count(*) FILTER (WHERE COALESCE(a.customer_confirmed, false) = false) AS unconfirmed_count
+         FROM appointments a
+        WHERE a.company_id = j.company_id AND a.job_id = j.id
+          AND a.status IN ('scheduled','confirmed','rescheduled')
+          AND a.scheduled_start > NOW()
+     ) cnt ON true
      WHERE j.company_id = $1
        AND j.status IN ('scheduled','rescheduled')
-       AND (a.customer_confirmed IS NULL OR a.customer_confirmed = false)
-       AND ${dateFilter}
-     ORDER BY j.id, a.scheduled_start ASC`,
+       AND cnt.unconfirmed_count > 0
+       AND EXISTS (
+         SELECT 1 FROM appointments a
+          WHERE a.company_id = j.company_id AND a.job_id = j.id
+            AND a.status IN ('scheduled','confirmed','rescheduled')
+            AND COALESCE(a.customer_confirmed, false) = false
+            AND a.scheduled_start > NOW()
+            AND ${dateFilter}
+       )
+     ORDER BY lead.scheduled_start ASC`,
     params
   );
 
@@ -536,92 +846,19 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz,
   let c = 0, s = 0;
   for (const row of rows) {
     const jobId = String(row.job_id);
-
-    // Channel must be resolved before the contact-completeness gate below —
-    // resolveOutboundChannel only depends on settings/preferences, never on
-    // contact info, so this ordering is always safe. (Previously the phone
-    // check ran unconditionally first, which would incorrectly block a
-    // web_chat/email-delivery customer who has an email but no phone on file.)
-    const channel = resolveOutboundChannel({
-      smsLive, preferredChannel: row.preferred_channel,
-      channelStrategy: callSettings.channel_strategy, attemptNumber: 1,
-    });
-
-    if (channel !== "web_chat" && !row.customer_phone) {
-      await todosDb.createMissingPhone({
-        companyId, jobId, subjectKind: "customer",
-        subjectName: row.customer_name, callType: trigger.call_type,
-        reason: "Customer phone number not provided — confirmation call could not be placed.",
-        isTest: isDev,
-      });
-      logger.info("Scheduler [scheduled_unconfirmed]: todo created — customer missing phone", { companyId, jobId, customer: row.customer_name });
-      s++; continue;
-    }
-
-    // Contact-completeness gate for web_chat — required contact info depends
-    // on the company's configured chat_link_delivery_method ('email' sends a
-    // link by email; 'sms' starts a live Retell conversation over text, same
-    // mechanism as the "Text Now" channel, so it needs a phone; 'both' needs
-    // at least one). Flag missing info for staff instead of silently skipping
-    // or guessing another channel; the next sweep picks it up normally once
-    // the missing info is added.
-    if (channel === "web_chat") {
-      const deliveryMethod = callSettings.chat_link_delivery_method;
-      const needsEmail = deliveryMethod === "email" && !row.customer_email;
-      const needsPhone = deliveryMethod === "sms" && !row.customer_phone;
-      const needsEither = deliveryMethod === "both" && !row.customer_email && !row.customer_phone;
-
-      if (needsEmail || needsEither) {
-        await todosDb.createMissingEmail({
-          companyId, jobId, subjectKind: "customer",
-          subjectName: row.customer_name, callType: trigger.call_type,
-          reason: "Customer email not provided — confirmation chat link could not be sent.",
-          isTest: isDev,
+    // One result per resolved recipient (the customer and/or their opted-in
+    // confirmation_contact_ids) — fold across all of them for this job's count.
+    const results = await enqueueConfirmationForJobRow(companyId, trigger.call_type, callSettings, tz, smsLive, row);
+    for (const result of results) {
+      if (result.status === "queued") {
+        c++;
+      } else {
+        logger.info(`Scheduler [scheduled_unconfirmed]: skipped — ${result.reason}`, {
+          companyId, jobId, jobName: row.job_name, customer: row.customer_name, channel: result.channel,
+          recipientContactId: result.recipientContactId,
         });
-        logger.info("Scheduler [scheduled_unconfirmed]: todo created — customer missing email for web_chat dispatch", { companyId, jobId, customer: row.customer_name });
-        s++; continue;
+        s++;
       }
-      if (needsPhone) {
-        await todosDb.createMissingPhone({
-          companyId, jobId, subjectKind: "customer",
-          subjectName: row.customer_name, callType: trigger.call_type,
-          reason: "Customer phone number not provided — confirmation chat could not be texted.",
-          isTest: isDev,
-        });
-        logger.info("Scheduler [scheduled_unconfirmed]: todo created — customer missing phone for web_chat dispatch", { companyId, jobId, customer: row.customer_name });
-        s++; continue;
-      }
-    }
-
-    if (await scheduledCallsDb.existsForCustomerJob(companyId, jobId, trigger.call_type, isDev)) {
-      logger.info("Scheduler [scheduled_unconfirmed]: skipped — call already exists", {
-        companyId, jobId, jobName: row.job_name, customer: row.customer_name,
-        reason: "Active or completed scheduled call already exists for this job",
-      });
-      s++; continue;
-    }
-
-    const scheduledAt = isDev
-      ? new Date()
-      : snapToWindowStart(callSettings, tz, new Date());
-
-    const inserted = await scheduleCall({
-      companyId, callType: trigger.call_type,
-      phoneNumber: row.customer_phone,
-      jobId, jobDate: targetDate,
-      appointmentId: row.appointment_id || null,
-      customerName: row.customer_name,
-      customerAddress: [row.address_line1, row.city, row.state].filter(Boolean).join(", ") || null,
-      jobName: row.job_name || null,
-      jobDescription: row.job_description || null,
-      jobType: row.job_type || null,
-      scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
-      callPriority: computeInitialPriority({ triggerType: "scheduled_unconfirmed", jobDate: targetDate, tz }),
-      channel,
-    });
-    if (inserted) c++; else {
-      logger.info("Scheduler [scheduled_unconfirmed]: skipped — duplicate on insert", { companyId, jobId });
-      s++;
     }
   }
   return { c, s };
@@ -637,7 +874,8 @@ async function processQuotationPending(companyId, trigger, callSettings, tz, sms
   const { rows } = await db.query(
     `SELECT q.id AS quotation_id, q.job_id, q.title AS quote_title, q.notes AS quote_description,
             q.total_amount, q.currency,
-            c.phone AS customer_phone, c.full_name AS customer_name, c.preferred_channel
+            c.phone AS customer_phone, c.full_name AS customer_name,
+            c.is_voice, c.is_sms, c.is_email
      FROM quotations q
      JOIN customers c ON c.id = q.customer_id
      WHERE q.company_id = $1
@@ -683,9 +921,10 @@ async function processQuotationPending(companyId, trigger, callSettings, tz, sms
       ? new Date()
       : getNextWindowStart(callSettings, tz);
 
-    const channel = resolveOutboundChannel({
-      smsLive, preferredChannel: row.preferred_channel,
-      channelStrategy: callSettings.channel_strategy, attemptNumber: 1,
+    const { channel, linkDelivery } = resolveOutboundChannel({
+      smsLive,
+      flags: { is_voice: row.is_voice, is_sms: row.is_sms, is_email: row.is_email },
+      channelStrategy: callSettings.channel_strategy,
     });
 
     const inserted = await scheduleCall({
@@ -696,6 +935,7 @@ async function processQuotationPending(companyId, trigger, callSettings, tz, sms
       jobName: row.quote_title || null,
       jobDescription: row.quote_description || null,
       totalAmount: row.total_amount ?? null,
+      linkDelivery,
       scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
       callPriority: computeInitialPriority({ triggerType: "quotation_pending", jobDate: null, tz }),
       channel,
@@ -725,7 +965,7 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz, smsLi
     SELECT j.id AS job_id, j.scheduled_date,
            j.title AS job_name, j.description AS job_description, j.job_type,
            c.phone AS customer_phone, c.full_name AS customer_name,
-           c.address_line1, c.city, c.state, c.preferred_channel
+           c.address_line1, c.city, c.state, c.is_voice, c.is_sms, c.is_email
     FROM jobs j
     JOIN customers c ON c.id = j.customer_id
     WHERE j.company_id = $1
@@ -767,9 +1007,10 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz, smsLi
       ? new Date()
       : snapToWindowStart(callSettings, tz, new Date());
 
-    const channel = resolveOutboundChannel({
-      smsLive, preferredChannel: row.preferred_channel,
-      channelStrategy: callSettings.channel_strategy, attemptNumber: 1,
+    const { channel, linkDelivery } = resolveOutboundChannel({
+      smsLive,
+      flags: { is_voice: row.is_voice, is_sms: row.is_sms, is_email: row.is_email },
+      channelStrategy: callSettings.channel_strategy,
     });
 
     const inserted = await scheduleCall({
@@ -783,7 +1024,7 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz, smsLi
       jobType: row.job_type || null,
       scheduledAt, isTest: isDev, maxAttempts: callSettings.max_attempts,
       callPriority: computeInitialPriority({ triggerType: "open_job_due_soon", jobDate: targetDate, tz }),
-      channel,
+      channel, linkDelivery,
     });
     if (inserted) c++; else {
       logger.info("Scheduler [open_job_due_soon]: skipped — duplicate on insert", { companyId, jobId });
@@ -874,4 +1115,4 @@ async function processTechnicianUnconfirmed(companyId, trigger, callSettings, tz
   return { c, s };
 }
 
-module.exports = { runDispatcher, runDailyJob, isWithinActiveHours, getNextWindowStart, processUnopenedChatLinks };
+module.exports = { runDispatcher, runDailyJob, isWithinActiveHours, getNextWindowStart, processUnopenedChatLinks, enqueueJobConfirmation };
