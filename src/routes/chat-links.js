@@ -172,7 +172,11 @@ router.post("/:token/messages", openCors, async (req, res) => {
       return res.end();
     }
 
-    for (const message of result.messages) {
+    // Defense in depth — every event in this stream must be role:"agent"
+    // (the doc promises the customer's own message is never echoed back);
+    // the real fix is upstream (confirmationAgent.sendMessage no longer
+    // includes it), but this guards against any future regression too.
+    for (const message of result.messages.filter((m) => m.role === "agent")) {
       const text = message.content || "";
       for (let i = 0; i < text.length; i += CHUNK_SIZE) {
         sseSend(res, "message_delta", { role: message.role, chunk: text.slice(i, i + CHUNK_SIZE) });

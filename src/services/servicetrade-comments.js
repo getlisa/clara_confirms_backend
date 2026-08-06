@@ -207,11 +207,11 @@ async function resolveTargets(companyId, callType, scheduledCall) {
 }
 
 /**
- * Idempotency: GET existing comments on the entity and check whether we already
- * posted one for this call (marker match). Fails open (returns false) so a read
- * error never blocks a legitimate write.
+ * Idempotency: GET existing comments on the entity and check whether one
+ * already contains this marker. Fails open (returns false) so a read error
+ * never blocks a legitimate write.
  */
-async function alreadyPosted(companyId, entityType, entityId, retellCallId) {
+async function hasCommentWithMarker(companyId, entityType, entityId, marker) {
   try {
     const res = await stLoggedRequest(
       companyId,
@@ -221,12 +221,15 @@ async function alreadyPosted(companyId, entityType, entityId, retellCallId) {
     );
     if (!res.ok) return false;
     const list = Array.isArray(res.data) ? res.data : res.data?.comments || [];
-    const marker = commentMarker(retellCallId);
     return list.some((c) => typeof c?.content === "string" && c.content.includes(marker));
   } catch (err) {
     logger.warn("servicetrade comment: GET existing failed; proceeding", { error: err.message, companyId, entityId });
     return false;
   }
+}
+
+async function alreadyPosted(companyId, entityType, entityId, retellCallId) {
+  return hasCommentWithMarker(companyId, entityType, entityId, commentMarker(retellCallId));
 }
 
 /**
@@ -329,8 +332,106 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
   }
 }
 
+/**
+ * Chat-agent counterpart to commentMarker/buildCommentContent. Embeds the
+ * message count at post time (not just the thread id) so a conversation
+ * that's reopened later and ends again produces a fresh, distinct marker —
+ * the longer history naturally makes each ending unique, with no separate
+ * "already ended once" bookkeeping needed.
+ */
+function chatCommentMarker(threadId, messageCount) {
+  return `[clara-chat:${threadId}:${messageCount}]`;
+}
+
+function buildChatCommentContent(summaryLines, threadId, messageCount) {
+  const body = summaryLines.map((l) => `- ${l}`).join("\n");
+  return `Clara chat outcome:\n${body}\n\n${chatCommentMarker(threadId, messageCount)}`;
+}
+
+/**
+ * Post a single job-level comment summarizing a completed confirmation-agent
+ * chat conversation. Unlike postCallComment (built around Retell's fuzzy
+ * outcome/custom call-analysis fields), the caller here already knows
+ * exactly what happened — summaryLines is built from real tool calls/results,
+ * not derived from any ambiguous signal — so there's no label-guessing step.
+ *
+ * Deliberately posts to the parent JOB only, not a specific appointment: a
+ * chat conversation can touch several appointments on the job (confirm one,
+ * reschedule another), so one job-level comment listing everything that
+ * happened is simpler than picking an arbitrary "the" appointment.
+ *
+ * Best-effort — never throws into the chat turn.
+ *
+ * @param {object} args
+ * @param {number|string} args.companyId
+ * @param {number|string} args.jobId
+ * @param {string} args.threadId       chat_links.token (this conversation's thread id)
+ * @param {string[]} args.summaryLines human-readable lines, one per successful action
+ * @param {number} args.messageCount   full message count at post time (see chatCommentMarker)
+ */
+async function postConfirmationAgentComment({ companyId, jobId, threadId, summaryLines, messageCount }) {
+  if (!summaryLines || summaryLines.length === 0) {
+    logger.info("servicetrade comment (chat): nothing reportable; skipping", { companyId, threadId, jobId });
+    return;
+  }
+
+  const enabled = await isCommentWritebackEnabled(companyId);
+  if (!enabled) {
+    logger.info("servicetrade comment (chat): crm_comment_writeback_enabled is FALSE for company; skipping", { companyId, threadId });
+    return;
+  }
+
+  const targets = await resolveTargets(companyId, "customer_confirmation", { job_id: String(jobId), appointment_id: null });
+  if (targets.length === 0) {
+    logger.warn("servicetrade comment (chat): no servicetrade entity resolved; skipping (see [resolve] logs above)", { companyId, threadId, jobId });
+    return;
+  }
+
+  const content = buildChatCommentContent(summaryLines, threadId, messageCount);
+  const marker = chatCommentMarker(threadId, messageCount);
+  const posts = targets.flatMap((t) => t.entityIds.map((entityId) => ({ entityKey: t.entityKey, entityType: t.entityType, entityId })));
+
+  logger.info("servicetrade comment (chat): posting", { companyId, threadId, count: posts.length, entities: posts.map((p) => `${p.entityKey}:${p.entityId}`) });
+  for (const { entityKey, entityType, entityId } of posts) {
+    try {
+      if (await hasCommentWithMarker(companyId, entityType, entityId, marker)) {
+        logger.info("servicetrade comment (chat): already posted for this conversation state; skipping", { companyId, entityKey, entityId, threadId });
+        continue;
+      }
+      const body = buildCommentBody({ entityId, entityType, content });
+      const res = await stLoggedRequest(companyId, "POST", "/comment", { body, context: "comment.post" });
+      if (!res.ok) {
+        logger.error("servicetrade comment (chat): POST failed", { companyId, entityKey, entityId, status: res.status, messages: res.messages, data: res.data });
+      } else {
+        logger.info("servicetrade comment (chat): posted OK", { companyId, entityKey, entityId, threadId, commentId: res.data?.id ?? null });
+      }
+      await callLogsDb
+        .insert({
+          companyId,
+          callId: null,
+          retellCallId: threadId,
+          eventType: "servicetrade_comment_posted",
+          payload: {
+            ok: res.ok,
+            status: res.status,
+            entity_key: entityKey,
+            entity_type: entityType,
+            entity_id: entityId,
+            comment_id: res.data?.id ?? null,
+            summary_lines: summaryLines,
+            messages: res.ok ? undefined : res.messages,
+          },
+        })
+        .catch(() => {});
+    } catch (err) {
+      logger.error("servicetrade comment (chat): unexpected error", { error: err.message, companyId, entityId, threadId });
+    }
+  }
+}
+
 module.exports = {
   postCallComment,
+  postConfirmationAgentComment,
   appliesToCallType,
   isCommentWritebackEnabled,
   // exported for tests / live verification

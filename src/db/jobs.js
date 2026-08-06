@@ -615,6 +615,24 @@ async function updateAppointment(id, companyId, fields) {
   return result.rows[0] ? apptRow(result.rows[0]) : null;
 }
 
+/**
+ * Confirm many appointments in one statement instead of looping
+ * updateAppointment per row — for a recurring-service job with dozens of
+ * future visits, a "confirm all remaining" action shouldn't cost one round
+ * trip per appointment. customer_confirmed_at is stamped uniformly to the
+ * time of the batch, same as updateAppointment's own auto-stamp behavior.
+ */
+async function bulkConfirmAppointments(companyId, appointmentIds) {
+  if (!Array.isArray(appointmentIds) || appointmentIds.length === 0) return [];
+  const result = await db.query(
+    `UPDATE appointments SET customer_confirmed = true, customer_confirmed_at = NOW(), updated_at = NOW()
+     WHERE company_id = $1 AND id = ANY($2::int[])
+     RETURNING *`,
+    [companyId, appointmentIds]
+  );
+  return result.rows.map(apptRow);
+}
+
 async function getAppointmentById(id, companyId) {
   const result = await db.query(
     `SELECT a.*,
@@ -633,4 +651,5 @@ module.exports = {
   listJobs, listJobTypes, getJobById, createJob, updateJob, getJobContacts,
   fetchServicesByAppointment, fetchJobServiceLines,
   listAppointmentsByJob, createAppointment, updateAppointment, getAppointmentById,
+  bulkConfirmAppointments,
 };

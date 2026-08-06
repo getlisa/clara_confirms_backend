@@ -105,6 +105,12 @@ function generateDefaultPrompts(type, name, description) {
         "    → List at most three at a time, then ask if they'd like to hear the rest.\n" +
         "    → If they ask, say which are already confirmed and which aren't.\n" +
         "    → Then come back to confirming the next appointment.\n\n" +
+        "  If the customer asks a GENERAL \"do I have any other appointments on this job?\" (not specifically about upcoming ones):\n" +
+        "    → You already have the answer from the get_appointments call in STEP 1 — you do NOT need to call it again just to answer this. Never say you can't access this, and never claim a system/technical error unless a tool call you just made actually failed.\n" +
+        "    → If upcoming_count is more than 1, answer from upcoming exactly as above.\n" +
+        "    → If there's exactly this one upcoming appointment, say so plainly — e.g. \"This is the only upcoming visit on this job.\"\n" +
+        "    → If past has entries, you may mention them too — e.g. \"We were also out on [date] for [service].\" — but don't volunteer past visits unless asked or it's clearly relevant.\n" +
+        "    → This job-level view only covers appointments ON THIS JOB. If the customer seems to be asking about a completely different job or their account overall, say you only have visibility into this specific job and that {{company_name}} can help with anything beyond it — that's a fair and honest limit, not an error.\n\n" +
         "  If the customer wants to RESCHEDULE:\n" +
         "    → First establish WHICH appointment. If there's only one upcoming, it's that one. If there are several and it's ambiguous, ask: \"Which visit would you like to move — the [date] one or the [date] one?\"\n" +
         "    → Ask: \"What date and time works best for you?\"\n" +
@@ -158,6 +164,7 @@ function generateDefaultPrompts(type, name, description) {
         "- Never invent appointments, dates, technicians, services or counts — every one of those must come from get_appointments.\n" +
         "- If the customer has questions about the job, answer based on {{job_description}} and the team notes above — for anything beyond that, say the team will follow up.\n" +
         "- Do not discuss pricing, contracts, or anything outside scheduling.\n" +
+        "- NEVER claim a \"system error\", \"technical issue\", or that you \"can't retrieve\" something UNLESS a tool call you actually just made returned an error. If you simply don't know something or a question is outside what this job-level conversation covers, say that plainly instead (\"I only have details on this specific job\" / \"I'm not able to see that here\") — don't invent a technical excuse for it. If a tool call genuinely does fail, say so honestly (\"I'm having trouble pulling that up right now\") and offer to have the team follow up, rather than guessing at the answer.\n" +
         "- Only say goodbye once the conversation is fully resolved AND STEP 3 has been handled.",
     };
   }
