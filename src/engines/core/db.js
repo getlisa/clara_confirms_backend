@@ -109,6 +109,36 @@ async function gcOldRuns(days = 30) {
   return r.rowCount;
 }
 
+/**
+ * Mark abandoned runs as failed. A run is abandoned when the process died
+ * without ever calling setStatus — on Vercel the function is frozen once its
+ * HTTP response is sent, so any work still in flight (crm_sync deliberately
+ * runs un-awaited) simply stops, leaving `running` in the table forever.
+ *
+ * gcOldRuns can't help: it excludes `status != 'running'` on purpose, so these
+ * rows are never even deleted. Left alone they make status reporting lie
+ * indefinitely — this account had runs claiming to be "running" for 31 and 60
+ * days.
+ *
+ * `minutes` is deliberately generous. A legitimate run can be long: Vercel now
+ * allows 300s, and the same code run locally has no cap at all and has taken
+ * 10+ minutes on a full sync. The point is to catch corpses, not to impose a
+ * deadline on live work.
+ */
+async function reapStaleRuns(minutes = 30) {
+  const r = await db.query(
+    `UPDATE engine_runs
+        SET status = 'failed',
+            error = COALESCE(error, 'Abandoned — no completion recorded within ' || $1 || ' minutes (process most likely terminated mid-run)'),
+            finished_at = NOW()
+      WHERE status = 'running'
+        AND started_at < NOW() - ($1 || ' minutes')::interval
+      RETURNING id`,
+    [String(minutes)]
+  );
+  return r.rowCount;
+}
+
 module.exports = {
-  createRun, getRun, appendEvent, setStatus, getEventsSince, listRuns, gcOldRuns,
+  createRun, getRun, appendEvent, setStatus, getEventsSince, listRuns, gcOldRuns, reapStaleRuns,
 };

@@ -167,9 +167,15 @@ router.all("/engines/gc", async (req, res) => {
   if (!verifyCronSecret(req, res)) return;
   try {
     const days = Math.max(parseInt(req.query.days, 10) || 30, 1);
+    // Reap first: gcOldRuns deliberately skips status='running', so an
+    // abandoned run would otherwise never be cleaned up OR deleted. Marking
+    // it failed here both corrects status reporting now and makes it eligible
+    // for deletion on a later pass.
+    const staleMinutes = Math.max(parseInt(req.query.staleMinutes, 10) || 30, 1);
+    const reaped = await enginesDb.reapStaleRuns(staleMinutes);
     const deleted = await enginesDb.gcOldRuns(days);
-    logger.info("Admin: engine_runs GC", { days, deleted });
-    return res.json({ ok: true, days, deleted });
+    logger.info("Admin: engine_runs GC", { days, deleted, staleMinutes, reaped });
+    return res.json({ ok: true, days, deleted, staleMinutes, reaped });
   } catch (err) {
     logger.error("Admin engines/gc failed", { error: err.message });
     return res.status(500).json({ error: err.message });
