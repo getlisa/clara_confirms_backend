@@ -203,6 +203,33 @@ function normalizeSchedulingComment(item, { companyId, jobId }) {
 }
 
 /**
+ * A /comment row (ServiceTrade's real per-job comment stream) → platform
+ * `job_comments`. `created`/`updated` are unix seconds; they're carried
+ * through as real timestamps because comment RECENCY is what distinguishes
+ * "customer confirmed" from a later "customer called to reschedule" — our
+ * own row timestamps move on every sync and can't be used for that.
+ */
+function normalizeJobComment(item, { companyId, jobId }) {
+  if (!item || item.id == null) return null;
+  const toTs = (unix) => (Number.isFinite(Number(unix)) ? new Date(Number(unix) * 1000).toISOString() : null);
+  return {
+    companyId,
+    jobId,
+    externalRef:   String(item.id),
+    source:        "servicetrade",
+    content:       item.content ?? null,
+    authorName:    item.author?.name ?? null,
+    authorEmail:   item.author?.email ?? null,
+    authorIsTech:  typeof item.author?.isTech === "boolean" ? item.author.isTech : null,
+    commentedAt:   toTs(item.created),
+    stUpdatedAt:   toTs(item.updated),
+    pinned:        item.pinned === true,
+    visibility:    Array.isArray(item.visibility) ? item.visibility : null,
+    additionalInformation: { servicetrade_comment_id: String(item.id) },
+  };
+}
+
+/**
  * A job's embedded `notes[]` item ({type, text}) → platform `job_notes`.
  * No id/stable identity in the payload — caller re-syncs by delete-and-reinsert
  * per job rather than upserting by external_ref.
@@ -561,6 +588,7 @@ module.exports = {
   normalizeProject,
   normalizeCrmUser,
   normalizeSchedulingComment,
+  normalizeJobComment,
   normalizeJobNote,
   normalizeAppointmentNote,
   normalizeContact,

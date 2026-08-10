@@ -6,7 +6,19 @@
  */
 const db = require("./index");
 
-const BATCH_SIZE = 500;
+// Every upsert here carries a full `payload` JSONB (~1.7–5 kB/row), so batch
+// size is really "how many kB per round trip". At 500 a single company's
+// appointments went out as one ~740 kB INSERT — right in the range
+// db/index.js's fetchAllByCompanyChunked already documents as slow and
+// erratic enough to blow past query_timeout on a remote pooled connection
+// (measured there at 2.7s / 4.4s / 11.5s / outright timeout for 843 kB, with
+// the server itself idle). That's exactly what "Query read timeout" on
+// INSERT INTO servicetrade_appointments was.
+//
+// 50 matches the read side's chunk size for the same reason: keep every
+// round trip small and bounded, so a slow link costs throughput instead of
+// failing the whole sync.
+const BATCH_SIZE = 50;
 
 // ── Sync state ──────────────────────────────────────────────────────────────
 
@@ -502,6 +514,40 @@ async function upsertServiceRecurrencesBatch(companyId, rows) {
   }
 }
 
+/**
+ * Raw job comments from GET /comment?entityType=3&entityId=<job>. Payload is
+ * kept whole (author/created/visibility/pinned) — the normalize step reads
+ * everything it needs off it, same as every other raw table here.
+ */
+async function upsertJobCommentsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(
+        companyId,
+        r.servicetrade_id,
+        r.servicetrade_job_id,
+        r.payload ? JSON.stringify(r.payload) : "{}"
+      );
+    });
+    await db.query(
+      `INSERT INTO servicetrade_job_comments
+         (company_id, servicetrade_id, servicetrade_job_id, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         servicetrade_job_id = EXCLUDED.servicetrade_job_id,
+         payload             = EXCLUDED.payload,
+         updated_at          = NOW()`,
+      params
+    );
+  }
+}
+
 async function upsertServiceRequestsBatch(companyId, rows) {
   if (rows.length === 0) return;
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
@@ -806,6 +852,7 @@ module.exports = {
   upsertUsersBatch,
   upsertJobStubsBatch,
   upsertLocationStubsBatch,
+  upsertJobCommentsBatch,
   // Reads
   listCustomers,
   listJobs,

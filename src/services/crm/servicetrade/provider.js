@@ -104,7 +104,7 @@ class ServiceTradeProvider extends CrmProvider {
       contacts: 0, offices: 0, tags: 0, locations: 0,
       serviceLines: 0, deficiencies: 0, changeOrders: 0, contracts: 0, serviceRecurrences: 0,
       serviceRequests: 0, serviceOpportunities: 0, appointmentServices: 0,
-      schedulingComments: 0, jobNotes: 0, appointmentNotes: 0,
+      schedulingComments: 0, jobNotes: 0, jobComments: 0, appointmentNotes: 0,
       confirmationAssessments: 0,
     };
 
@@ -166,6 +166,7 @@ class ServiceTradeProvider extends CrmProvider {
     await this._normalizeJobTags(companyId, rawJobs);
     counts.schedulingComments = await this._normalizeSchedulingComments(companyId, rawJobs);
     counts.jobNotes           = await this._normalizeJobNotes(companyId, rawJobs);
+    counts.jobComments        = await this._normalizeJobComments(companyId);
 
     const rawAppointments = await db.fetchAllByCompanyChunked(companyId, "servicetrade_appointments");
 
@@ -216,10 +217,14 @@ class ServiceTradeProvider extends CrmProvider {
     counts.serviceRequests = await this._normalizeServiceRequests(companyId, engine);
     if (engine) await engine.emit("entity_done", { entity: "service_requests", count: counts.serviceRequests });
 
-    counts.serviceOpportunities = await this._normalizeServiceOpportunities(companyId, engine);
-    if (engine) await engine.emit("entity_done", { entity: "service_opportunities", count: counts.serviceOpportunities });
+    // Service-opportunity sync removed by request — service_requests/
+    // appointment_services (same raw source) keep normalizing as before.
+    // The service_opportunity_followup call type, its get_service_opportunities/
+    // book_service_opportunity tools, and the dispatch route in
+    // routes/service-opportunities.js all keep running unchanged, just
+    // against whatever is already in `service_opportunities` — it will no
+    // longer pick up new/changed opportunities from ServiceTrade.
 
-    await this._normalizeServiceOpportunityPreferredTechs(companyId);
     await this._normalizeServiceRequestPreferredTechs(companyId);
 
     counts.appointmentServices = await this._normalizeAppointmentServices(companyId, engine);
@@ -575,6 +580,38 @@ class ServiceTradeProvider extends CrmProvider {
     const argsList = Array.from(argsById.values());
     await db.bulkUpsertByExternalRef("scheduling_comments", SCHEDULING_COMMENT_FIELDS, argsList);
     logger.info("ServiceTradeProvider: normalized scheduling comments", { companyId, count: argsList.length });
+    return argsList.length;
+  }
+
+  /**
+   * servicetrade_job_comments (from GET /comment?entityType=3) → platform
+   * `job_comments`. This is ServiceTrade's REAL comment stream — distinct
+   * from schedulingComments/notes above, which are frequently empty even on
+   * jobs with a full comment history.
+   *
+   * Upserted by external_ref (real comment ids) rather than
+   * delete-and-reinsert, so `commented_at` — ServiceTrade's own `created`,
+   * which drives the recency logic in job-confirmation-inference.js — stays
+   * stable across syncs.
+   */
+  async _normalizeJobComments(companyId) {
+    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_job_comments", {
+      columns: "id, servicetrade_id, servicetrade_job_id, payload",
+    });
+    const jobsMap = await db.fetchExternalRefMap(companyId, "jobs");
+    // De-duped by comment id for the same reason as scheduling comments —
+    // a repeated external_ref in one batch trips "ON CONFLICT DO UPDATE
+    // command cannot affect row a second time".
+    const argsById = new Map();
+    for (const row of raw) {
+      const jobId = jobsMap.get(String(row.servicetrade_job_id));
+      if (!jobId) continue;
+      const mapped = normalize.normalizeJobComment(row.payload, { companyId, jobId });
+      if (mapped) argsById.set(String(row.servicetrade_id), mapped);
+    }
+    const argsList = Array.from(argsById.values());
+    await db.bulkUpsertByExternalRef("job_comments", JOB_COMMENT_FIELDS, argsList);
+    logger.info("ServiceTradeProvider: normalized job comments", { companyId, count: argsList.length });
     return argsList.length;
   }
 
@@ -1064,6 +1101,18 @@ const PROJECT_FIELDS = [
 const SCHEDULING_COMMENT_FIELDS = [
   { column: "job_id", key: "jobId" },
   { column: "content", key: "content" },
+];
+
+const JOB_COMMENT_FIELDS = [
+  { column: "job_id", key: "jobId" },
+  { column: "content", key: "content" },
+  { column: "author_name", key: "authorName" },
+  { column: "author_email", key: "authorEmail" },
+  { column: "author_is_tech", key: "authorIsTech" },
+  { column: "commented_at", key: "commentedAt" },
+  { column: "st_updated_at", key: "stUpdatedAt" },
+  { column: "pinned", key: "pinned" },
+  { column: "visibility", key: "visibility" },
 ];
 
 const CONTACT_FIELDS = [
