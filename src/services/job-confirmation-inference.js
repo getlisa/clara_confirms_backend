@@ -109,14 +109,12 @@ ${commentLines || "(none)"}
 
 Decide, based ONLY on the comments above, whether the customer has ALREADY CONFIRMED this job's appointment.
 
-Answer "yes" ONLY if a comment states the confirmation ALREADY HAPPENED — someone spoke with the customer and the customer agreed to the scheduled time. Examples: "spoke with customer, confirmed", "customer confirmed for Tuesday", "confirmed via text".
+Answer "yes" ONLY if a comment states the confirmation ALREADY HAPPENED — someone spoke with the customer and the customer agreed to the scheduled time. Examples: "spoke with customer, confirmed", "customer confirmed for Tuesday", "confirmed via text", "Call Angelo to confirm monday is a go and he is planning for it! ", "
 
 Answer "no" if any of these hold:
 - There are NO comments at all. No comment means nobody has confirmed anything.
-- The comments only describe an INTENT, PLAN, TASK or REMINDER to confirm — not a confirmation that happened. Phrases like "call for confirm", "call to confirm", "schedule a call for confirm", "need to confirm", "please confirm", "follow up to confirm", "confirmation call scheduled" are all instructions/reminders. They mean the confirmation has NOT happened yet. This distinction is the single most important rule here — do not treat a plan to confirm as a confirmation.
+- The comments only describe an INTENT, PLAN, TASK or REMINDER to confirm — not a confirmation that happened. Phrases like "call for confirm", "call to confirm", "need to confirm", "please confirm", "follow up to confirm", "confirmation call scheduled" are all instructions/reminders. They mean the confirmation has NOT happened yet. This distinction is the single most important rule here — do not treat a plan to confirm as a confirmation.
 - A comment states the customer declined, cancelled, or asked to reschedule.
-
-Answer "unclear" ONLY when comments exist but genuinely say nothing either way about confirmation.
 
 RECENCY DECIDES. The comments are in chronological order; a later comment overrides an earlier one. If the customer confirmed on Monday but a later comment says they called to reschedule, the answer is "no". Judge by the LATEST relevant comment, not the first one you find.
 
