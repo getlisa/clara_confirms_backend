@@ -274,7 +274,8 @@ Check the current connection state. Returns whether credentials exist, whether t
     "startedAt": "2026-08-10T11:47:37.000Z",
     "lastSyncAt": "2026-08-10T10:12:04.000Z",
     "lastSyncStatus": "success",           // "success" | "failed" | null
-    "lastSyncError": null
+    "lastSyncError": null,
+    "lastRunAbandoned": false              // true = last run died mid-sync (see §4.4)
   }
 }
 
@@ -352,6 +353,17 @@ A cold company's first full sync was measured at **~9–10 minutes**. So on exac
 Query params: `full=true` (ignore cursors), `stream=true` (recommended), `range=week|month|3month` (default `month`, scopes the service-request window).
 
 The blocking form is kept only for back-compat with the existing button. Keep it *only* for incremental syncs on already-populated accounts, where runs are short.
+
+#### What `stream=true` does and does not fix
+
+It fixes the **reporting**: the UI stops claiming failure on a healthy sync, and you get live progress. It does **not** yet make a long sync *finish* on Vercel.
+
+The run is a background promise, and the serverless function is frozen once it responds — there is no `waitUntil`. So in stream mode the sync can die seconds after the `202`. Blocking mode instead survives to the `maxDuration: 300` cap. Neither reaches the ~9–10 minutes a cold account needs. A chunked/resumable cron-driven sync is the real fix and is not built yet.
+
+**Consequences you must handle:**
+- An interrupted sync **loses no data**. Fetch cursors advance only at the end and only for entities that completed, so the next run re-covers the missed window; all writes are idempotent upserts.
+- A run whose process died leaves partial data and never reports `done` or `failed`. Watch for `sync.lastRunAbandoned === true` on `/status` and show "last sync was interrupted — retry", rather than a spinner that never resolves.
+- Do **not** treat a missing `done` event as "still going" indefinitely. Trust `status.sync`, which applies a staleness check server-side.
 
 UX: see §7 — the "Sync now" button should now open a live progress view rather than a spinner that can time out.
 
@@ -650,6 +662,7 @@ Incremental syncs are now much cheaper than they used to be (the normalize phase
 - [ ] **Render the stage checklist** from the §7.2 table; drop any reference to `fetching_customers` / `fetching_technicians` (§7.2).
 - [ ] **Suppress empty states while `sync.syncing`** — show "Importing…" instead. Highest-value item: this is what makes a working sync look like data loss (§7.3).
 - [ ] **Poll `/status` on page load** and subscribe via `sync.runId` if a cron- or other-admin-started run is already in flight (§7.4).
+- [ ] **Handle `sync.lastRunAbandoned`** — show "last sync was interrupted — retry", not a spinner. A killed run never emits `done`/`failed` (§4.4).
 - [ ] **Re-fetch open lists on relevant `entity_done`** (or poll 3–5s) so rows appear progressively (§7.3).
 - [ ] **Treat a job with zero appointments as loading, not empty**, while syncing — jobs normalize before appointments (§7.3).
 

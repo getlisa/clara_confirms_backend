@@ -86,8 +86,14 @@ async function listRuns({ companyId, kind, limit = 20 }) {
   if (kind) { params.push(kind); where += ` AND kind = $${params.length}`; }
   params.push(limit);
   const r = await db.query(
+    // last_event_at is the `ts` of the most recent state_history entry — the
+    // run's heartbeat, used to tell a slow run from a dead one. Computed here
+    // rather than returning state_history, which is an unbounded JSONB array
+    // (hundreds of events on a real sync) and would make every status poll
+    // ship it. `-> -1` is the last element; NULL for a run with no events yet.
     `SELECT id, kind, current_state, status, result, error, started_at, finished_at,
-            last_event_seq
+            last_event_seq,
+            (state_history -> -1 ->> 'ts') AS last_event_at
        FROM engine_runs
       WHERE ${where}
       ORDER BY started_at DESC
@@ -132,7 +138,12 @@ async function reapStaleRuns(minutes = 30) {
             error = COALESCE(error, 'Abandoned — no completion recorded within ' || $1 || ' minutes (process most likely terminated mid-run)'),
             finished_at = NOW()
       WHERE status = 'running'
-        AND started_at < NOW() - ($1 || ' minutes')::interval
+        -- Silence, not age, is what identifies a dead run. Keying off
+        -- started_at alone would reap a healthy long sync (a cold company
+        -- measures ~9-10 min) that is still emitting events. Fall back to
+        -- started_at only when a run never recorded an event at all.
+        AND COALESCE((state_history -> -1 ->> 'ts')::timestamptz, started_at)
+              < NOW() - ($1 || ' minutes')::interval
       RETURNING id`,
     [String(minutes)]
   );

@@ -97,6 +97,23 @@ router.post("/login", async (req, res) => {
  * Best-effort: a failure here must not take down the connection check that is
  * this endpoint's actual job.
  */
+
+// A run whose process died leaves engine_runs.status = 'running' forever —
+// nothing writes a terminal status on a hard kill (Vercel freezing the
+// instance, the 300s function cap, a crash). The daily GC cron reaps those,
+// but "daily" means a dead run reports syncing = true for up to ~24h, and
+// clients are told to suppress empty states while syncing — so complete data
+// hides behind a permanent "Importing…". Observed in production: run 252 sat
+// in `normalizing` for over two hours after its process was gone.
+//
+// So don't trust `running` on its own: a run that has not recorded ANY
+// progress for this long is treated as dead on read. Compared against the last
+// event, not started_at — a genuinely slow sync keeps emitting state/fetched/
+// entity_done events, so it never trips this, while a dead one goes silent
+// immediately. The row is left alone (the GC cron owns writes); this only
+// affects what we report.
+const STALE_RUN_MS = 10 * 60 * 1000;
+
 async function buildSyncStatus(companyId) {
   try {
     const [state, runs] = await Promise.all([
@@ -104,12 +121,17 @@ async function buildSyncStatus(companyId) {
       enginesDb.listRuns({ companyId, kind: "crm_sync", limit: 1 }).catch(() => []),
     ]);
     const latest = runs[0] || null;
-    const running = latest && latest.status === "running";
+    const lastBeat = latest ? (latest.last_event_at || latest.started_at) : null;
+    const stale = lastBeat ? (Date.now() - new Date(lastBeat).getTime()) > STALE_RUN_MS : false;
+    const running = !!latest && latest.status === "running" && !stale;
     return {
-      syncing: !!running,
+      syncing: running,
       currentState: running ? latest.current_state : null,   // e.g. "normalizing"
       runId: running ? String(latest.id) : null,
       startedAt: running ? latest.started_at : null,
+      // Surfaced so a client can say "last sync was interrupted" instead of
+      // silently showing stale-but-complete-looking data.
+      lastRunAbandoned: !!latest && latest.status === "running" && stale,
       lastSyncAt: state?.last_sync_at ?? null,
       lastSyncStatus: state?.last_sync_status ?? null,
       lastSyncError: state?.last_sync_error ?? null,
