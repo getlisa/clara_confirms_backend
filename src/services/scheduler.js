@@ -184,7 +184,12 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
           dynVars.unconfirmed_count = String(jobCtx.counts.unconfirmed);
           dynVars.all_upcoming_confirmed = jobCtx.counts.all_confirmed ? "true" : "false";
           if (next) {
-            dynVars.next_service_line = next.service_line || jobCtx.job.title || "your upcoming visit";
+            // Every service on the visit, not just the first: an appointment
+            // bundling backflow + alarm + extinguisher + sprinkler used to be
+            // announced as "Backflow" alone. service_summary is the spoken
+            // form ("Backflow, Alarm Systems and Sprinkler").
+            dynVars.next_service_line =
+              next.service_summary || next.service_line || jobCtx.job.title || "your upcoming visit";
             dynVars.next_appointment_date = next.scheduled_start_spoken;
             dynVars.next_appointment_id = String(next.appointment_id);
             dynVars.next_technician = next.technician || "";
@@ -197,7 +202,12 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
             const MAX_INLINE = 8;
             const lines = upcoming.slice(0, MAX_INLINE).map((a) => {
               const bits = [`#${a.appointment_id}`, a.scheduled_start_spoken];
-              if (a.service_line) bits.push(`for ${a.service_line}`);
+              // Full per-service wording here (not the short spoken summary):
+              // this is reference context the agent reads, and it's what lets
+              // it match the right onsite-expectation entry.
+              const svc = a.service_names?.length ? a.service_names : a.service_lines;
+              if (svc?.length) bits.push(`for ${svc.join("; ")}`);
+              else if (a.service_line) bits.push(`for ${a.service_line}`);
               if (a.technician) bits.push(`with ${a.technician}`);
               bits.push(a.customer_confirmed ? "(confirmed)" : "(not yet confirmed)");
               return bits.join(" ");

@@ -21,9 +21,23 @@
 // without ever needing to see every date.
 const MAX_INLINE_UPCOMING = 8;
 
+/**
+ * ALL services on the visit, not just the first. One appointment routinely
+ * bundles several (backflow + alarm + extinguisher + sprinkler on one trip),
+ * and naming only the first understates what the customer is agreeing to and
+ * hides which onsite-expectation entry applies.
+ */
+function formatServices(a) {
+  const names = a.service_names?.length ? a.service_names : null;
+  const lines = a.service_lines?.length ? a.service_lines : (a.service_line ? [a.service_line] : []);
+  if (names) return `for ${names.join("; ")}`;
+  return lines.length ? `for ${lines.join("; ")}` : null;
+}
+
 function formatAppointment(a) {
   const parts = [a.scheduled_start_spoken];
-  if (a.service_line) parts.push(`for ${a.service_line}`);
+  const svc = formatServices(a);
+  if (svc) parts.push(svc);
   if (a.technician) parts.push(`with ${a.technician}`);
   parts.push(a.customer_confirmed ? "(confirmed)" : "(not yet confirmed)");
   return `- Appointment #${a.appointment_id}: ${parts.join(" ")}`;
@@ -37,7 +51,8 @@ function formatAppointment(a) {
  */
 function formatHistoryAppointment(a) {
   const parts = [a.scheduled_start_spoken];
-  if (a.service_line) parts.push(`for ${a.service_line}`);
+  const svc = formatServices(a);
+  if (svc) parts.push(svc);
   if (a.technician) parts.push(`with ${a.technician}`);
   parts.push(`(${a.status})`);
   return `- Appointment #${a.appointment_id}: ${parts.join(" ")}`;
@@ -175,8 +190,10 @@ function build(ctx, {
   if (serviceLineDescriptions.length) {
     lines.push(
       "",
-      "── SERVICE DETAILS (what a visit for each service line actually involves) ──",
-      "Use the one matching this visit's actual service line when the customer asks what the visit involves — match by reading the appointment's own service_line/job text above; don't guess if none clearly matches.",
+      "── ONSITE EXPECTATIONS — STATE THESE, DON'T WAIT TO BE ASKED ──",
+      "Every confirmation must tell the customer what to expect onsite: building access, noise, and rough duration. This is the note the site needs in order to prepare — giving tenants notice, unlocking units, expecting the panel to sound. A confirmation that skips it is incomplete, even if the customer never asks.",
+      "Pick the ONE entry matching this visit, by reading the appointment's own service_line/job text above. If the job covers several services, use the single combined entry (e.g. alarm + sprinkler) rather than reading two. If nothing clearly matches, describe the visit only in general terms — never invent access or noise specifics.",
+      "Work it into the confirmation naturally and briefly, in your own words. These are notes to convey, not a script to recite.",
       "",
       ...serviceLineDescriptions.flatMap((d) => [`${d.title}:`, d.description, ""])
     );

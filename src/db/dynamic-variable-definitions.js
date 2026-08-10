@@ -10,6 +10,12 @@ const db = require("./index");
 const VARIABLE_SEEDS = [
   // ── Routing ─────────────────────────────────────────────────────────────────
   { name: "call_type",           sort_order: 1,  resolved_from: "dispatcher.call_type",          description: "The slug of the call type (e.g. customer_confirmation, quotation_followup) — used by the branch router to pick the right subagent." },
+  // Referenced throughout customer_confirmation's prompt but currently set by
+  // nobody (the web-chat path is the LangGraph agent now, which doesn't use
+  // Retell prompts at all). Registered so it resolves to "" — which reads as
+  // "not a chat session", the correct branch — instead of rendering the
+  // literal "{{is_chat_session}}" into the prompt on every voice call.
+  { name: "is_chat_session",     sort_order: 2,  resolved_from: "unset — defaults to \"\" (voice)", description: "\"true\" only inside a Retell chat session; empty on a voice call, which is the branch every prompt should take." },
 
   // ── Company + agent identity (set on every call) ───────────────────────────
   { name: "company_name",        sort_order: 10, resolved_from: "default_dynamic_variables",     description: "The name of the company placing the call. Set once per company in the flow's default_dynamic_variables." },
@@ -23,6 +29,12 @@ const VARIABLE_SEEDS = [
   { name: "customer_name",       sort_order: 30, resolved_from: "scheduled_calls.customer_name",  description: "Customer's full name." },
   { name: "customer_address",    sort_order: 31, resolved_from: "scheduled_calls.customer_address", description: "Customer's address joined as a single string." },
   { name: "technician_name",     sort_order: 32, resolved_from: "scheduled_calls.technician_name", description: "Assigned technician's full name." },
+  // Bound at dispatch from the confirmation RECIPIENT when the row has one (a
+  // property manager etc.), else from the customer record — same resolution the
+  // web_chat branch makes. Both are conditional, so both need a "" default: the
+  // SERVICE LINK step reads {{customer_email}} directly.
+  { name: "customer_email",      sort_order: 33, resolved_from: "dispatcher (recipient snapshot, else customers.email, live at dispatch)", description: "Email already on file for whoever this call is with — presented for confirmation in the service-link step instead of asking blind. Blank when none is on file, which is the prompt's cue to ask." },
+  { name: "customer_phone",      sort_order: 34, resolved_from: "dispatcher (recipient snapshot, else customers.phone, live at dispatch)", description: "Phone already on file for whoever this call is with. Blank when none is on file." },
 
   // ── Job context ─────────────────────────────────────────────────────────────
   { name: "job_id",              sort_order: 40, resolved_from: "scheduled_calls.job_id",         description: "Numeric job ID (or 'quotation:N' for quotation calls). Required by all tools." },
@@ -55,8 +67,17 @@ const VARIABLE_SEEDS = [
   { name: "unconfirmed_count",      sort_order: 52, resolved_from: "job-confirmation-context (live at dispatch)", description: "How many of the upcoming appointments the customer has not confirmed yet." },
   { name: "all_upcoming_confirmed", sort_order: 53, resolved_from: "job-confirmation-context (live at dispatch)", description: "'true' when every upcoming appointment is already confirmed, else 'false'." },
   { name: "next_appointment_id",    sort_order: 54, resolved_from: "job-confirmation-context (live at dispatch)", description: "Appointment ID of the next upcoming visit — what confirm_appointment is called with when the customer confirms it." },
-  { name: "next_technician",        sort_order: 55, resolved_from: "job-confirmation-context (live at dispatch)", description: "Technician assigned to the next upcoming visit. Blank when none is assigned." },
-  { name: "upcoming_appointments",  sort_order: 56, resolved_from: "job-confirmation-context (live at dispatch)", description: "Pre-rendered list of the job's upcoming appointments, one per line (id, date, service line, technician, confirmed state). Capped at 8 with a '...plus N more' tail — the agent calls get_appointments to see beyond that." },
+  // These two carry the highest stakes of the whole set: they are interpolated
+  // into begin_message, the first thing said when the call connects, before any
+  // prompt logic or tool call can compensate. The dispatcher only sets them
+  // when the job HAS a next appointment, so a job with none (or a job context
+  // that failed to build) would otherwise open by speaking the literal text
+  // "{{next_service_line}}" at the customer. Registered = they resolve to "",
+  // and the prompt's "if these are empty, drop that clause" rule takes over.
+  { name: "next_appointment_date",  sort_order: 55, resolved_from: "job-confirmation-context (live at dispatch)", description: "Spoken date/time of the next upcoming visit, e.g. 'Thursday, May 28, 2026 at 10:00 AM'. Blank when no visit is booked — the opening line drops the clause that uses it." },
+  { name: "next_service_line",      sort_order: 56, resolved_from: "job-confirmation-context (live at dispatch)", description: "Service line of the next upcoming visit, falling back to the job title. Blank when no visit is booked — the opening line drops the clause that uses it." },
+  { name: "next_technician",        sort_order: 57, resolved_from: "job-confirmation-context (live at dispatch)", description: "Technician assigned to the next upcoming visit. Blank when none is assigned." },
+  { name: "upcoming_appointments",  sort_order: 58, resolved_from: "job-confirmation-context (live at dispatch)", description: "Pre-rendered list of the job's upcoming appointments, one per line (id, date, service line, technician, confirmed state). Capped at 8 with a '...plus N more' tail — the agent calls get_appointments to see beyond that." },
   { name: "total_amount",        sort_order: 60, resolved_from: "scheduled_calls.total_amount",   description: "Quotation total amount (string) — used in quotation_followup calls." },
 
   // ── Service opportunity follow-up ─────────────────────────────────────────────
