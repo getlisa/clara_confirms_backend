@@ -44,6 +44,41 @@ const MAX_COMMENTS = 3;
 const MAX_COMMENT_CHARS = 500;
 const MAX_PAST_APPOINTMENTS = 5;
 
+/** Distinct, non-empty, order-preserving. */
+function dedupe(values) {
+  return [...new Set(values.filter((v) => v != null && String(v).trim() !== ""))];
+}
+
+/**
+ * ServiceTrade service descriptions are free text and routinely carry
+ * dispatcher notes rather than a service name — job 33276 has
+ * "**MOVED TO AUG 2025 TO MAKE ON SAME SCHEDULE AS ALARM**\nAnnual Fire
+ * Sprinkler Inspection (1-wet)(1-dry)". Read aloud verbatim that is nonsense
+ * to a customer, so strip **…** note blocks, collapse the embedded newlines
+ * and trailing spaces, and keep what's left.
+ */
+function cleanServiceDescription(desc) {
+  if (!desc) return null;
+  const cleaned = String(desc)
+    .replace(/\*\*[^*]*\*\*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || null;
+}
+
+/** "Backflow / Fire Protection" -> "Backflow" (drop the trade suffix). */
+function headSegment(line) {
+  return String(line).split("/")[0].trim();
+}
+
+/** ["a","b","c"] -> "a, b and c" — spoken, not a comma-jammed list. */
+function spokenList(items) {
+  const v = dedupe(items);
+  if (v.length === 0) return null;
+  if (v.length === 1) return v[0];
+  return `${v.slice(0, -1).join(", ")} and ${v[v.length - 1]}`;
+}
+
 function isUpcoming(appt, now) {
   if (!appt || !UPCOMING_STATUSES.includes(appt.status)) return false;
   if (!appt.scheduled_start) return false;
@@ -134,7 +169,16 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
 
   // Built field-by-field, never spread from the DB row: raw ISO timestamps must
   // not reach an agent (it would read them aloud verbatim).
-  const shape = (appt, { isNext = false } = {}) => ({
+  const shape = (appt, { isNext = false } = {}) => {
+    const svc = Array.isArray(appt.services) ? appt.services : [];
+    // Every service on the visit, not just the first. A single appointment
+    // routinely bundles several (job 33276: backflow + fire alarm +
+    // extinguisher + sprinkler), and naming only services[0] told the customer
+    // about one of four — and left the agent unable to pick the combined
+    // onsite-expectation entry, which is keyed on the full set.
+    const lines = dedupe(svc.map((s) => s.service_line));
+    const detail = dedupe(svc.map((s) => cleanServiceDescription(s.description)));
+    return ({
     appointment_id: appt.id,
     status: appt.status,
     scheduled_start: appt.scheduled_start, // internal: sorting/derivation only
@@ -144,10 +188,23 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     technician_confirmed: appt.technician_confirmed === true,
     technician: appt.technician_name || null,
     technicians: techsByAppt.get(appt.id) || [],
+    // Kept as-is: existing callers (and the back-compat single-value dynamic
+    // variable) still read it. It is now explicitly "the first of", not "the".
     service_line: appt.service_line || jobServiceLines[0] || null,
+    // All of them. `service_lines` is the clean category list; `service_names`
+    // is the specific per-service wording ("Annual Fire Alarm Inspection"),
+    // which is what matches the onsite-expectation entries.
+    service_lines: lines.length ? lines : (jobServiceLines[0] ? [jobServiceLines[0]] : []),
+    service_names: detail,
+    // Short spoken form for the opening line: "Backflow, Alarm Systems,
+    // Portable Extinguishers and Sprinkler". Built from the category list
+    // rather than the descriptions, which carry trade suffixes, embedded
+    // newlines and scheduling notes that read badly aloud.
+    service_summary: spokenList(lines.map(headSegment)) || jobServiceLines[0] || null,
     services: appt.services || [],
     is_next: isNext,
   });
+  };
 
   const upcoming = upcomingRaw.map((a, i) => shape(a, { isNext: i === 0 }));
   const history = historyRaw.map((a) => shape(a));

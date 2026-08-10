@@ -21,9 +21,23 @@
 // without ever needing to see every date.
 const MAX_INLINE_UPCOMING = 8;
 
+/**
+ * ALL services on the visit, not just the first. One appointment routinely
+ * bundles several (backflow + alarm + extinguisher + sprinkler on one trip),
+ * and naming only the first understates what the customer is agreeing to and
+ * hides which onsite-expectation entry applies.
+ */
+function formatServices(a) {
+  const names = a.service_names?.length ? a.service_names : null;
+  const lines = a.service_lines?.length ? a.service_lines : (a.service_line ? [a.service_line] : []);
+  if (names) return `for ${names.join("; ")}`;
+  return lines.length ? `for ${lines.join("; ")}` : null;
+}
+
 function formatAppointment(a) {
   const parts = [a.scheduled_start_spoken];
-  if (a.service_line) parts.push(`for ${a.service_line}`);
+  const svc = formatServices(a);
+  if (svc) parts.push(svc);
   if (a.technician) parts.push(`with ${a.technician}`);
   parts.push(a.customer_confirmed ? "(confirmed)" : "(not yet confirmed)");
   return `- Appointment #${a.appointment_id}: ${parts.join(" ")}`;
@@ -37,7 +51,8 @@ function formatAppointment(a) {
  */
 function formatHistoryAppointment(a) {
   const parts = [a.scheduled_start_spoken];
-  if (a.service_line) parts.push(`for ${a.service_line}`);
+  const svc = formatServices(a);
+  if (svc) parts.push(svc);
   if (a.technician) parts.push(`with ${a.technician}`);
   parts.push(`(${a.status})`);
   return `- Appointment #${a.appointment_id}: ${parts.join(" ")}`;
