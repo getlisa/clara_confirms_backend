@@ -173,6 +173,7 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
         address: [c.address_line1, c.city, c.state, c.zipcode].filter(Boolean).join(", ") || null,
       },
       technician: t.name ? { name: t.name, phone: t.phone ?? null } : null,
+      location_name: job.location_name ?? null,
       comments,
       notes,
       contacts: opts.includeContacts ? (job.contacts || []) : undefined,
@@ -213,6 +214,14 @@ function toDynamicVariables(ctx) {
     job_comments: job.comments.length
       ? truncate(job.comments.slice(0, MAX_COMMENTS).join(" | "), MAX_COMMENT_CHARS)
       : "none",
+    // The opening line greets the site: "Hi {{location_name}}, this is …".
+    // Falls back to the customer rather than going blank — most jobs have no
+    // location row, and "Hi , this is Clara" is a worse first impression than
+    // a slightly generic one. Only emitted when SOMETHING is known, so the
+    // registered "" default still applies when neither is.
+    ...((job.location_name || job.customer?.name)
+      ? { location_name: job.location_name || job.customer.name }
+      : {}),
   };
 }
 

@@ -254,10 +254,15 @@ async function getJobById(id, companyId) {
             c.address_line1, c.city, c.state, c.zipcode,
             t.first_name || ' ' || t.last_name AS technician_name,
             t.phone         AS technician_phone,
-            t.email         AS technician_email
+            t.email         AS technician_email,
+            l.name          AS location_name
      FROM jobs j
      JOIN customers c  ON c.id = j.customer_id
      LEFT JOIN technicians t ON t.id = j.technician_id
+     -- LEFT JOIN, folded into the existing read rather than a second query:
+     -- this sits on the voice-dispatch path, where an extra round trip is
+     -- ~250ms of dead air before the agent can speak.
+     LEFT JOIN locations l   ON l.id = j.location_id
      WHERE j.id = $1 AND j.company_id = $2`,
     [id, companyId]
   );
@@ -282,6 +287,7 @@ async function getJobById(id, companyId) {
       phone: row.technician_phone,
       email: row.technician_email ?? null,
     } : null,
+    location_name: row.location_name ?? null,
   };
 
   // All appointments for this job (full history)
