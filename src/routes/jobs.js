@@ -93,7 +93,12 @@ router.get("/", async (req, res) => {
     // status/job_type/customer_id/location_id all accept a single value or a
     // comma-separated list — jobsDb.listJobs handles both the same way, so a
     // single status=scheduled request behaves exactly as it always has.
-    const jobs = await jobsDb.listJobs(companyId, {
+    // Clamped here, and reused for totalPages below — computing pages from the
+    // raw query param would disagree with the page size actually applied.
+    const limitNum  = limit  ? Math.min(Number(limit), 200) : 50;
+    const offsetNum = offset ? Number(offset) : 0;
+
+    const { rows: jobs, total } = await jobsDb.listJobs(companyId, {
       status:            status || undefined,
       jobType:           job_type || undefined,
       customerId:        customer_id || undefined,
@@ -105,12 +110,23 @@ router.get("/", async (req, res) => {
       dueSoonDays:       due_soon != null ? Number(due_soon) : undefined,
       confirmed:         confirmed === "true" ? true : confirmed === "false" ? false : undefined,
       search:            search || undefined,
-      limit:             limit  ? Math.min(Number(limit), 200) : 50,
-      offset:            offset ? Number(offset) : 0,
+      limit:             limitNum,
+      offset:            offsetNum,
     });
 
     // const jobsWithAppointments = jobs.filter((j) => j.active_appointment != null);
-    return res.json({ jobs: jobs.map((j) => localizeJob(j, tz)) });
+    return res.json({
+      jobs: jobs.map((j) => localizeJob(j, tz)),
+      // Additive — the `jobs` array is unchanged, so existing clients are
+      // unaffected. Same shape as GET /customers. totalPages floors at 1 so an
+      // empty result reports one (empty) page rather than 0.
+      pagination: {
+        total,
+        limit: limitNum,
+        offset: offsetNum,
+        totalPages: Math.max(Math.ceil(total / limitNum), 1),
+      },
+    });
   } catch (err) {
     logger.error("GET /jobs failed", { error: err.message });
     return res.status(500).json({ error: "Failed to load jobs" });

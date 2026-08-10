@@ -118,15 +118,36 @@ async function listJobs(companyId, {
   // upcoming appointments as a set (any unconfirmed upcoming => not
   // confirmed), not just the single "active" appointment used for display.
   if (confirmed === true || confirmed === false) {
-    const cmp = confirmed ? "= 0" : "> 0";
-    conditions.push(`(
-      SELECT COUNT(*) FROM appointments up
-       WHERE up.job_id = j.id AND up.company_id = j.company_id
-         AND up.status = ANY($${i++}::varchar[])
-         AND up.scheduled_start > NOW()
-         AND COALESCE(up.customer_confirmed, false) = false
-    ) ${cmp}`);
+    // One param, referenced by both subqueries below.
+    const p = i++;
     values.push(UPCOMING_APPOINTMENT_STATUSES);
+
+    // "Outstanding" (booked, not completed/cancelled, regardless of start
+    // time) — the SAME definition job-confirmation-status.js derives
+    // jobs.status from. These must agree: with a future-only test here, a job
+    // whose confirmed visit had already started showed status 'confirmed' but
+    // was missing from ?confirmed=true.
+    const outstanding = `SELECT 1 FROM appointments up
+       WHERE up.job_id = j.id AND up.company_id = j.company_id
+         AND up.status = ANY($${p}::varchar[])`;
+    const unconfirmedCount = `SELECT COUNT(*) FROM appointments up
+       WHERE up.job_id = j.id AND up.company_id = j.company_id
+         AND up.status = ANY($${p}::varchar[])
+         AND COALESCE(up.customer_confirmed, false) = false`;
+
+    if (confirmed) {
+      // The EXISTS is load-bearing. "Zero unconfirmed outstanding
+      // appointments" is VACUOUSLY true for a job with none outstanding, so
+      // without it confirmed=true returned jobs nobody ever confirmed — every
+      // visit simply completed. Measured before this guard: company 4 had
+      // 435 matches, 435 of them vacuous (zero genuine); company 9 had 27, of
+      // which 10 were vacuous.
+      conditions.push(`EXISTS (${outstanding}) AND (${unconfirmedCount}) = 0`);
+    } else {
+      // No EXISTS needed: a non-zero unconfirmed count already implies at
+      // least one outstanding appointment.
+      conditions.push(`(${unconfirmedCount}) > 0`);
+    }
   }
   if (search) {
     conditions.push(`(j.title ILIKE $${i} OR c.full_name ILIKE $${i})`);
@@ -134,8 +155,14 @@ async function listJobs(companyId, {
     i++;
   }
 
-  values.push(limit, offset);
-  const result = await db.query(
+  const where = conditions.join(" AND ");
+
+  // `values` deliberately does NOT get limit/offset appended — they're spread
+  // into the rows query only. The count query has no LIMIT/OFFSET, so sharing
+  // a mutated array would leave it with two extra params and throw on every
+  // filtered request.
+  const [result, countResult] = await Promise.all([
+    db.query(
     `SELECT j.*,
             c.full_name       AS customer_name,
             c.phone           AS customer_phone,
@@ -158,12 +185,33 @@ async function listJobs(companyId, {
        WHERE ap.job_id = j.id AND ap.status NOT IN ('cancelled','rescheduled')
        ORDER BY ap.scheduled_start DESC LIMIT 1
      ) a ON true
-     WHERE ${conditions.join(" AND ")}
+     WHERE ${where}
      ORDER BY j.scheduled_date ASC NULLS LAST, j.created_at DESC
-     LIMIT $${i++} OFFSET $${i}`,
-    values
-  );
-  return result.rows.map((row) => ({
+     LIMIT $${i} OFFSET $${i + 1}`,
+      [...values, limit, offset]
+    ),
+    // JOIN customers is required, not optional: it's an INNER join, so it can
+    // exclude jobs (a job whose customer row is missing), and `search` filters
+    // on c.full_name. Without it `total` could exceed the rows actually
+    // returnable, or the count would fail outright on a search.
+    //
+    // The LEFT JOIN LATERAL is deliberately omitted — it only populates
+    // active_appointment and can neither exclude nor duplicate rows, so it's
+    // pure cost here.
+    //
+    // COUNT(*) rather than COUNT(DISTINCT j.id): both appointment-based
+    // filters (the scheduled_date window and `confirmed`) are written as
+    // EXISTS / scalar subqueries, so there is exactly one row per job.
+    db.query(
+      `SELECT COUNT(*)::int AS n
+         FROM jobs j
+         JOIN customers c ON c.id = j.customer_id
+        WHERE ${where}`,
+      values
+    ),
+  ]);
+
+  const rows = result.rows.map((row) => ({
     ...jobRow(row),
     customer_name:             row.customer_name ?? null,
     customer_phone:            row.customer_phone ?? null,
@@ -179,6 +227,8 @@ async function listJobs(companyId, {
       technician_confirmed: row.technician_confirmed,
     } : null,
   }));
+
+  return { rows, total: countResult.rows[0].n };
 }
 
 // Distinct job types actually present for this company — the sync ingests up

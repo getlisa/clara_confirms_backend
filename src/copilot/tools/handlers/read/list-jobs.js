@@ -14,7 +14,9 @@ const schema = z.object({
 
 async function run({ status, customer_id, search, due_soon_days, limit }, config) {
   const companyId = config?.configurable?.ctx?.companyId;
-  const rows = await jobsDb.listJobs(companyId, {
+  // listJobs returns {rows, total} — `total` is the count before limit, which
+  // this tool doesn't surface (it reports how many it's showing).
+  const { rows } = await jobsDb.listJobs(companyId, {
     status: status || undefined,
     customerId: customer_id || undefined,
     search: search || undefined,

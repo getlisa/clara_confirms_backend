@@ -21,6 +21,7 @@ const db              = require("../../../db");
 const normalize       = require("./normalize");
 const callSettingsDb  = require("../../../db/call-settings");
 const { inferJobConfirmations } = require("../../job-confirmation-inference");
+const { syncAllJobStatuses } = require("../../job-confirmation-status");
 const logger          = require("../../../utils/logger");
 
 class ServiceTradeProvider extends CrmProvider {
@@ -284,6 +285,18 @@ class ServiceTradeProvider extends CrmProvider {
 
     counts.appointmentServices = await this._normalizeAppointmentServices(companyId, engine);
     if (engine) await engine.emit("entity_done", { entity: "appointment_services", count: counts.appointmentServices });
+
+    // Derive jobs.status from the appointments that now exist. Runs LAST, and
+    // unconditionally (not watermark-filtered): the jobs passes above write
+    // jobs.status straight from ServiceTrade's own status, which would
+    // otherwise clobber this on every sync. It also has to come after the
+    // second jobs pass, not just after appointments, for the same reason.
+    //
+    // Not scoped by the watermark because a job's derived status can change
+    // without the job row itself changing — an appointment completing or
+    // being confirmed is a change to a different table.
+    counts.jobStatusesDerived = await syncAllJobStatuses(companyId);
+    if (engine) await engine.emit("entity_done", { entity: "job_statuses", count: counts.jobStatusesDerived });
 
     // Advance the watermark ONLY here — reached only if every pass above
     // completed. If any threw, normalizeAll propagates and this line never
