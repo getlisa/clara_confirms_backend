@@ -865,6 +865,11 @@ async function deleteAllSyncData(companyId) {
   await db.query("DELETE FROM servicetrade_change_orders       WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_deficiencies        WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_service_lines       WHERE company_id = $1", [companyId]);
+  // Before servicetrade_jobs — job comments are the largest raw table on a
+  // real account (734 rows for 164 jobs) and were missed when the table was
+  // added, so a "delete synced data" left them behind and the next sync
+  // re-upserted on top of stale rows.
+  await db.query("DELETE FROM servicetrade_job_comments        WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_appointments WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_jobs         WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_locations    WHERE company_id = $1", [companyId]);

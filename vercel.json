@@ -35,7 +35,7 @@
     },
     {
       "path": "/admin/engines/gc",
-      "schedule": "0 3 * * *"
+      "schedule": "17 * * * *"
     }
   ]
 }
