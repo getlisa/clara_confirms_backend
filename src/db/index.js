@@ -198,18 +198,28 @@ class Database {
    *   NOT NULL"). Callers pass literals only; never interpolate user input.
    * @returns {Promise<Array<object>>}
    */
-  async fetchAllByCompanyChunked(companyId, table, { columns = "*", chunkSize = 50, extraWhere = null } = {}) {
+  async fetchAllByCompanyChunked(companyId, table, { columns = "*", chunkSize = 50, extraWhere = null, updatedSince = null } = {}) {
     const all = [];
     let lastId = 0;
     let queryCount = 0;
     const start = Date.now();
     while (true) {
+      // updatedSince is a bound parameter rather than folded into extraWhere:
+      // callers pass a timestamp read out of the database, and interpolating
+      // it into the SQL string would make this an injection surface for no
+      // benefit.
+      const params = [companyId, lastId];
+      let sinceClause = "";
+      if (updatedSince) {
+        params.push(updatedSince);
+        sinceClause = ` AND updated_at > $${params.length}`;
+      }
       const { rows } = await this.query(
         `SELECT ${columns} FROM ${table}
-          WHERE company_id = $1 AND id > $2${extraWhere ? ` AND ${extraWhere}` : ""}
+          WHERE company_id = $1 AND id > $2${sinceClause}${extraWhere ? ` AND ${extraWhere}` : ""}
           ORDER BY id
           LIMIT ${chunkSize}`,
-        [companyId, lastId]
+        params
       );
       queryCount++;
       all.push(...rows);
@@ -223,7 +233,8 @@ class Database {
       lastId = next;
     }
     logger.info("fetchAllByCompanyChunked: table fetched", {
-      table, companyId, rows: all.length, chunkSize, queries: queryCount, durationMs: Date.now() - start,
+      table, companyId, rows: all.length, chunkSize, queries: queryCount,
+      durationMs: Date.now() - start, ...(updatedSince ? { updatedSince } : {}),
     });
     return all;
   }
