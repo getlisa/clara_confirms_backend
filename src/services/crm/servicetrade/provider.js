@@ -162,12 +162,15 @@ class ServiceTradeProvider extends CrmProvider {
     counts.jobs        = await this._normalizeJobs(companyId, engine, rawJobs, contactDedupe);
     if (engine) await engine.emit("entity_done", { entity: "jobs", count: counts.jobs });
 
-    await this._normalizeJobOffices(companyId, rawJobs);
-    await this._normalizeJobTags(companyId, rawJobs);
-    counts.schedulingComments = await this._normalizeSchedulingComments(companyId, rawJobs);
-    counts.jobNotes           = await this._normalizeJobNotes(companyId, rawJobs);
-    counts.jobComments        = await this._normalizeJobComments(companyId);
-
+    // Appointments run IMMEDIATELY after jobs, before the comment/note passes
+    // below. Every write here is committed on its own (nothing wraps the sync
+    // in a transaction), so the platform is readable mid-sync — which means
+    // the ORDER of these passes is user-visible. With appointments last, a
+    // job appeared with zero visits while ~1.7k comments normalized in
+    // between; on a real account that window ran over a minute and reads as
+    // data loss rather than "still loading". Appointments only need jobsMap
+    // and techniciansMap, both already populated above, so moving this up is
+    // safe and closes that window to near-zero.
     const rawAppointments = await db.fetchAllByCompanyChunked(companyId, "servicetrade_appointments");
 
     counts.appointments = await this._normalizeAppointments(companyId, engine, rawAppointments);
@@ -176,6 +179,12 @@ class ServiceTradeProvider extends CrmProvider {
     await this._normalizeAppointmentTechnicians(companyId, rawAppointments);
     await this._normalizeAppointmentOffices(companyId, rawAppointments);
     counts.appointmentNotes = await this._normalizeAppointmentNotes(companyId, rawAppointments);
+
+    await this._normalizeJobOffices(companyId, rawJobs);
+    await this._normalizeJobTags(companyId, rawJobs);
+    counts.schedulingComments = await this._normalizeSchedulingComments(companyId, rawJobs);
+    counts.jobNotes           = await this._normalizeJobNotes(companyId, rawJobs);
+    counts.jobComments        = await this._normalizeJobComments(companyId);
 
     // Infer confirmation status from ServiceTrade's own human-entered
     // comments/notes (just normalized above) — off by default per company,

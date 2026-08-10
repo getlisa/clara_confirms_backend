@@ -81,8 +81,48 @@ router.post("/login", async (req, res) => {
 });
 
 /**
+ * Sync state for the status response: whether one is running right now, and
+ * how the last one ended.
+ *
+ * This exists because the platform is READABLE MID-SYNC — nothing wraps the
+ * sync in a transaction, so each batch commits as it goes and rows appear
+ * progressively. Without this, a client that loads during a sync sees a
+ * partially-populated account with no way to tell "still importing" from
+ * "this is everything", which reads as data loss.
+ *
+ * `syncing` comes from engine_runs rather than servicetrade_sync_state
+ * because sync_state is only written when a run *finishes* — an in-flight (or
+ * killed) run leaves no trace there.
+ *
+ * Best-effort: a failure here must not take down the connection check that is
+ * this endpoint's actual job.
+ */
+async function buildSyncStatus(companyId) {
+  try {
+    const [state, runs] = await Promise.all([
+      syncDb.getSyncState(companyId).catch(() => null),
+      enginesDb.listRuns({ companyId, kind: "crm_sync", limit: 1 }).catch(() => []),
+    ]);
+    const latest = runs[0] || null;
+    const running = latest && latest.status === "running";
+    return {
+      syncing: !!running,
+      currentState: running ? latest.current_state : null,   // e.g. "normalizing"
+      runId: running ? String(latest.id) : null,
+      startedAt: running ? latest.started_at : null,
+      lastSyncAt: state?.last_sync_at ?? null,
+      lastSyncStatus: state?.last_sync_status ?? null,
+      lastSyncError: state?.last_sync_error ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * GET /integrations/servicetrade/status
  * Check connection using stored auth_code (no password). If token invalid, user must connect again.
+ * Also reports sync progress so a client can tell partial data from complete data.
  */
 router.get("/status", async (req, res) => {
   const companyId = req.user.companyId;
@@ -103,6 +143,7 @@ router.get("/status", async (req, res) => {
         connected: true,
         user: session.user,
         hasCredentials: true,
+        sync: await buildSyncStatus(companyId),
       });
     }
 
