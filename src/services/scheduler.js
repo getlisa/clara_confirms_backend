@@ -128,7 +128,12 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         call_type:    row.call_type,
         current_date: now.toLocaleDateString("en-US", { timeZone: callTz, weekday: "long", year: "numeric", month: "long", day: "numeric" }),
         current_time: now.toLocaleTimeString("en-US", { timeZone: callTz, hour: "2-digit", minute: "2-digit", hour12: true }),
-        ...(row.customer_name    && { customer_name:    row.customer_name }),
+        // Address the actual recipient by name when this row is for a
+        // confirmation contact (a property manager, etc.), not the customer
+        // — same substitution the web_chat/sms branches below already make
+        // for their own delivery text, just missing here for the live
+        // voice-call path until now.
+        ...((row.recipient_name || row.customer_name) && { customer_name: row.recipient_name || row.customer_name }),
         ...(row.technician_name  && { technician_name:  row.technician_name }),
         ...(row.customer_address && { customer_address: row.customer_address }),
         ...(row.job_date && { job_date: new Date(row.job_date).toLocaleDateString("en-US", { weekday:"long", month:"long", day:"numeric", year:"numeric" }) }),
@@ -157,10 +162,70 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         const jobCtx = await buildJobConfirmationContext(row.company_id, row.job_id, { tz: callTz });
         if (jobCtx.ok) {
           Object.assign(dynVars, toDynamicVariables(jobCtx));
+
+          // ── Appointment facts, pre-bound for the OPENING ──────────────
+          // Retell binds dynamic variables once at call creation, so these
+          // are a snapshot — the same staleness tradeoff job_comments
+          // already accepts. That's fine for opening the call, and it's what
+          // removes get_appointments from the critical path: the agent can
+          // name the real service/date/count in its first breath instead of
+          // stalling on a tool round-trip while the customer waits.
+          //
+          // Anything that CHANGES mid-call (after a confirm/reschedule/
+          // cancel) must still come from get_appointments — the prompt says
+          // so explicitly. These are for the opening, not a replacement for
+          // live state.
+          //
+          // Computed from the jobCtx this dispatcher already builds above —
+          // no extra query, no added dispatch latency.
+          const next = jobCtx.appointments.next;
+          const upcoming = jobCtx.appointments.upcoming;
+          dynVars.upcoming_count = String(jobCtx.counts.upcoming);
+          dynVars.unconfirmed_count = String(jobCtx.counts.unconfirmed);
+          dynVars.all_upcoming_confirmed = jobCtx.counts.all_confirmed ? "true" : "false";
+          if (next) {
+            dynVars.next_service_line = next.service_line || jobCtx.job.title || "your upcoming visit";
+            dynVars.next_appointment_date = next.scheduled_start_spoken;
+            dynVars.next_appointment_id = String(next.appointment_id);
+            dynVars.next_technician = next.technician || "";
+          }
+          // One flat line per upcoming appointment — dynamic variables are
+          // strings, so the list is pre-rendered here rather than asking the
+          // model to format a JSON blob mid-call. Capped: this rides in
+          // every turn's context, and a recurring-service job can have 30+.
+          if (upcoming.length) {
+            const MAX_INLINE = 8;
+            const lines = upcoming.slice(0, MAX_INLINE).map((a) => {
+              const bits = [`#${a.appointment_id}`, a.scheduled_start_spoken];
+              if (a.service_line) bits.push(`for ${a.service_line}`);
+              if (a.technician) bits.push(`with ${a.technician}`);
+              bits.push(a.customer_confirmed ? "(confirmed)" : "(not yet confirmed)");
+              return bits.join(" ");
+            });
+            if (upcoming.length > MAX_INLINE) {
+              lines.push(`...plus ${upcoming.length - MAX_INLINE} more — call get_appointments to see the rest.`);
+            }
+            dynVars.upcoming_appointments = lines.join("\n");
+          }
         } else {
           logger.warn("Dispatcher: job confirmation context unavailable, falling back to flat row vars", {
             scheduledCallId: row.id, jobId: row.job_id, code: jobCtx.code,
           });
+        }
+
+        // Known email/phone — same recipient-vs-customer resolution the
+        // web_chat branch below already does — so the agent can present it
+        // for confirmation in the SERVICE LINK step instead of asking blind.
+        if (row.recipient_contact_id != null) {
+          if (row.recipient_email) dynVars.customer_email = row.recipient_email;
+          if (row.phone_number) dynVars.customer_phone = row.phone_number;
+        } else {
+          const { rows: custContactRows } = await db.query(
+            `SELECT c.email, c.phone FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = $1 AND j.company_id = $2`,
+            [row.job_id, row.company_id]
+          );
+          if (custContactRows[0]?.email) dynVars.customer_email = custContactRows[0].email;
+          if (custContactRows[0]?.phone) dynVars.customer_phone = custContactRows[0].phone;
         }
       }
 

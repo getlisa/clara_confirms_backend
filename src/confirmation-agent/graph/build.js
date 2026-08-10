@@ -33,6 +33,7 @@ const prompt = require("./prompt");
 const { getToolsForPhase, byName } = require("../tools/registry");
 const { buildJobConfirmationContext } = require("../../services/job-confirmation-context");
 const { logCall } = require("../../db/llm-call-logs");
+const serviceLineDescriptionsDb = require("../../db/service-line-descriptions");
 const db = require("../../db");
 const logger = require("../../utils/logger");
 
@@ -45,6 +46,10 @@ const ConfirmationState = Annotation.Root({
   // already confirmed by a DIFFERENT recipient's separate conversation —
   // see resolveConfirmedByOther below.
   confirmedByOtherLabel: Annotation({ reducer: (_prev, next) => next, default: () => null }),
+  // Company's reference descriptions of what a visit for each service line
+  // actually involves (see migrations/084) — small, static-ish company data,
+  // cheap to refresh alongside jobCtx every turn.
+  serviceLineDescriptions: Annotation({ reducer: (_prev, next) => next ?? _prev, default: () => [] }),
 });
 
 function phaseFromContext(ctx) {
@@ -94,7 +99,8 @@ async function buildGraph() {
     const { companyId, jobId, threadId, linkAppointmentId } = config?.configurable?.ctx || {};
     const ctx = await buildJobConfirmationContext(companyId, jobId);
     const confirmedByOtherLabel = await resolveConfirmedByOther(companyId, linkAppointmentId, threadId);
-    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel };
+    const serviceLineDescriptions = await serviceLineDescriptionsDb.listByCompany(companyId);
+    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions };
   }
 
   async function agentNode(state, config) {
@@ -109,7 +115,15 @@ async function buildGraph() {
     // field of its own — phase is a separate Annotation this graph computes
     // alongside it (phaseFromContext) — so it must be merged in explicitly;
     // prompt.js's phase-specific branches read `ctx.phase`.
-    const sys = new SystemMessage(prompt.build({ ...state.jobCtx, phase: state.phase }, { companyName: ctx.companyName, isOpeningTurn, confirmedByOtherLabel: state.confirmedByOtherLabel }));
+    const sys = new SystemMessage(prompt.build({ ...state.jobCtx, phase: state.phase }, {
+      companyName: ctx.companyName,
+      isOpeningTurn,
+      confirmedByOtherLabel: state.confirmedByOtherLabel,
+      serviceLineDescriptions: state.serviceLineDescriptions,
+      recipientName: ctx.recipientName,
+      recipientEmail: ctx.recipientEmail,
+      recipientPhone: ctx.recipientPhone,
+    }));
     const message = await invokeWithFailover(tools, [sys, ...state.messages], config, ctx);
 
     // The human message that triggered THIS call — only present when this is
@@ -171,7 +185,8 @@ async function buildGraph() {
     const { companyId, jobId, threadId, linkAppointmentId } = config?.configurable?.ctx || {};
     const ctx = await buildJobConfirmationContext(companyId, jobId);
     const confirmedByOtherLabel = await resolveConfirmedByOther(companyId, linkAppointmentId, threadId);
-    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel };
+    const serviceLineDescriptions = await serviceLineDescriptionsDb.listByCompany(companyId);
+    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions };
   }
 
   const checkpointer = await getCheckpointer();

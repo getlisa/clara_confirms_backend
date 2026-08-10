@@ -20,7 +20,17 @@ const db = require("../db");
 const { syncJobConfirmationStatus } = require("./job-confirmation-status");
 const logger = require("../utils/logger");
 
-const OPENAI_MODEL = "gpt-4o-mini";
+// gpt-4.1-mini: chosen for latency. Inference runs once per job with an
+// unconfirmed upcoming appointment, and the loop below is sequential, so
+// per-call time directly sets how much of a sync slice this phase consumes.
+//
+// This is a deliberate step back toward a mini model after an earlier move to
+// gpt-4o (which was made because a mini model's verdicts looked off). The
+// classification rules in buildPrompt below — action-vs-fact ("call for
+// confirm" is NOT a confirmation), recency-wins, no-comments-means-no — were
+// re-verified against this model before switching; keep that check in mind if
+// the model changes again, since those distinctions are the whole point.
+const OPENAI_MODEL = "gpt-4.1-mini";
 // Only a high-confidence "yes" auto-confirms — a wrong inference here
 // silently suppresses a real confirmation dispatch, so this stays
 // conservative.
@@ -42,9 +52,13 @@ const CONFIRMATION_SCHEMA = {
   },
 };
 
-/** scheduling_comments + job_notes + this job's appointment_notes, oldest first. */
+/**
+ * Every comment source for a job, oldest first: ServiceTrade's real
+ * /comment stream (job_comments — usually the substantive one), plus the
+ * job's schedulingComments/notes and its appointments' notes.
+ */
 async function fetchJobComments(companyId, jobId, appointmentIds) {
-  const [comments, notes, apptNotes] = await Promise.all([
+  const [comments, notes, apptNotes, jobComments] = await Promise.all([
     db.query(
       `SELECT content, created_at FROM scheduling_comments
         WHERE company_id = $1 AND job_id = $2 AND content IS NOT NULL AND content <> ''
@@ -65,12 +79,22 @@ async function fetchJobComments(companyId, jobId, appointmentIds) {
           [companyId, appointmentIds]
         )
       : { rows: [] },
+    // ServiceTrade's real per-job comment stream. `commented_at` is
+    // ServiceTrade's own `created`, not our sync time — the ordering below
+    // is only meaningful because of that.
+    db.query(
+      `SELECT content, author_name, commented_at FROM job_comments
+        WHERE company_id = $1 AND job_id = $2 AND content IS NOT NULL AND content <> ''
+        ORDER BY commented_at ASC`,
+      [companyId, jobId]
+    ),
   ]);
 
   return [
     ...comments.rows.map((r) => ({ source: "scheduling_comment", type: null, text: r.content, created_at: r.created_at })),
     ...notes.rows.map((r) => ({ source: "job_note", type: r.type ?? null, text: r.text, created_at: r.created_at })),
     ...apptNotes.rows.map((r) => ({ source: "appointment_note", type: r.type ?? null, text: r.text, created_at: r.created_at })),
+    ...jobComments.rows.map((r) => ({ source: "comment", type: r.author_name ? `by ${r.author_name}` : null, text: r.content, created_at: r.commented_at })),
   ].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 }
 
@@ -80,19 +104,29 @@ function buildPrompt({ jobNumber, customerName, comments }) {
     .join("\n");
   return `Job #${jobNumber} for customer "${customerName ?? "unknown"}".
 
-Comments and notes on this job, oldest first:
+Comments and notes on this job, OLDEST FIRST (each line is prefixed with its timestamp):
 ${commentLines || "(none)"}
 
-Based ONLY on the comments and notes above, decide whether the customer has confirmed this job/appointment.
-- "yes" if a comment clearly states the customer confirmed (e.g. spoke to customer, confirmed via call/text/email).
-- "no" if a comment clearly states the customer declined, cancelled, or asked to reschedule.
-- "unclear" if there are no comments, or nothing in them addresses confirmation status.
-Quote the specific comment text that supports your answer in "evidence" (or null if unclear).`;
+Decide, based ONLY on the comments above, whether the customer has ALREADY CONFIRMED this job's appointment.
+
+Answer "yes" ONLY if a comment states the confirmation ALREADY HAPPENED — someone spoke with the customer and the customer agreed to the scheduled time. Examples: "spoke with customer, confirmed", "customer confirmed for Tuesday", "confirmed via text".
+
+Answer "no" if any of these hold:
+- There are NO comments at all. No comment means nobody has confirmed anything.
+- The comments only describe an INTENT, PLAN, TASK or REMINDER to confirm — not a confirmation that happened. Phrases like "call for confirm", "call to confirm", "schedule a call for confirm", "need to confirm", "please confirm", "follow up to confirm", "confirmation call scheduled" are all instructions/reminders. They mean the confirmation has NOT happened yet. This distinction is the single most important rule here — do not treat a plan to confirm as a confirmation.
+- A comment states the customer declined, cancelled, or asked to reschedule.
+
+Answer "unclear" ONLY when comments exist but genuinely say nothing either way about confirmation.
+
+RECENCY DECIDES. The comments are in chronological order; a later comment overrides an earlier one. If the customer confirmed on Monday but a later comment says they called to reschedule, the answer is "no". Judge by the LATEST relevant comment, not the first one you find.
+
+Quote the exact comment text driving your answer in "evidence" (or null if unclear).`;
 }
 
 async function analyzeJob(openai, { jobNumber, customerName, comments }) {
   const completion = await openai.chat.completions.create({
     model: OPENAI_MODEL,
+    temperature: 0, // deterministic classification — same input should give the same verdict every run
     messages: [
       { role: "system", content: "You audit field-service job comments to determine customer confirmation status. Be conservative — only say yes/no when the comments say so explicitly." },
       { role: "user", content: buildPrompt({ jobNumber, customerName, comments }) },
@@ -136,13 +170,30 @@ async function inferJobConfirmations(companyId) {
       const appointmentIds = apptRows.map((r) => r.id);
 
       const comments = await fetchJobComments(companyId, jobId, appointmentIds);
-      if (comments.length === 0) continue;
 
       const { rows: existingRows } = await db.query(
         `SELECT comment_count FROM job_confirmation_assessments WHERE company_id = $1 AND job_id = $2`,
         [companyId, jobId]
       );
-      if (existingRows[0]?.comment_count === comments.length) continue;
+      if (existingRows.length && existingRows[0].comment_count === comments.length) continue;
+
+      // No comments at all ⇒ not confirmed, recorded as a real assessment
+      // rather than skipped. No LLM call needed — the answer is definitional,
+      // and this is the most common case, so it also keeps cost near zero.
+      if (comments.length === 0) {
+        await db.query(
+          `INSERT INTO job_confirmation_assessments
+             (company_id, job_id, confirmed, confidence, reasoning, evidence, comment_count, checked_at)
+           VALUES ($1, $2, 'no', 1, 'No comments or notes on this job — nothing indicates the customer confirmed.', NULL, 0, NOW())
+           ON CONFLICT (company_id, job_id) DO UPDATE SET
+             confirmed = 'no', confidence = 1,
+             reasoning = 'No comments or notes on this job — nothing indicates the customer confirmed.',
+             evidence = NULL, comment_count = 0, checked_at = NOW()`,
+          [companyId, jobId]
+        );
+        assessed++;
+        continue;
+      }
 
       const { rows: jobInfoRows } = await db.query(
         `SELECT j.job_number, c.full_name AS customer_name

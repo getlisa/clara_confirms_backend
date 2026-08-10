@@ -83,6 +83,27 @@ const logger        = require("../utils/logger");
 
 const RETRY_ATTEMPTS = 3;
 const RETRY_BASE_MS  = 2000;
+
+// How many ServiceTrade requests are in flight at once for the per-entity
+// fetches (job detail, appointments-per-job, comments-per-job, customer
+// record, contact roster). A full sync is dominated by these — roughly
+// 3 calls per job plus 2 per distinct customer — and each one is a mostly-idle
+// network wait, so raising this shortens wall time close to linearly until
+// ServiceTrade starts pushing back.
+//
+// Measured on a real account (40 jobs, /comment fetch, run in both ascending
+// and descending order to cancel out the cold-connection penalty that
+// otherwise flatters whichever level runs first):
+//   5 → ~4200ms   10 → ~2100-3700ms   15 → ~1650-1940ms   20 → ~1500ms
+// Zero 429s at every level and identical row counts throughout, so 15 is
+// ~2.4x faster than 5 with 20 showing clear diminishing returns.
+//
+// Caveat: that was a 40-call burst. A full sync is ~3 calls/job + 2/customer
+// (~770 for a 180-job account), and ServiceTrade's sustained-rate behaviour
+// is NOT verified — if 429s start appearing, drop this via env rather than
+// editing code. requestWithRetry already backs off exponentially on 429/5xx,
+// so an over-aggressive value degrades into retries rather than lost data.
+const API_CONCURRENCY = Math.max(1, Number(process.env.SERVICETRADE_SYNC_CONCURRENCY) || 15);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ── HTTP with retry ─────────────────────────────────────────────────────────
@@ -470,6 +491,31 @@ function mapServiceLineRow(sl) {
   return { servicetrade_id: Number(sl.id), name: sl.name ?? null, trade: sl.trade ?? null, abbr: sl.abbr ?? null, icon: sl.icon ?? null, payload: sl };
 }
 
+// ServiceTrade's entity type for a Job on /comment — mirrors the seeded
+// servicetrade_entity_type_config row (entity_key='job'). Inlined here
+// rather than read from the DB: this runs inside the per-job fetch loop, and
+// the value is a fixed part of ServiceTrade's API contract, not tenant config.
+const ENTITY_TYPE_JOB = 3;
+
+/**
+ * One /comment row → raw table row. `payload` keeps the whole comment
+ * (content/created/updated/author/visibility/pinned) for the normalize step.
+ *
+ * The job id comes from the comment's OWN `entity.id` when present, not the
+ * job we happened to query by: the same comment id is sometimes returned
+ * under more than one job (verified — 2 of 259 across a 25-job sample), and
+ * `entity` is the authoritative owner. Falling back to the queried id keeps
+ * this safe if the field is ever missing.
+ */
+function mapJobCommentRow(c, servicetradeJobId) {
+  if (!c || c.id == null) return null;
+  return {
+    servicetrade_id:     String(c.id),
+    servicetrade_job_id: String(c.entity?.id ?? servicetradeJobId),
+    payload:             c,
+  };
+}
+
 function mapDeficiencyRow(d) {
   return { servicetrade_id: Number(d.id), ref_number: d.refNumber ?? null, name: d.name ?? null, description: d.description ?? null, payload: d };
 }
@@ -646,7 +692,7 @@ async function runSync(companyId, options = {}) {
     customers: 0, jobs: 0, appointments: 0, technicians: 0, locations: 0, contacts: 0, offices: 0, tags: 0,
     users: 0, projects: 0,
     serviceRequests: 0, serviceLines: 0, deficiencies: 0, changeOrders: 0, contracts: 0, serviceRecurrences: 0,
-    appointmentServiceLines: 0, appointmentServiceRequests: 0,
+    appointmentServiceLines: 0, appointmentServiceRequests: 0, jobComments: 0,
   };
   // Tracks which entities' fetches ran to completion this pass — an entity's
   // cursor only advances if its own fetch was complete (see fetchAllPages doc).
@@ -686,7 +732,7 @@ async function runSync(companyId, options = {}) {
     if (jobStubs.length) {
       if (engine) await engine.transition("fetching_job_details", { count: jobStubs.length });
       logger.info("ServiceTrade sync: fetching job details", { companyId, count: jobStubs.length });
-      const jobDetailResults = await mapWithConcurrency(jobStubs, 5, async (j) => {
+      const jobDetailResults = await mapWithConcurrency(jobStubs, API_CONCURRENCY, async (j) => {
         const res = await requestWithRetry(companyId, "GET", `/job/${j.id}`, {}, credentials);
         return res.ok ? flattenJobDetail(res.data) : null;
       });
@@ -777,7 +823,7 @@ async function runSync(companyId, options = {}) {
       // failed lookup just keeps the lightweight stub rather than failing
       // the whole sync (mapCustomerRow already tolerates missing fields).
       const distinctCustomerIds = Array.from(customersById.keys());
-      const enrichedCustomers = await mapWithConcurrency(distinctCustomerIds, 5, async (custId) => {
+      const enrichedCustomers = await mapWithConcurrency(distinctCustomerIds, API_CONCURRENCY, async (custId) => {
         const res = await requestWithRetry(companyId, "GET", `/company/${custId}`, {}, credentials);
         return res.ok && res.data ? [custId, res.data] : null;
       });
@@ -795,10 +841,27 @@ async function runSync(companyId, options = {}) {
       // invisible without this call. One request per DISTINCT customer seen
       // this run (not per job) — a customer with 50 jobs still costs exactly
       // 1 call.
-      for (const [custId, customer] of customersById) {
-        const { rows: companyContacts, complete: contactsComplete } = await fetchAllPages(
-          companyId, "/contact", "contacts", credentials, { companyId: String(custId) }
-        );
+      // Fetch every customer's roster concurrently, then apply the results
+      // serially below. The fetch is pure I/O and parallelises cleanly; the
+      // loop body is NOT safe to parallelise — it mutates shared
+      // contactsById/contactLinksById state, and linkContact's
+      // read-modify-write on those Maps would interleave. Splitting the two
+      // keeps the mutation order byte-identical to the old sequential
+      // version (mapWithConcurrency preserves input order in its results)
+      // while overlapping the network waits, which were previously fully
+      // serial — one round trip per customer, the slowest thing in the sync.
+      const contactRosters = await mapWithConcurrency(
+        Array.from(customersById.entries()),
+        API_CONCURRENCY,
+        async ([custId, customer]) => {
+          const { rows, complete } = await fetchAllPages(
+            companyId, "/contact", "contacts", credentials, { companyId: String(custId) }
+          );
+          return { custId, customer, rows, complete };
+        }
+      );
+
+      for (const { custId, customer, rows: companyContacts, complete: contactsComplete } of contactRosters) {
         if (!contactsComplete) {
           logger.warn("ServiceTrade: customer contact roster fetch incomplete", { companyId, customerId: custId });
         }
@@ -887,7 +950,7 @@ async function runSync(companyId, options = {}) {
       if (engine) await engine.transition("fetching_appointments", { count: jobs.length });
       logger.info("ServiceTrade sync: fetching appointments per job", { companyId, jobs: jobs.length });
       let appointmentsIncomplete = false;
-      const perJobAppts = await mapWithConcurrency(jobs, 5, async (j) => {
+      const perJobAppts = await mapWithConcurrency(jobs, API_CONCURRENCY, async (j) => {
         const { rows, sideLoad, complete: ok } = await fetchAllPagesWithSideLoad(companyId, "/appointment", "appointments", credentials, { jobId: String(j.id) });
         if (!ok) appointmentsIncomplete = true;
         return rows.map((a) => flattenAppointmentEntry(a, sideLoad));
@@ -957,13 +1020,69 @@ async function runSync(companyId, options = {}) {
       }
     }
 
+    // --- Job comments (/comment?entityType=3&entityId={job}) ---------------
+    // ServiceTrade's REAL comment stream. /job/{id}'s notes[]/schedulingComments[]
+    // are routinely empty even on jobs with a full comment history (verified
+    // live), so this endpoint is the only way to see what CSRs/techs actually
+    // wrote — which is what job confirmation inference reads
+    // (services/job-confirmation-inference.js).
+    //
+    // entityType 3 = Job (servicetrade_entity_type_config). No updatedAfter
+    // filter exists on /comment, so there's no cursor: the work is naturally
+    // scoped to whichever jobs this run's incremental job fetch returned.
+    // A failed page only drops that job's comments for this pass — it does
+    // NOT mark the jobs cursor incomplete, since jobs themselves synced fine
+    // and the next run re-fetches comments for whatever jobs come back then.
+    if (jobs.length) {
+      if (engine) await engine.transition("fetching_job_comments", { count: jobs.length });
+      logger.info("ServiceTrade sync: fetching job comments", { companyId, jobs: jobs.length });
+      const jobCommentEntityType = String(ENTITY_TYPE_JOB);
+      const perJobComments = await mapWithConcurrency(jobs, API_CONCURRENCY, async (j) => {
+        const { rows } = await fetchAllPages(companyId, "/comment", "comments", credentials, {
+          entityType: jobCommentEntityType,
+          entityId: String(j.id),
+          sort: "created",
+        });
+        return rows.map((c) => mapJobCommentRow(c, j.id)).filter(Boolean);
+      });
+      // Keyed by comment id, not just flattened: the same comment can come
+      // back under more than one job's fetch, and a duplicate
+      // servicetrade_id inside one batch INSERT makes Postgres error with
+      // "ON CONFLICT DO UPDATE command cannot affect row a second time" —
+      // the same de-dupe every other entity here already does.
+      const commentRowsById = new Map();
+      for (const row of perJobComments.flat()) commentRowsById.set(row.servicetrade_id, row);
+      const commentRows = Array.from(commentRowsById.values());
+      if (commentRows.length) {
+        await syncDb.upsertJobCommentsBatch(companyId, commentRows);
+        counts.jobComments = commentRows.length;
+      }
+      logger.info("ServiceTrade sync: wrote job comments", {
+        companyId, table: "servicetrade_job_comments", count: counts.jobComments,
+      });
+      if (engine) await engine.emit("fetched", { entity: "job_comments", count: counts.jobComments });
+    }
+
     // --- Service requests + embedded sub-objects (/servicerequest) ---------
-    // Kept deliberately: a service request with no job is structurally
-    // invisible to /job and /appointment?jobId= (it isn't linked to a job at
-    // all), so this is the only way to discover one — the basis of
-    // service_opportunities. Everything else /servicerequest touches
-    // (serviceLine/deficiency/changeOrder/contract/serviceRecurrence, plus
-    // job/location stubs for FK-resolvability) is unchanged.
+    // DISABLED. This standalone fetch existed to discover job-less service
+    // requests (structurally invisible to /job and /appointment?jobId=) —
+    // the basis of service_opportunities, whose normalize step is now also
+    // removed (see crm/servicetrade/provider.js's normalizeAll).
+    //
+    // Appointment-linked service requests are UNAFFECTED: the /appointment
+    // fetch above already writes them into the same
+    // servicetrade_service_requests table (with servicetrade_appointment_id
+    // set), which is exactly what _normalizeAppointmentServices reads —
+    // so appointment_services, and the service_line it feeds into both
+    // agents' context, keep working.
+    //
+    // Side effect of disabling this: the fan-out below was the only source
+    // for servicetrade_deficiencies / _change_orders / _contracts /
+    // _service_recurrences, so those stop refreshing too. Their only reader
+    // outside the sync is db/service-opportunities.js — i.e. the same
+    // service-opportunity feature already left on stale data — so nothing
+    // else degrades. Re-enable by uncommenting this block.
+    /*
     if (engine) await engine.transition("fetching_service_requests", { full });
     logger.info("ServiceTrade sync: fetching service requests", { companyId, range });
     const { rows: serviceRequests, complete: serviceRequestsComplete } = await fetchAllPages(companyId, "/servicerequest", "servicerequests", credentials,
@@ -1027,6 +1146,7 @@ async function runSync(companyId, options = {}) {
     if (engine) {
       await engine.emit("fetched", { entity: "serviceRequests", count: counts.serviceRequests });
     }
+    */
 
     // Bump cursors to "now" ONLY for entities whose fetch actually completed —
     // an incomplete entity keeps its old cursor so the next incremental run's
@@ -1044,7 +1164,14 @@ async function runSync(companyId, options = {}) {
       last_sync_error:               incomplete.length ? `Incomplete entities (cursor not advanced): ${incomplete.join(", ")}` : null,
       last_jobs_updated_at:          complete.jobs          ? now : undefined,
       last_appointments_updated_at:  complete.appointments  ? now : undefined,
-      last_service_requests_updated_at: complete.serviceRequests ? now : undefined,
+      // Deliberately NOT advanced while the /servicerequest fetch is disabled
+      // above: bumping a cursor for an entity we never fetched would mean a
+      // future re-enable resumes past everything that changed in the
+      // meantime, silently losing it. Frozen here, so re-enabling picks up
+      // from where the fetch actually last ran. (Not marked "incomplete" —
+      // that's for genuine fetch failures, and would write a misleading
+      // last_sync_error on every run.)
+      last_service_requests_updated_at: undefined,
     });
 
     if (incomplete.length) {

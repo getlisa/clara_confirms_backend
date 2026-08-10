@@ -43,8 +43,15 @@ function formatHistoryAppointment(a) {
   return `- Appointment #${a.appointment_id}: ${parts.join(" ")}`;
 }
 
-function build(ctx, { companyName, isOpeningTurn = false, confirmedByOtherLabel = null } = {}) {
-  const customerName = ctx.job.customer?.name || "the customer";
+function build(ctx, {
+  companyName, isOpeningTurn = false, confirmedByOtherLabel = null,
+  serviceLineDescriptions = [], recipientName = null, recipientEmail = null, recipientPhone = null,
+} = {}) {
+  // Address whoever this conversation is actually WITH — a different named
+  // contact (e.g. a property manager, migration 081) when one is set, else
+  // the customer themself. Getting this right matters: "Hi [customer name]"
+  // to a property manager who isn't the customer reads as a mistake.
+  const customerName = recipientName || ctx.job.customer?.name || "the customer";
   const jobName = ctx.job.title || "job";
   const lines = [
     `You are a friendly, professional scheduling assistant working on behalf of ${companyName || "the company"}, texting/messaging with ${customerName} about their ${jobName}.`,
@@ -121,7 +128,8 @@ function build(ctx, { companyName, isOpeningTurn = false, confirmedByOtherLabel 
       // Deterministic, exact template — built here in code from real data,
       // not left to the model to phrase (this is what "state driven, not
       // LLM-improvised" means applied to the greeting itself).
-      const greeting = `Hi ${customerName}, this request is regarding your upcoming appointment on ${nextUnconfirmed.scheduled_start_spoken} with ${companyName || "us"}${nextUnconfirmed.service_line ? ` regarding ${nextUnconfirmed.service_line}` : ""}.`;
+      const serviceRequest = nextUnconfirmed.services?.[0]?.description || ctx.job.description || null;
+      const greeting = `Hi ${customerName}, this request is regarding your upcoming appointment on ${nextUnconfirmed.scheduled_start_spoken} with ${companyName || "us"}${nextUnconfirmed.service_line ? ` regarding ${nextUnconfirmed.service_line}` : ""}${serviceRequest ? ` (${serviceRequest})` : ""}.`;
       lines.push(
         "── YOUR OPENING MESSAGE ──",
         `This is the first message in this conversation — send EXACTLY this as your opening line, verbatim, word for word: "${greeting}" Then, in the same message, ask them to confirm this appointment.`,
@@ -164,13 +172,30 @@ function build(ctx, { companyName, isOpeningTurn = false, confirmedByOtherLabel 
     }
   }
 
+  if (serviceLineDescriptions.length) {
+    lines.push(
+      "",
+      "── SERVICE DETAILS (what a visit for each service line actually involves) ──",
+      "Use the one matching this visit's actual service line when the customer asks what the visit involves — match by reading the appointment's own service_line/job text above; don't guess if none clearly matches.",
+      "",
+      ...serviceLineDescriptions.flatMap((d) => [`${d.title}:`, d.description, ""])
+    );
+  }
+
   lines.push(
     "",
     "── SIGNALING A DECISION EARLY ──",
     "The instant the customer clearly says they want to confirm, reschedule, or cancel — before you've collected the details needed to actually do it (like a new date) — call report_customer_intent with that intent. This lets the chat UI respond immediately; call the real action tool afterward once you have what you need.",
     "",
     "── SERVICE LINK (offer only after at least one appointment is confirmed) ──",
-    "Ask if they'd like a link to track this job. If yes, ask ONLY for their email first and call resolve_service_link_contact with just that email — do not ask for name/role unless that tool responds with status 'need_more_info'. Once resolved, the link itself displays automatically to the customer — call get_service_link and do not paste any URL yourself.",
+    "Ask if they'd like a link to track this job. If yes:",
+    recipientEmail
+      ? `You already have an email on file: ${recipientEmail}. Present it instead of asking blind — e.g. "I have your email on file as ${recipientEmail} — is that still the best one to use?" Use it if they confirm; if they give a different one, use that instead.`
+      : "Ask for their email — you don't have one on file for this conversation.",
+    "Call resolve_service_link_contact with that email — do not ask for name/role unless that tool responds with status 'need_more_info'. Once resolved, the link itself displays automatically to the customer — call get_service_link and do not paste any URL yourself.",
+    recipientPhone
+      ? `You also have a phone number on file (${recipientPhone}) — you may pass it as the phone argument to resolve_service_link_contact too, no need to ask for it separately.`
+      : null,
     "",
     "── ENDING THE CONVERSATION ──",
     "Once everything above is resolved, don't just wrap up — ask once whether there's anything else they need help with (e.g. \"Is there anything else I can help you with?\"). If they raise something new, handle it, then ask again before ending.",
