@@ -39,6 +39,10 @@ const SYNC_STATE_COLUMNS = [
   "last_locations_updated_at",
   "last_service_requests_created_at",
   "last_service_requests_updated_at",
+  // Watermark for the NORMALIZE phase (raw -> platform tables), distinct from
+  // the fetch cursors above (which track ServiceTrade's own updated stamps).
+  // See migrations/086_normalize_watermark.sql.
+  "last_normalized_at",
 ];
 
 async function getSyncState(companyId) {

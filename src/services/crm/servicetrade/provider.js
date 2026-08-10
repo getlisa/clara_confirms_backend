@@ -98,7 +98,7 @@ class ServiceTradeProvider extends CrmProvider {
    * location_tags junctions depend on offices/tags), then locations, then
    * technicians, then jobs, then appointments (depend on both).
    */
-  async normalizeAll(companyId, { engine = null } = {}) {
+  async normalizeAll(companyId, { engine = null, full = false } = {}) {
     const counts = {
       customers: 0, technicians: 0, crmUsers: 0, projects: 0, jobs: 0, appointments: 0,
       contacts: 0, offices: 0, tags: 0, locations: 0,
@@ -108,7 +108,49 @@ class ServiceTradeProvider extends CrmProvider {
       confirmationAssessments: 0,
     };
 
-    counts.customers   = await this._normalizeCustomers(companyId, engine);
+    // ── Incremental normalize ──────────────────────────────────────────────
+    // Without this, every run re-read and re-upserted a company's ENTIRE
+    // dataset even when a single job had changed — on a 180-job account that
+    // is ~180 jobs + ~440 appointments + ~1,200 contacts + ~1,700 comments
+    // rewritten for nothing, which dominated sync wall time on a remote
+    // pooled connection.
+    //
+    // `sinceTs` filters the high-volume passes to raw rows touched since the
+    // last successful normalize. `runStartedAt` (not NOW() at the end) becomes
+    // the new watermark, so rows written by a concurrent sync *during* this
+    // normalize stay above it and are picked up next run rather than skipped.
+    //
+    // full=true ignores the watermark entirely — the escape hatch for
+    // rebuilding platform tables from raw after a schema/mapping change.
+    const runStartedAt = new Date().toISOString();
+    const syncState = await stSyncDb.getSyncState(companyId).catch(() => null);
+    let sinceTs = full ? null : (syncState?.last_normalized_at ?? null);
+
+    // Self-healing: filtering by raw `updated_at` is only safe if a row's FK
+    // targets already existed when it was last written. They usually do (jobs
+    // normalize before appointments, appointments before their services), but
+    // ordering across RUNS isn't guaranteed: a raw appointment can land in one
+    // sync while its job only arrives in the next. That first run writes
+    // job_id = NULL, and because the raw row never changes again, no
+    // incremental run would ever revisit it — the NULL becomes permanent.
+    //
+    // So before trusting the watermark, look for platform rows whose FK is
+    // NULL but whose raw reference resolves NOW. Any hit means a previous run
+    // stranded something, and this run promotes itself to full to repair it.
+    // Costs one indexed query; only ever fires when there is real damage.
+    if (sinceTs) {
+      const stranded = await this._countStrandedRefs(companyId).catch(() => 0);
+      if (stranded > 0) {
+        logger.warn("ServiceTradeProvider: stranded FKs found — forcing full normalize", { companyId, stranded });
+        sinceTs = null;
+      }
+    }
+
+    logger.info("ServiceTradeProvider: normalize mode", {
+      companyId, mode: sinceTs ? "incremental" : "full", since: sinceTs,
+    });
+
+    counts.customers   = await this._normalizeCustomers(companyId, engine, { updatedSince: sinceTs });
     if (engine) await engine.emit("entity_done", { entity: "customers", count: counts.customers });
 
     // Raw jobs are read here rather than just before _normalizeJobs because
@@ -131,7 +173,7 @@ class ServiceTradeProvider extends CrmProvider {
     // and/or on a location. Everything else is classified "general".
     const primaryContactRefs = await this._collectPrimaryContactRefs(companyId, rawJobs, contactDedupe);
 
-    counts.contacts    = await this._normalizeContacts(companyId, engine, contactDedupe, primaryContactRefs);
+    counts.contacts    = await this._normalizeContacts(companyId, engine, contactDedupe, primaryContactRefs, { updatedSince: sinceTs });
     if (engine) await engine.emit("entity_done", { entity: "contacts", count: counts.contacts });
 
     counts.offices     = await this._normalizeOffices(companyId, engine);
@@ -140,7 +182,7 @@ class ServiceTradeProvider extends CrmProvider {
     counts.tags        = await this._normalizeTags(companyId, engine);
     if (engine) await engine.emit("entity_done", { entity: "tags", count: counts.tags });
 
-    counts.locations   = await this._normalizeLocations(companyId, engine, contactDedupe);
+    counts.locations   = await this._normalizeLocations(companyId, engine, contactDedupe, { updatedSince: sinceTs });
     if (engine) await engine.emit("entity_done", { entity: "locations", count: counts.locations });
 
     await this._normalizeLocationOffices(companyId);
@@ -159,7 +201,7 @@ class ServiceTradeProvider extends CrmProvider {
     // First jobs pass: resolves customer/owner/salesperson/office/project.
     // contract_id/current_appointment_id resolve to null here (contracts and
     // appointments don't exist yet) — a second pass at the end backfills them.
-    counts.jobs        = await this._normalizeJobs(companyId, engine, rawJobs, contactDedupe);
+    counts.jobs        = await this._normalizeJobs(companyId, engine, rawJobs, contactDedupe, { updatedSince: sinceTs });
     if (engine) await engine.emit("entity_done", { entity: "jobs", count: counts.jobs });
 
     // Appointments run IMMEDIATELY after jobs, before the comment/note passes
@@ -171,7 +213,11 @@ class ServiceTradeProvider extends CrmProvider {
     // data loss rather than "still loading". Appointments only need jobsMap
     // and techniciansMap, both already populated above, so moving this up is
     // safe and closes that window to near-zero.
-    const rawAppointments = await db.fetchAllByCompanyChunked(companyId, "servicetrade_appointments");
+    // Watermark-filtered: every appointment pass below (the appointment rows
+    // themselves plus the technician/office/note junctions) is scoped to one
+    // appointment at a time, so an appointment that hasn't changed keeps the
+    // rows it already has. Unchanged ones are simply left alone.
+    const rawAppointments = await db.fetchAllByCompanyChunked(companyId, "servicetrade_appointments", { updatedSince: sinceTs });
 
     counts.appointments = await this._normalizeAppointments(companyId, engine, rawAppointments);
     if (engine) await engine.emit("entity_done", { entity: "appointments", count: counts.appointments });
@@ -184,7 +230,7 @@ class ServiceTradeProvider extends CrmProvider {
     await this._normalizeJobTags(companyId, rawJobs);
     counts.schedulingComments = await this._normalizeSchedulingComments(companyId, rawJobs);
     counts.jobNotes           = await this._normalizeJobNotes(companyId, rawJobs);
-    counts.jobComments        = await this._normalizeJobComments(companyId);
+    counts.jobComments        = await this._normalizeJobComments(companyId, { updatedSince: sinceTs });
 
     // Infer confirmation status from ServiceTrade's own human-entered
     // comments/notes (just normalized above) — off by default per company,
@@ -213,7 +259,7 @@ class ServiceTradeProvider extends CrmProvider {
     counts.contracts           = await this._normalizeContracts(companyId, engine);
     if (engine) await engine.emit("entity_done", { entity: "contracts", count: counts.contracts });
 
-    counts.serviceRecurrences  = await this._normalizeServiceRecurrences(companyId, engine);
+    counts.serviceRecurrences  = await this._normalizeServiceRecurrences(companyId, engine, { updatedSince: sinceTs });
     if (engine) await engine.emit("entity_done", { entity: "service_recurrences", count: counts.serviceRecurrences });
 
     // Second jobs pass: contract_id (from _normalizeContracts, just above)
@@ -221,9 +267,9 @@ class ServiceTradeProvider extends CrmProvider {
     // only resolve now that both tables are populated. Raw job rows
     // themselves haven't changed since the first pass — reuse rawJobs
     // instead of re-scanning servicetrade_jobs a second time.
-    await this._normalizeJobs(companyId, engine, rawJobs, contactDedupe);
+    await this._normalizeJobs(companyId, engine, rawJobs, contactDedupe, { updatedSince: sinceTs });
 
-    counts.serviceRequests = await this._normalizeServiceRequests(companyId, engine);
+    counts.serviceRequests = await this._normalizeServiceRequests(companyId, engine, { updatedSince: sinceTs });
     if (engine) await engine.emit("entity_done", { entity: "service_requests", count: counts.serviceRequests });
 
     // Service-opportunity sync removed by request — service_requests/
@@ -239,11 +285,23 @@ class ServiceTradeProvider extends CrmProvider {
     counts.appointmentServices = await this._normalizeAppointmentServices(companyId, engine);
     if (engine) await engine.emit("entity_done", { entity: "appointment_services", count: counts.appointmentServices });
 
+    // Advance the watermark ONLY here — reached only if every pass above
+    // completed. If any threw, normalizeAll propagates and this line never
+    // runs, so the next attempt re-covers the same window. Redoing work is
+    // free (every write is an idempotent upsert); skipping it silently would
+    // leave platform tables permanently behind raw.
+    //
+    // Stamped with runStartedAt rather than "now" so anything a concurrent
+    // sync wrote mid-normalize stays above the watermark and is picked up next
+    // run instead of being missed.
+    await stSyncDb.updateSyncState(companyId, { last_normalized_at: runStartedAt })
+      .catch((err) => logger.warn("ServiceTradeProvider: failed to advance normalize watermark", { companyId, error: err.message }));
+
     return counts;
   }
 
-  async _normalizeCustomers(companyId, engine = null) {
-    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_customers");
+  async _normalizeCustomers(companyId, engine = null, { updatedSince = null } = {}) {
+    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_customers", { updatedSince });
     const argsList = raw.map((row) => normalize.normalizeCustomer(row, { companyId })).filter(Boolean);
     const n = await bulkUpsertCustomers(companyId, argsList);
     logger.info("ServiceTradeProvider: normalized customers", { companyId, count: n });
@@ -283,10 +341,19 @@ class ServiceTradeProvider extends CrmProvider {
     return refs;
   }
 
-  async _normalizeContacts(companyId, engine = null, dedupe = null, primaryRefs = null) {
+  async _normalizeContacts(companyId, engine = null, dedupe = null, primaryRefs = null, { updatedSince = null } = {}) {
     const { canonicalRows, dropped } =
       dedupe || dedupeContactsByEmail(await db.fetchAllByCompanyChunked(companyId, "servicetrade_contacts"));
-    const argsList = canonicalRows
+    // Dedupe runs over EVERY contact (above) so the surviving record is
+    // chosen identically run to run — picking a different winner would
+    // duplicate contacts and corrupt the contact_companies/contact_locations
+    // junctions the confirmation-recipients feature depends on. Only the
+    // WRITE set is watermark-filtered. `dropped` deletions below are NOT
+    // filtered: a merge-away must always be applied.
+    const writeRows = updatedSince
+      ? canonicalRows.filter((r) => r.updated_at && new Date(r.updated_at) > new Date(updatedSince))
+      : canonicalRows;
+    const argsList = writeRows
       .map((row) => normalize.normalizeContact(row, {
         companyId,
         isPrimary: primaryRefs ? primaryRefs.has(String(row.servicetrade_id)) : false,
@@ -321,8 +388,8 @@ class ServiceTradeProvider extends CrmProvider {
     return argsList.length;
   }
 
-  async _normalizeLocations(companyId, engine = null, dedupe = null) {
-    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_locations");
+  async _normalizeLocations(companyId, engine = null, dedupe = null, { updatedSince = null } = {}) {
+    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_locations", { updatedSince });
     // Bulk-fetch both FK maps ONCE instead of one lookup query per row.
     const [customersMap, contactsMap] = await Promise.all([
       db.fetchExternalRefMap(companyId, "customers"),
@@ -479,8 +546,20 @@ class ServiceTradeProvider extends CrmProvider {
    * Called TWICE by normalizeAll — contract_id/current_appointment_id only
    * resolve on the second call, once contracts/appointments exist.
    */
-  async _normalizeJobs(companyId, engine = null, rawJobs = null, dedupe = null) {
-    const raw = rawJobs || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_jobs"));
+  async _normalizeJobs(companyId, engine = null, rawJobs = null, dedupe = null, { updatedSince = null } = {}) {
+    const rawAll = rawJobs || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_jobs"));
+    // The caller keeps the FULL job list (it feeds primaryContactRefs, job
+    // offices and job tags, all of which reason across every job), so the
+    // watermark is applied to the WRITE set only — unchanged jobs keep the
+    // rows they already have.
+    //
+    // Safe despite this method's second backfill pass: contract_id and
+    // current_appointment_id both come from the job's own payload, so if
+    // either changed, ServiceTrade touched the job row and it is above the
+    // watermark anyway.
+    const raw = updatedSince
+      ? rawAll.filter((r) => r.updated_at && new Date(r.updated_at) > new Date(updatedSince))
+      : rawAll;
     const [customersMap, crmUsersMap, officesMap, projectsMap, contractsMap, appointmentsMap, locationsMap, contactsMap] = await Promise.all([
       db.fetchExternalRefMap(companyId, "customers"),
       db.fetchExternalRefMap(companyId, "crm_users"),
@@ -603,9 +682,10 @@ class ServiceTradeProvider extends CrmProvider {
    * which drives the recency logic in job-confirmation-inference.js — stays
    * stable across syncs.
    */
-  async _normalizeJobComments(companyId) {
+  async _normalizeJobComments(companyId, { updatedSince = null } = {}) {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_job_comments", {
       columns: "id, servicetrade_id, servicetrade_job_id, payload",
+      updatedSince,
     });
     const jobsMap = await db.fetchExternalRefMap(companyId, "jobs");
     // De-duped by comment id for the same reason as scheduling comments —
@@ -743,6 +823,35 @@ class ServiceTradeProvider extends CrmProvider {
     return rows.length;
   }
 
+  /**
+   * Count platform rows left with a NULL FK that the raw side can resolve now.
+   * Guards incremental normalize — see the call site in normalizeAll.
+   *
+   * Only covers the FK-resolving passes that are watermark-filtered
+   * (appointments.job_id, job_comments.job_id); passes that always read every
+   * raw row can't strand anything. Casts are needed because the raw mirrors
+   * store ids as bigint/text while platform `external_ref` is varchar.
+   */
+  async _countStrandedRefs(companyId) {
+    const { rows } = await db.query(
+      `SELECT
+         (SELECT count(*) FROM appointments a
+            JOIN servicetrade_appointments ra
+              ON ra.company_id = a.company_id AND ra.servicetrade_id::text = a.external_ref
+            JOIN jobs j
+              ON j.company_id = a.company_id AND j.external_ref = ra.servicetrade_job_id::text
+           WHERE a.company_id = $1 AND a.job_id IS NULL)
+       + (SELECT count(*) FROM job_comments c
+            JOIN servicetrade_job_comments rc
+              ON rc.company_id = c.company_id AND rc.servicetrade_id = c.external_ref
+            JOIN jobs j
+              ON j.company_id = c.company_id AND j.external_ref = rc.servicetrade_job_id
+           WHERE c.company_id = $1 AND c.job_id IS NULL) AS n`,
+      [companyId]
+    );
+    return Number(rows[0]?.n || 0);
+  }
+
   async _normalizeServiceLines(companyId, engine = null) {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_service_lines");
     const argsList = raw.map((row) => normalize.normalizeServiceLine(row, { companyId })).filter(Boolean);
@@ -775,8 +884,8 @@ class ServiceTradeProvider extends CrmProvider {
     return argsList.length;
   }
 
-  async _normalizeServiceRecurrences(companyId, engine = null) {
-    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_service_recurrences");
+  async _normalizeServiceRecurrences(companyId, engine = null, { updatedSince = null } = {}) {
+    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_service_recurrences", { updatedSince });
     const argsList = raw.map((row) => normalize.normalizeServiceRecurrence(row, { companyId })).filter(Boolean);
     await db.bulkUpsertByExternalRef("service_recurrences", SERVICE_RECURRENCE_FIELDS, argsList);
     logger.info("ServiceTradeProvider: normalized service recurrences", { companyId, count: argsList.length });
@@ -789,8 +898,8 @@ class ServiceTradeProvider extends CrmProvider {
    * derived from this table's jobless subset rather than reading the raw
    * table directly.
    */
-  async _normalizeServiceRequests(companyId, engine = null) {
-    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_service_requests");
+  async _normalizeServiceRequests(companyId, engine = null, { updatedSince = null } = {}) {
+    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_service_requests", { updatedSince });
     const [locationsMap, jobsMap, deficienciesMap, changeOrdersMap, contractsMap, recurrencesMap, serviceLinesMap] = await Promise.all([
       db.fetchExternalRefMap(companyId, "locations"),
       db.fetchExternalRefMap(companyId, "jobs"),
