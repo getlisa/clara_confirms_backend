@@ -15,7 +15,11 @@ Auth header: `Authorization: Bearer <token>` on every endpoint below.
 4. [Endpoint Reference](#4-endpoint-reference)
 5. [Settings Page — CRM Integrations Section](#5-settings-page--crm-integrations-section)
 6. [Customers / Jobs / Appointments / Technicians Browser Pages](#6-customers--jobs--appointments--technicians-browser-pages)
-7. [Sync Triggers & Status](#7-sync-triggers--status)
+7. [Sync Triggers, Live Progress & Status](#7-sync-triggers--status)
+   - 7.1 [Manual sync UX — replace the blocking call](#71-manual-sync-ux--replace-the-blocking-call)
+   - 7.2 [Live progress — the SSE event stream](#72-live-progress--the-sse-event-stream)
+   - 7.3 [Showing rows live, mid-sync](#73-showing-rows-live-while-the-sync-is-still-running)
+   - 7.4 [Automatic sync](#74-automatic-sync-no-frontend-action)
 8. [Frontend Checklist](#8-frontend-checklist)
 
 ---
@@ -250,17 +254,28 @@ Log into ServiceTrade with username + password. The password is **never stored**
 
 ### 4.2 `GET /integrations/servicetrade/status`
 
-Check the current connection state. Returns whether credentials exist and whether the cookie is still valid.
+Check the current connection state. Returns whether credentials exist, whether the cookie is still valid, **and whether a sync is in flight right now**.
+
+> **Corrected 2026-08-10.** An earlier version of this section showed
+> `username` and top-level `lastSyncAt` / `lastSyncStatus`. The endpoint does
+> not return those. Sync fields live under a nested `sync` object, shown below.
+> If your code reads `status.lastSyncAt`, it has been reading `undefined`.
 
 ```json
 // Response — connected
 {
   "connected": true,
   "hasCredentials": true,
-  "username": "ops@acme.com",
   "user": { "id": 9123, "firstName": "Ops", "lastName": "Manager", "email": "ops@acme.com" },
-  "lastSyncAt": "2026-06-05T11:00:00.000Z",
-  "lastSyncStatus": "success"
+  "sync": {
+    "syncing": true,                       // a run is in flight NOW
+    "currentState": "normalizing",         // null unless syncing
+    "runId": "1287",                       // null unless syncing — subscribe to this
+    "startedAt": "2026-08-10T11:47:37.000Z",
+    "lastSyncAt": "2026-08-10T10:12:04.000Z",
+    "lastSyncStatus": "success",           // "success" | "failed" | null
+    "lastSyncError": null
+  }
 }
 
 // Response — has credentials but session expired
@@ -279,7 +294,9 @@ Check the current connection state. Returns whether credentials exist and whethe
 }
 ```
 
-Use the `lastSyncStatus` / `lastSyncAt` fields to render a "Last synced …" caption next to the connection status.
+Use `sync.lastSyncStatus` / `sync.lastSyncAt` to render a "Last synced …" caption next to the connection status.
+
+**`sync.syncing` is the single most important field for the live view.** It is derived from `engine_runs`, not from the saved cursor, so it is true for a run started by *anything* — this browser tab, another admin, or the hourly cron. Poll `/status` on page load and use it to decide whether to show the "importing" state described in §7.2. Without it, a user who reloads mid-sync sees a half-empty account with no explanation.
 
 ### 4.3 `DELETE /integrations/servicetrade/session`
 
@@ -313,7 +330,30 @@ The same call also **normalizes** raw rows into the platform tables (`customers`
 { "error": "ServiceTrade not connected" }
 ```
 
-UX: show a spinner on the "Sync now" button; on success, surface the count toast (`Synced 24 customers, 56 jobs, …`) and refetch any open lists.
+#### ⚠️ Do not use this blocking form for a full sync
+
+The response above only arrives when the run *finishes*. The backend waits at most **4 minutes** (`waitForRun`, `src/routes/servicetrade.js`) and then returns an error — but the sync itself **keeps running in the background and normally succeeds**.
+
+A cold company's first full sync was measured at **~9–10 minutes**. So on exactly the accounts that matter most, the current blocking flow shows the user **"Sync failed"** while the data is, in fact, loading correctly. Reloading then shows a half-populated account, which reads as data loss. This is the main reason frontend changes are needed.
+
+**Use `?stream=true` instead** — it returns immediately with a run id and an SSE URL:
+
+```json
+// POST /integrations/servicetrade/sync?full=true&stream=true  → 202 Accepted
+{
+  "runId": "1287",
+  "kind": "crm_sync",
+  "streamToken": "eyJhbGciOi…",
+  "streamUrl": "/engines/1287/stream?token=eyJhbGciOi…",
+  "snapshotUrl": "/engines/1287"
+}
+```
+
+Query params: `full=true` (ignore cursors), `stream=true` (recommended), `range=week|month|3month` (default `month`, scopes the service-request window).
+
+The blocking form is kept only for back-compat with the existing button. Keep it *only* for incremental syncs on already-populated accounts, where runs are short.
+
+UX: see §7 — the "Sync now" button should now open a live progress view rather than a spinner that can time out.
 
 ### 4.5 `GET /integrations/servicetrade/customers`
 
@@ -511,36 +551,107 @@ This is a **read-only** debug view — no edit/delete from this page. All mutati
 
 ## 7. Sync Triggers & Status
 
-### Manual sync UX
+### 7.1 Manual sync UX — replace the blocking call
 
-The **"Sync now"** button on the CRM card calls `POST /integrations/servicetrade/sync` (incremental). The **"Full re-sync"** button passes `?full=true`.
+The old flow below **is the thing to change**. It blocks on a request that gives up after 4 minutes while a full sync takes ~9–10, so it reports failure on a successful sync (see §4.4).
 
 ```tsx
+// ❌ OLD — times out and shows "Sync failed" on any cold/full sync
 async function handleSync(full: boolean) {
   setSyncing(true);
-  const token = getStoredToken();
-  const result = await runServiceTradeSync(token!, { full });
+  const result = await runServiceTradeSync(token!, { full }); // blocks up to 4 min
   setSyncing(false);
-  if (result?.success) {
-    const c = result.counts ?? {};
-    toast.success(
-      `Synced ${c.customers ?? 0} customers, ${c.jobs ?? 0} jobs, ` +
-      `${c.appointments ?? 0} appointments, ${c.technicians ?? 0} technicians.`
-    );
-    refetchStatus();
-  } else {
-    toast.error(result?.error ?? 'Sync failed');
-  }
+  if (result?.success) { toast.success(`Synced ${result.counts.customers} customers, …`); }
+  else { toast.error(result?.error ?? 'Sync failed'); }     // ← fires while sync is fine
 }
 ```
 
-### Automatic sync (no frontend action)
+```tsx
+// ✅ NEW — start, then watch. Never blocks, never false-fails.
+async function handleSync(full: boolean) {
+  const { runId, streamUrl } = await runServiceTradeSync(token!, { full, stream: true });
+  setActiveRunId(runId);        // render the live panel in §7.2
+  subscribeToRun(streamUrl);    // EventSource
+}
+```
 
-A backend cron (`POST /admin/crm-sync` every 6 hours) runs the same sync for every connected company. Users don't need to click anything — the data stays fresh on its own. The status card always shows the most recent sync regardless of source (manual or cron).
+Keep the button enabled-but-labelled rather than disabled-with-spinner: a sync can be started by the cron or another admin, so "syncing" is a *server* state you observe (`status.sync.syncing`), not a local boolean you own.
+
+### 7.2 Live progress — the SSE event stream
+
+`GET /engines/:runId/stream?token=…` is a standard `EventSource` feed. The token comes from the sync response; **it is a query param, not a header**, because `EventSource` cannot set headers.
+
+```ts
+const es = new EventSource(`${API_URL}${streamUrl}`);   // streamUrl already contains ?token=
+es.addEventListener('snapshot',    e => applySnapshot(JSON.parse(e.data)));
+es.addEventListener('state',       e => setStage(JSON.parse(e.data).state));
+es.addEventListener('fetched',     e => bumpFetched(JSON.parse(e.data)));      // {entity, count}
+es.addEventListener('entity_done', e => bumpNormalized(JSON.parse(e.data)));   // {entity, count}
+es.addEventListener('done',   e => { es.close(); refetchEverything(); });
+es.addEventListener('failed', e => { es.close(); toast.error(JSON.parse(e.data).error); });
+```
+
+`snapshot` is always sent first and reflects current state, so a client that connects late (or reconnects) is immediately correct — you do not need to replay.
+
+**Stages, in the order they actually fire.** Render these as a checklist; the two `fetching_job_*` stages are the long ones on a cold account.
+
+| `state` | What's happening |
+|---|---|
+| `authenticating` | logging in to ServiceTrade |
+| `fetching_jobs` | paged job pull — also brings customers, locations, contacts, users, projects |
+| `fetching_job_details` | one request per job (the slowest stage) |
+| `fetching_appointments` | one request per job |
+| `fetching_job_comments` | one request per job — feeds confirmation inference |
+| `fetching_service_requests` | service-request window (`range`) |
+| `normalizing` | raw → platform tables |
+| `done` / `failed` | terminal |
+
+There is **no** `fetching_customers` or `fetching_technicians` state, despite what older docs said — those entities are pulled inside `fetching_jobs` and report via `fetched` only.
+
+`fetched` entities (raw layer): `jobs`, `customers`, `locations`, `contacts`, `users`, `projects`, `appointments`, `technicians`, `appointment_service_requests`, `job_comments`.
+
+`entity_done` entities (platform layer), emitted in this order:
+`customers`, `contacts`, `offices`, `tags`, `locations`, `technicians`, `crm_users`, `projects`, `jobs`, `appointments`, `service_lines`, `deficiencies`, `change_orders`, `contracts`, `service_recurrences`, `service_requests`, `appointment_services`.
+
+> Two event types you may see referenced elsewhere — `progress` and `warning` — are **not emitted** by this engine. Don't build UI that waits for them.
+
+### 7.3 Showing rows live, while the sync is still running
+
+Nothing wraps the sync in a transaction, so **every batch commits as it completes** and the platform tables fill up progressively. The frontend gets a live view for free: re-fetch your normal list endpoints while `syncing` is true.
+
+Recommended: re-fetch open lists on each `entity_done` for an entity that list depends on, or simply poll every ~3–5s while syncing. Don't poll faster — these are multi-MB reads over a pooled connection.
+
+Because `entity_done` fires in the order above, **jobs land before appointments**. A job can briefly exist with zero visits. Render that as *loading*, not as "no appointments scheduled".
+
+**The one rule that matters:** while `sync.syncing` is true, an empty or short list means *not finished yet*, not *nothing there*. Every empty state must be suppressed in favour of "Importing…". Getting this wrong is what makes a working sync look like data loss.
+
+```tsx
+if (sync?.syncing) return <ImportingState stage={sync.currentState} startedAt={sync.startedAt} />;
+if (!rows.length)  return <EmptyState />;   // only trustworthy when NOT syncing
+```
+
+### 7.4 Automatic sync (no frontend action)
+
+A backend cron (`/admin/crm-sync`, **hourly**) runs the same sync for every connected company, so data stays fresh with no clicks. The status card shows the most recent sync regardless of source.
+
+Consequence for the UI: a sync can begin without any user action. Treat `status.sync.syncing` as the source of truth on every page load — and if it is true but you have no `runId` subscription (because *you* didn't start it), you can still subscribe using `sync.runId` via `GET /engines/:runId/stream`, or just poll `/status`.
+
+Incremental syncs are now much cheaper than they used to be (the normalize phase only reprocesses rows changed since the last run — measured 32.0s → 16.5s on a mid-size account), so the hourly cron is mostly invisible. Full re-syncs are still minutes long.
 
 ---
 
 ## 8. Frontend Checklist
+
+### Live data view — the changes required by this revision
+- [ ] **Fix `getServiceTradeStatus()` types** — sync fields are nested under `sync`, not top-level. Any `status.lastSyncAt` read today is `undefined` (§4.2).
+- [ ] **Pass `stream: true`** from `runServiceTradeSync()` and handle the `202` shape (`runId`, `streamUrl`) instead of awaiting `{success, counts}` (§4.4).
+- [ ] **Stop treating a full sync as a blocking call** — this is the bug: it false-fails after 4 min on a ~10 min sync (§4.4).
+- [ ] **Add an `EventSource` subscription** keyed on `streamUrl`; handle `snapshot`, `state`, `fetched`, `entity_done`, `done`, `failed`. Token goes in the query string (§7.2).
+- [ ] **Render the stage checklist** from the §7.2 table; drop any reference to `fetching_customers` / `fetching_technicians` (§7.2).
+- [ ] **Suppress empty states while `sync.syncing`** — show "Importing…" instead. Highest-value item: this is what makes a working sync look like data loss (§7.3).
+- [ ] **Poll `/status` on page load** and subscribe via `sync.runId` if a cron- or other-admin-started run is already in flight (§7.4).
+- [ ] **Re-fetch open lists on relevant `entity_done`** (or poll 3–5s) so rows appear progressively (§7.3).
+- [ ] **Treat a job with zero appointments as loading, not empty**, while syncing — jobs normalize before appointments (§7.3).
 
 ### Types
 - [ ] Create `src/types/integration.ts` — `CrmSlug`, `IntegrationStatus`, `SyncResult`

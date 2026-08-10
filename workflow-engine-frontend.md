@@ -143,9 +143,9 @@ event: state              ← state transition
 id: 43
 data: {"state":"normalizing","ts":"..."}
 
-event: warning            ← sub-event within current state
+event: entity_done        ← sub-event within current state
 id: 44
-data: {"state":"normalizing","ts":"...","entity":"customer","code":"missing_phone","subject_name":"Acme HQ","message":"…"}
+data: {"state":"normalizing","ts":"...","entity":"appointments","count":59}
 
 event: done               ← terminal
 id: 65
@@ -177,24 +177,38 @@ Recommendation: new UI uses `POST /engines/crm_sync` directly.
 
 ### 4.1 `crm_sync`
 
+> **Corrected 2026-08-10** against the emitting code. The previous version of
+> this table listed two states that are never emitted (`fetching_customers`,
+> `fetching_technicians`), omitted four that are, and documented a `warning`
+> event that no longer exists anywhere in the sync path. See
+> `integration-document.md` §7.2 for the frontend-facing version.
+
 | `event:` | `state` | Payload | Meaning |
 |---|---|---|---|
 | `snapshot` | (any) | run snapshot | sent first; reflect current state into UI |
 | `started` | `started` | `{kind, companyId, startedAt}` | run created |
 | `state` | `authenticating` | `{provider}` | logging in to CRM |
-| `state` | `fetching_customers` | `{full}` | pulling customer pages |
-| `fetched` | (n/a) | `{entity, count}` | a fetch stage finished |
-| `state` | `fetching_technicians` | `{}` | — |
-| `state` | `fetching_jobs` | `{full}` | — |
+| `state` | `fetching_jobs` | `{full}` | paged job pull; also yields customers, locations, contacts, users, projects |
+| `state` | `fetching_job_details` | `{count}` | one request per job — slowest stage |
+| `state` | `fetching_appointments` | `{count}` | one request per job |
+| `state` | `fetching_job_comments` | `{count}` | one request per job |
+| `state` | `fetching_service_requests` | `{full}` | service-request window |
 | `state` | `normalizing` | `{}` | writing into platform tables |
+| `fetched` | (n/a) | `{entity, count}` | a raw-layer stage finished |
 | `entity_done` | (n/a) | `{entity, count}` | a normalize stage finished |
-| `warning` | (n/a) | `{entity, code, subject_name, external_ref, message}` | row inserted with caveat (missing phone, unresolved FK, …) |
-| `done` | `done` | `{result: {counts: {customers, jobs, appointments, technicians, normalized: {...}}}}` | success |
+| `done` | `done` | `{result: {counts}}` | success |
 | `failed` | `failed` | `{error, partialResult?}` | error |
 
-Warning codes from the CRM-sync normalizer:
-`missing_phone`, `missing_name`, `no_customer`, `unresolved_customer`,
-`no_job`, `unresolved_job`, `unresolved_technician`, `missing_scheduled_start`.
+`fetched` entities: `jobs`, `customers`, `locations`, `contacts`, `users`,
+`projects`, `appointments`, `technicians`, `appointment_service_requests`,
+`job_comments`.
+
+`entity_done` entities, in emission order: `customers`, `contacts`, `offices`,
+`tags`, `locations`, `technicians`, `crm_users`, `projects`, `jobs`,
+`appointments`, `service_lines`, `deficiencies`, `change_orders`, `contracts`,
+`service_recurrences`, `service_requests`, `appointment_services`.
+
+There is no `progress` or `warning` event — don't build UI that waits for one.
 
 ### 4.2 `scheduler_run`
 
@@ -315,13 +329,16 @@ Today the "Sync now" button is a blocking action. Replace with:
 1. User clicks **Sync now** or **Full re-sync** → call `startEngine('crm_sync', {full})`.
 2. Replace the button row with a **progress stepper** keyed off `run.current_state`:
    - `authenticating` → "Signing in to ServiceTrade…"
-   - `fetching_customers` / `fetching_jobs` / `fetching_appointments` / `fetching_technicians`
-     → "Pulling {entity}…" (subscribe to `fetched` event for the count)
-   - `normalizing` → progress bar across customers → technicians → jobs → appointments (subscribe to `entity_done`)
+   - `fetching_jobs` / `fetching_job_details` / `fetching_appointments` /
+     `fetching_job_comments` / `fetching_service_requests`
+     → "Pulling {entity}…" (subscribe to `fetched` for the count). The three
+     per-job stages dominate wall time on a cold account.
+   - `normalizing` → progress bar across the `entity_done` sequence (customers →
+     … → jobs → appointments → … → appointment_services)
    - `done` → success banner with `result.counts`; "Last sync 2 minutes ago"
    - `failed` → red banner with `error`; **Retry** button (starts a fresh run)
-3. A **warnings drawer** lists every `warning` event live. Group by `entity`,
-   show a count badge on the entity tab in the CRM Browser.
+3. No warnings drawer — the `warning` event is not emitted. Surface `failed`
+   errors instead.
 4. After `done`, invalidate the platform queries (`customers`, `jobs`, etc.)
    so the rest of the UI reflects the new data.
 
@@ -401,7 +418,8 @@ For v1, runs are short enough.
 - [ ] API wrappers: `startEngine`, `getEngineRun`, `listEngineRuns`.
 - [ ] `useEngineRun({runId, streamUrl})` hook with EventSource + reconnect.
 - [ ] Settings → ServiceTrade card: replace blocking sync with engine UX
-      (stepper + warnings drawer).
+      (stepper + live `fetched`/`entity_done` counters). No warnings drawer —
+      see §4.1.
 - [ ] Scheduler page: "Run now" → engine UX (live trigger feed + totals).
 - [ ] Recent activity list (optional, can ship later).
 - [ ] After `done`/`failed`, invalidate dependent queries:
