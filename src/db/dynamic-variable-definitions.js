@@ -34,14 +34,29 @@ const VARIABLE_SEEDS = [
   { name: "job_comments",        sort_order: 46, resolved_from: "job-confirmation-context (job details, live at dispatch)", description: "Scheduling comments the team left on the job, most recent first, joined with ' | '. 'none' when there are none." },
 
   // ── Appointment + quotation ─────────────────────────────────────────────────
-  // NOTE: appointment DATA is deliberately not injected as variables. A
-  // confirmation conversation is job-scoped and the agent fetches every
-  // appointment (dates, technicians, services, confirmation state) from the
-  // get_appointments tool, because Retell binds these variables once at
-  // call/chat creation — a queued row can sit for days, and appointments change
-  // mid-conversation as the agent confirms/reschedules/cancels. Only the
-  // identifier below is injected.
-  { name: "appointment_id",      sort_order: 50, resolved_from: "scheduled_calls.appointment_id", description: "The appointment this call was queued for. Used by technician_confirmation, which is appointment-specific. customer_confirmation ignores it and takes every appointment ID from the get_appointments tool instead." },
+  // Appointment data IS now injected for customer_confirmation — reversing the
+  // earlier rule that it never should be. The reason it was banned was
+  // staleness: Retell binds variables once at call creation, "a queued row can
+  // sit for days, and appointments change mid-conversation".
+  //
+  // Half of that no longer applies: the dispatcher computes the job context
+  // FRESH at dispatch (services/scheduler.js — "Computed HERE, at dispatch,
+  // not when the row was queued"), seconds before the call connects. The other
+  // half still does — appointments really can change mid-call — so these are
+  // scoped to the OPENING only: customer_confirmation's prompt requires a
+  // get_appointments call after any confirm/reschedule/cancel/create, and
+  // falls back to the tool when these arrive blank.
+  //
+  // The point is latency: without them the agent cannot say anything about the
+  // visit until a tool round-trip completes, which is why it had to stall with
+  // "Let me pull up the appointments on this job."
+  { name: "appointment_id",      sort_order: 50, resolved_from: "scheduled_calls.appointment_id", description: "The appointment this call was queued for. Used by technician_confirmation, which is appointment-specific. customer_confirmation uses next_appointment_id / upcoming_appointments instead." },
+  { name: "upcoming_count",         sort_order: 51, resolved_from: "job-confirmation-context (live at dispatch)", description: "How many upcoming appointments are on this job. Blank when the job context could not be built — the agent then falls back to the get_appointments tool." },
+  { name: "unconfirmed_count",      sort_order: 52, resolved_from: "job-confirmation-context (live at dispatch)", description: "How many of the upcoming appointments the customer has not confirmed yet." },
+  { name: "all_upcoming_confirmed", sort_order: 53, resolved_from: "job-confirmation-context (live at dispatch)", description: "'true' when every upcoming appointment is already confirmed, else 'false'." },
+  { name: "next_appointment_id",    sort_order: 54, resolved_from: "job-confirmation-context (live at dispatch)", description: "Appointment ID of the next upcoming visit — what confirm_appointment is called with when the customer confirms it." },
+  { name: "next_technician",        sort_order: 55, resolved_from: "job-confirmation-context (live at dispatch)", description: "Technician assigned to the next upcoming visit. Blank when none is assigned." },
+  { name: "upcoming_appointments",  sort_order: 56, resolved_from: "job-confirmation-context (live at dispatch)", description: "Pre-rendered list of the job's upcoming appointments, one per line (id, date, service line, technician, confirmed state). Capped at 8 with a '...plus N more' tail — the agent calls get_appointments to see beyond that." },
   { name: "total_amount",        sort_order: 60, resolved_from: "scheduled_calls.total_amount",   description: "Quotation total amount (string) — used in quotation_followup calls." },
 
   // ── Service opportunity follow-up ─────────────────────────────────────────────

@@ -17,6 +17,7 @@ const { getGraph } = require("./graph/build");
 const db = require("../db");
 const chatLinksDb = require("../db/chat-links");
 const { postConfirmationAgentComment } = require("../services/servicetrade-comments");
+const { resolveContact } = require("./tools/confirmer-label");
 const logger = require("../utils/logger");
 
 // Tool calls whose outcome is worth recording on the ServiceTrade job when
@@ -34,12 +35,37 @@ const TRIGGER_MESSAGE = "(This is a text chat, not a phone call. Please begin no
 
 async function resolveJobRefs(companyId, jobId) {
   const { rows } = await db.query(
-    `SELECT j.external_ref AS job_ref, cu.external_ref AS customer_ref
+    `SELECT j.external_ref AS job_ref, cu.external_ref AS customer_ref,
+            cu.email AS customer_email, cu.phone AS customer_phone
        FROM jobs j LEFT JOIN customers cu ON cu.id = j.customer_id
       WHERE j.id = $1 AND j.company_id = $2`,
     [jobId, companyId]
   );
-  return { jobRef: rows[0]?.job_ref ?? null, customerRef: rows[0]?.customer_ref ?? null };
+  return {
+    jobRef: rows[0]?.job_ref ?? null,
+    customerRef: rows[0]?.customer_ref ?? null,
+    customerEmail: rows[0]?.customer_email ?? null,
+    customerPhone: rows[0]?.customer_phone ?? null,
+  };
+}
+
+/**
+ * Who this conversation is actually WITH — the customer themself
+ * (recipientContactId null) or a different named contact (e.g. a property
+ * manager, migration 081's confirmation-recipients feature). Used for the
+ * greeting (address them by their own name) and the service-link step
+ * (present known email/phone instead of asking blind).
+ */
+async function resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone) {
+  if (recipientContactId) {
+    const contact = await resolveContact(companyId, recipientContactId);
+    return {
+      recipientName: contact?.name ?? null,
+      recipientEmail: contact?.email ?? null,
+      recipientPhone: contact?.phone ?? null,
+    };
+  }
+  return { recipientName: null, recipientEmail: customerEmail, recipientPhone: customerPhone };
 }
 
 function extractText(m) {
@@ -191,8 +217,12 @@ async function runGraph(threadId, ctx, input) {
  * checkpointer keeps the thread alive indefinitely.
  */
 async function ensureOpened({ companyId, jobId, token, companyName, recipientContactId = null, linkAppointmentId = null }) {
-  const { jobRef, customerRef } = await resolveJobRefs(companyId, jobId);
-  const ctx = { companyId, jobId, threadId: token, jobRef, customerRef, companyName, recipientContactId, linkAppointmentId };
+  const { jobRef, customerRef, customerEmail, customerPhone } = await resolveJobRefs(companyId, jobId);
+  const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone);
+  const ctx = {
+    companyId, jobId, threadId: token, jobRef, customerRef, companyName, recipientContactId, linkAppointmentId,
+    recipientName, recipientEmail, recipientPhone,
+  };
 
   const graph = await getGraph();
   const snapshot = await graph.getState({ configurable: { thread_id: token } });
@@ -204,8 +234,12 @@ async function ensureOpened({ companyId, jobId, token, companyName, recipientCon
 }
 
 async function sendMessage({ companyId, jobId, token, companyName, content, recipientContactId = null, linkAppointmentId = null }) {
-  const { jobRef, customerRef } = await resolveJobRefs(companyId, jobId);
-  const ctx = { companyId, jobId, threadId: token, jobRef, customerRef, companyName, recipientContactId, linkAppointmentId };
+  const { jobRef, customerRef, customerEmail, customerPhone } = await resolveJobRefs(companyId, jobId);
+  const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone);
+  const ctx = {
+    companyId, jobId, threadId: token, jobRef, customerRef, companyName, recipientContactId, linkAppointmentId,
+    recipientName, recipientEmail, recipientPhone,
+  };
   const messages = await runGraph(token, ctx, { messages: [new HumanMessage(content)] });
   return { messages };
 }
