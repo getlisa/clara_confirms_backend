@@ -175,8 +175,10 @@ function build(ctx, {
   if (serviceLineDescriptions.length) {
     lines.push(
       "",
-      "── SERVICE DETAILS (what a visit for each service line actually involves) ──",
-      "Use the one matching this visit's actual service line when the customer asks what the visit involves — match by reading the appointment's own service_line/job text above; don't guess if none clearly matches.",
+      "── ONSITE EXPECTATIONS — STATE THESE, DON'T WAIT TO BE ASKED ──",
+      "Every confirmation must tell the customer what to expect onsite: building access, noise, and rough duration. This is the note the site needs in order to prepare — giving tenants notice, unlocking units, expecting the panel to sound. A confirmation that skips it is incomplete, even if the customer never asks.",
+      "Pick the ONE entry matching this visit, by reading the appointment's own service_line/job text above. If the job covers several services, use the single combined entry (e.g. alarm + sprinkler) rather than reading two. If nothing clearly matches, describe the visit only in general terms — never invent access or noise specifics.",
+      "Work it into the confirmation naturally and briefly, in your own words. These are notes to convey, not a script to recite.",
       "",
       ...serviceLineDescriptions.flatMap((d) => [`${d.title}:`, d.description, ""])
     );
