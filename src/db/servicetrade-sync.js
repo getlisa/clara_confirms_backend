@@ -5,6 +5,7 @@
  * appointments, technicians) plus a sync_state cursor table.
  */
 const db = require("./index");
+const logger = require("../utils/logger");
 
 // Every upsert here carries a full `payload` JSONB (~1.7–5 kB/row), so batch
 // size is really "how many kB per round trip". At 500 a single company's
@@ -45,16 +46,50 @@ const SYNC_STATE_COLUMNS = [
   "last_normalized_at",
 ];
 
-async function getSyncState(companyId) {
-  const r = await db.query(
-    `SELECT ${SYNC_STATE_COLUMNS.join(", ")} FROM servicetrade_sync_state WHERE company_id = $1`,
-    [companyId]
+// Columns added by a migration that may not be applied yet. Deploys here do
+// NOT run migrations (`npm run migrate` is manual), so freshly deployed code
+// can meet an older schema. getSyncState/updateSyncState name their columns
+// explicitly, so a missing one is error 42703 (undefined_column) — and because
+// getSyncState is on the path of the hourly /admin/crm-sync cron, that would
+// break every sync until someone noticed. These degrade to the pre-migration
+// behaviour instead: reads omit the column, writes drop it. Incremental
+// normalize sees no watermark and does a full pass, which is correct, just
+// slower. Remove an entry once its migration is applied everywhere.
+const OPTIONAL_SYNC_STATE_COLUMNS = new Set(["last_normalized_at"]);
+
+const isUndefinedColumn = (err) => err?.code === "42703";
+
+function warnMissingColumn(fn, err) {
+  logger.warn(
+    `${fn}: servicetrade_sync_state is missing a column — run pending migrations (npm run migrate)`,
+    { error: err.message }
   );
-  return r.rows[0] || null;
 }
 
-async function updateSyncState(companyId, data) {
-  const entries = Object.entries(data).filter(([k, v]) => SYNC_STATE_COLUMNS.includes(k) && v !== undefined);
+async function getSyncState(companyId) {
+  const select = (cols) =>
+    db.query(
+      `SELECT ${cols.join(", ")} FROM servicetrade_sync_state WHERE company_id = $1`,
+      [companyId]
+    );
+  try {
+    const r = await select(SYNC_STATE_COLUMNS);
+    return r.rows[0] || null;
+  } catch (err) {
+    if (!isUndefinedColumn(err)) throw err;
+    warnMissingColumn("getSyncState", err);
+    const r = await select(SYNC_STATE_COLUMNS.filter((c) => !OPTIONAL_SYNC_STATE_COLUMNS.has(c)));
+    return r.rows[0] || null;
+  }
+}
+
+async function updateSyncState(companyId, data, retriedWithoutOptional = false) {
+  const entries = Object.entries(data).filter(
+    ([k, v]) =>
+      SYNC_STATE_COLUMNS.includes(k) &&
+      v !== undefined &&
+      !(retriedWithoutOptional && OPTIONAL_SYNC_STATE_COLUMNS.has(k))
+  );
   if (entries.length === 0) return;
 
   const cols  = entries.map(([k]) => k);
@@ -63,12 +98,20 @@ async function updateSyncState(companyId, data) {
   const insertCols  = ["company_id", ...cols].join(", ");
   const insertVals  = ["$1", ...cols.map((_, i) => `$${i + 2}`)].join(", ");
 
-  await db.query(
-    `INSERT INTO servicetrade_sync_state (${insertCols})
-     VALUES (${insertVals})
-     ON CONFLICT (company_id) DO UPDATE SET ${setClauses}`,
-    [companyId, ...vals]
-  );
+  try {
+    await db.query(
+      `INSERT INTO servicetrade_sync_state (${insertCols})
+       VALUES (${insertVals})
+       ON CONFLICT (company_id) DO UPDATE SET ${setClauses}`,
+      [companyId, ...vals]
+    );
+  } catch (err) {
+    // Retry once without the not-yet-migrated columns, so the cursors that DO
+    // exist still get persisted rather than the whole update being lost.
+    if (!isUndefinedColumn(err) || retriedWithoutOptional) throw err;
+    warnMissingColumn("updateSyncState", err);
+    return updateSyncState(companyId, data, true);
+  }
 }
 
 // ── Upserts ─────────────────────────────────────────────────────────────────
