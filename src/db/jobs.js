@@ -122,27 +122,30 @@ async function listJobs(companyId, {
     const p = i++;
     values.push(UPCOMING_APPOINTMENT_STATUSES);
 
-    const upcoming = `SELECT 1 FROM appointments up
+    // "Outstanding" (booked, not completed/cancelled, regardless of start
+    // time) — the SAME definition job-confirmation-status.js derives
+    // jobs.status from. These must agree: with a future-only test here, a job
+    // whose confirmed visit had already started showed status 'confirmed' but
+    // was missing from ?confirmed=true.
+    const outstanding = `SELECT 1 FROM appointments up
        WHERE up.job_id = j.id AND up.company_id = j.company_id
-         AND up.status = ANY($${p}::varchar[])
-         AND up.scheduled_start > NOW()`;
+         AND up.status = ANY($${p}::varchar[])`;
     const unconfirmedCount = `SELECT COUNT(*) FROM appointments up
        WHERE up.job_id = j.id AND up.company_id = j.company_id
          AND up.status = ANY($${p}::varchar[])
-         AND up.scheduled_start > NOW()
          AND COALESCE(up.customer_confirmed, false) = false`;
 
     if (confirmed) {
-      // The EXISTS is load-bearing. "Zero unconfirmed upcoming appointments"
-      // is VACUOUSLY true for a job with no upcoming appointments at all, so
+      // The EXISTS is load-bearing. "Zero unconfirmed outstanding
+      // appointments" is VACUOUSLY true for a job with none outstanding, so
       // without it confirmed=true returned jobs nobody ever confirmed — every
-      // visit simply in the past. Measured before this guard: company 4 had
+      // visit simply completed. Measured before this guard: company 4 had
       // 435 matches, 435 of them vacuous (zero genuine); company 9 had 27, of
       // which 10 were vacuous.
-      conditions.push(`EXISTS (${upcoming}) AND (${unconfirmedCount}) = 0`);
+      conditions.push(`EXISTS (${outstanding}) AND (${unconfirmedCount}) = 0`);
     } else {
       // No EXISTS needed: a non-zero unconfirmed count already implies at
-      // least one upcoming appointment.
+      // least one outstanding appointment.
       conditions.push(`(${unconfirmedCount}) > 0`);
     }
   }

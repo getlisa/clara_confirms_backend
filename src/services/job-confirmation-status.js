@@ -34,14 +34,22 @@ const logger = require("../utils/logger");
  * and one cancelled is finished, and a job whose appointments were ALL
  * cancelled is not "completed" (n_active = 0 fails the > 0 test).
  */
+// "Outstanding" = booked but not yet completed or cancelled, REGARDLESS of
+// whether it has started. Deliberately NOT the "upcoming" (scheduled_start >
+// NOW()) definition used by job-confirmation-context.js and the confirmation
+// sweep: those answer "who still needs a confirmation call?", where future-only
+// is right. This answers "is this job's remaining work confirmed?", where it
+// is not — a confirmed all-day visit that began an hour ago stops being
+// "upcoming" the moment it starts, which silently dropped the job back to
+// `scheduled` while the appointment was still running (reported on job 33286:
+// customer_confirmed = true, visit 08:00-16:00, job showed `scheduled`).
 const APPOINTMENT_TALLIES = `
   SELECT job_id,
          count(*) FILTER (WHERE status <> 'cancelled')                       AS n_active,
          count(*) FILTER (WHERE status =  'completed')                       AS n_completed,
+         count(*) FILTER (WHERE status IN ('scheduled','confirmed','rescheduled'))
+                                                                             AS n_outstanding,
          count(*) FILTER (WHERE status IN ('scheduled','confirmed','rescheduled')
-                            AND scheduled_start > NOW())                     AS n_upcoming,
-         count(*) FILTER (WHERE status IN ('scheduled','confirmed','rescheduled')
-                            AND scheduled_start > NOW()
                             AND COALESCE(customer_confirmed, false) = false) AS n_unconfirmed
     FROM appointments`;
 
@@ -50,7 +58,7 @@ const APPOINTMENT_TALLIES = `
 const DERIVED_STATUS = `
   CASE
     WHEN a.n_active   > 0 AND a.n_completed = a.n_active THEN 'completed'
-    WHEN a.n_upcoming > 0 AND a.n_unconfirmed = 0        THEN 'confirmed'
+    WHEN a.n_outstanding > 0 AND a.n_unconfirmed = 0     THEN 'confirmed'
     ELSE 'scheduled'
   END`;
 
