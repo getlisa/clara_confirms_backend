@@ -238,6 +238,12 @@ function build(ctx, {
         // Full crew for THIS visit only — the list lines above carry names, this
         // adds how to reach them, so "who's coming?" and "can I contact them?"
         // need no tool call.
+        // Stated up front, not only when asked: "8:00 AM" sets an expectation a
+        // crew cannot keep to the minute, and the customer plans access around
+        // it. Precomputed — never do this arithmetic yourself.
+        nextUnconfirmed?.arrival_window_spoken
+          ? `Arrival window for that visit: the crew should arrive ${nextUnconfirmed.arrival_window_spoken} (the scheduled time is ${nextUnconfirmed.scheduled_start_spoken}, and they can be up to 30 minutes either side). Say this when you confirm, so the time is not heard as exact. Use this wording — do not work out the window yourself.`
+          : null,
         nextUnconfirmed && formatCrewDetail(nextUnconfirmed)
           ? `Technicians assigned to that visit: ${formatCrewDetail(nextUnconfirmed)}. Share a technician's contact details only if the customer actually asks for them — never volunteer them.`
           : null,

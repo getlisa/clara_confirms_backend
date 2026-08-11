@@ -425,3 +425,50 @@ test("no crew → no crew-detail line at all", async () => {
   const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
   assert.ok(!out.includes("Technicians assigned to that visit"));
 });
+
+// ── Arrival window ───────────────────────────────────────────────────────────
+//
+// "8:00 AM" is heard as an exact arrival, and a crew cannot keep to the minute.
+// The window is PRECOMPUTED rather than left to the agent: a model doing this
+// arithmetic gets hour and noon boundaries wrong (8:00 minus 30 is 7:30, not
+// 8:30; 12:15 PM minus 30 crosses meridiem to 11:45 AM).
+
+const { formatArrivalWindow } = require("../src/utils/timezone");
+const TZ = "America/Chicago";
+
+test("the window brackets the scheduled start by 30 minutes", () => {
+  assert.equal(formatArrivalWindow("2026-08-28T13:00:00Z", TZ), "between 7:30 AM and 8:30 AM");
+});
+
+test("crossing noon keeps the meridiem right", () => {
+  assert.equal(formatArrivalWindow("2026-08-28T17:15:00Z", TZ), "between 11:45 AM and 12:45 PM");
+});
+
+test("crossing midnight keeps the meridiem right", () => {
+  assert.equal(formatArrivalWindow("2026-08-28T05:20:00Z", TZ), "between 11:50 PM and 12:50 AM");
+});
+
+test("a DST fall-back night yields null rather than 'between 1:00 AM and 1:00 AM'", () => {
+  // 1:00 AM occurs twice, so both bounds format identically. Saying nothing
+  // beats saying something absurd; the caller states the scheduled time alone.
+  assert.equal(formatArrivalWindow("2026-11-01T06:30:00Z", TZ), null);
+});
+
+test("a missing or unparseable start yields null, not a broken window", () => {
+  assert.equal(formatArrivalWindow(null, TZ), null);
+  assert.equal(formatArrivalWindow("not-a-date", TZ), null);
+});
+
+test("the context exposes the window on each appointment", async () => {
+  const ctx = await ctxFor({ services: [service("Backflow", "Annual Backflow Inspection")] });
+  const a = nextOf(ctx);
+  assert.match(a.arrival_window_spoken, /^between .+ and .+$/);
+});
+
+test("the chat prompt states the window and forbids computing it", async () => {
+  const ctx = await ctxFor({ services: [service("Backflow", "Annual Backflow Inspection")] });
+  const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
+  assert.match(out, /Arrival window for that visit: the crew should arrive between /);
+  assert.match(out, /30 minutes either side/);
+  assert.match(out, /do not work out the window yourself/i);
+});

@@ -82,6 +82,7 @@ function generateDefaultPrompts(type, name, description) {
         "- Still unconfirmed: {{unconfirmed_count}}\n" +
         "- Every upcoming one already confirmed? {{all_upcoming_confirmed}}\n" +
         "- The next one: appointment {{next_appointment_id}} on {{next_appointment_date}} for {{next_service_line}}, with {{next_technician}}\n" +
+        "- Arrival window: the crew should arrive {{next_arrival_window}} — the scheduled time plus or minus 30 minutes. SAY THIS when you confirm, so {{next_appointment_date}} is not heard as an exact arrival. Use this wording; never work the window out yourself. If it is blank, just state the scheduled time.\n" +
         "- What that visit actually covers (one service per line, as \"service line — description\"). The description is the detailed part: equipment, counts and locations. Use it when the customer asks what is being done, and to pick the right onsite-expectations entry. Do NOT read the whole block out verbatim — summarise it:\n" +
         "{{next_appointment_services}}\n" +
         "- Who is coming (the FULL crew, one per line, with contact details):\n" +

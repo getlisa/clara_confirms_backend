@@ -147,6 +147,35 @@ function formatSpokenDateTime(iso, tz) {
   return new Date(iso).toLocaleString("en-US", { timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+/** Time of day only, e.g. "8:00 AM" — for arrival windows, where the date is already stated. */
+function formatSpokenTime(iso, tz) {
+  if (!iso) return null;
+  return new Date(iso).toLocaleTimeString("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" });
+}
+
+/**
+ * The arrival window around a scheduled start, as "between 7:30 AM and 8:30 AM".
+ *
+ * Computed rather than left to the agent: a model doing this arithmetic in its
+ * head gets hour and noon boundaries wrong (8:00 minus 30 is 7:30, not 8:30;
+ * 12:15 PM minus 30 is 11:45 AM, crossing meridiem). Both bounds are formatted
+ * from real Date arithmetic in the company's timezone, so DST transitions and
+ * midnight crossings are handled by the formatter rather than by guesswork.
+ */
+function formatArrivalWindow(iso, tz, minutes = 30) {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return null;
+  const from = formatSpokenTime(new Date(t - minutes * 60_000).toISOString(), tz);
+  const to = formatSpokenTime(new Date(t + minutes * 60_000).toISOString(), tz);
+  if (!from || !to) return null;
+  // On a DST fall-back night the same wall-clock time occurs twice, so both
+  // bounds can format identically — "between 1:00 AM and 1:00 AM" is worse than
+  // saying nothing. Callers fall back to stating the scheduled time alone.
+  if (from === to) return null;
+  return `between ${from} and ${to}`;
+}
+
 /**
  * Human-readable spoken form for a DATE-only value (e.g. jobs.scheduled_date —
  * no time-of-day/timezone component at all). Deliberately does NOT take a `tz`
@@ -183,6 +212,8 @@ function toLocalDateOnly(input, tz) {
 }
 
 module.exports = {
+  formatSpokenTime,
+  formatArrivalWindow,
   DEFAULT_TZ,
   getCompanyTimezone,
   localToUTC,

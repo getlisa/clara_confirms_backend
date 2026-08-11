@@ -24,7 +24,7 @@
 
 const jobsDb = require("../db/jobs");
 const db = require("../db");
-const { getCompanyTimezone, formatSpokenDateTime, formatSpokenDateOnly } = require("../utils/timezone");
+const { getCompanyTimezone, formatSpokenDateTime, formatSpokenDateOnly, formatArrivalWindow } = require("../utils/timezone");
 const logger = require("../utils/logger");
 
 /**
@@ -43,6 +43,9 @@ const UPCOMING_STATUSES = ["scheduled", "confirmed", "rescheduled"];
 const MAX_COMMENTS = 3;
 const MAX_COMMENT_CHARS = 500;
 const MAX_PAST_APPOINTMENTS = 5;
+
+// How much either side of the scheduled start a crew may realistically arrive.
+const ARRIVAL_WINDOW_MINUTES = 30;
 
 /** Distinct, non-empty, order-preserving. */
 function dedupe(values) {
@@ -223,6 +226,11 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     scheduled_start: appt.scheduled_start, // internal: sorting/derivation only
     scheduled_start_spoken: formatSpokenDateTime(appt.scheduled_start, tz),
     scheduled_end_spoken: formatSpokenDateTime(appt.scheduled_end, tz),
+    // "between 7:30 AM and 8:30 AM" — the honest arrival expectation, since a
+    // crew does not land on the minute. Precomputed because a model doing this
+    // arithmetic gets hour and noon boundaries wrong. null on a DST fall-back
+    // night, where both bounds are the same wall-clock time.
+    arrival_window_spoken: formatArrivalWindow(appt.scheduled_start, tz, ARRIVAL_WINDOW_MINUTES),
     customer_confirmed: appt.customer_confirmed === true,
     technician_confirmed: appt.technician_confirmed === true,
     // Kept for back-compat; explicitly "the lead", not "the technician".
