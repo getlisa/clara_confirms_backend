@@ -28,6 +28,7 @@ stub("utils/logger.js", silentLogger());
 
 const { VARIABLE_SEEDS } = require("../src/db/dynamic-variable-definitions");
 const { BUILTIN_TYPES, generateDefaultPrompts } = require("../src/db/call-type-configs");
+const { toAppointmentsPayload } = require("../src/services/job-confirmation-context");
 
 const REGISTERED = new Set(VARIABLE_SEEDS.map((v) => v.name));
 
@@ -148,4 +149,65 @@ test("the catalog documents the appointment variables as dispatch-time, not queu
     if (!seed) continue; // covered by the registration test above
     assert.match(seed.resolved_from, /live at dispatch/, `${name} must be documented as computed live at dispatch`);
   }
+});
+
+// ── The voice agent's second channel: the get_appointments tool result ───────
+//
+// Dynamic variables are bound once at dispatch and go stale the moment the
+// agent writes anything, so the prompt requires a get_appointments call after
+// every confirm/reschedule/cancel. That tool result is therefore the ONLY
+// source of service and technician detail for the rest of the call — if the
+// plural fields are missing from it, the agent silently falls back to the
+// singular "first of" ones and understates a multi-service visit.
+
+test("get_appointments carries every service and technician, not just the first", () => {
+  const ctx = {
+    ok: true,
+    job: { id: 1, job_number: "J1", title: "Annual Inspection", customer: { name: "Acme" }, comments: [] },
+    counts: { upcoming: 1, unconfirmed: 1, all_confirmed: false },
+    appointments: {
+      next: null,
+      upcoming: [{
+        appointment_id: 11,
+        status: "scheduled",
+        scheduled_start: new Date(Date.now() + 864e5).toISOString(),
+        scheduled_start_spoken: "Thursday",
+        scheduled_end_spoken: null,
+        customer_confirmed: false,
+        technician_confirmed: false,
+        technician: "Lead Tech",
+        technicians: [{ name: "Lead Tech", phone: "+1555", email: null }, { name: "Second Tech", phone: null, email: "s@co.test" }],
+        technician_names: ["Lead Tech", "Second Tech"],
+        technician_summary: "Lead Tech and Second Tech",
+        service_line: "Backflow",
+        service_lines: ["Backflow", "Alarm Systems"],
+        service_names: ["Annual Backflow Inspection", "Annual Fire Alarm Inspection"],
+        service_details: [
+          { service_line: "Backflow", description: "Annual Backflow Inspection" },
+          { service_line: "Alarm Systems", description: "Annual Fire Alarm Inspection" },
+        ],
+        service_summary: "Backflow and Alarm Systems",
+        services: [],
+        is_next: true,
+      }],
+      history: [],
+    },
+  };
+
+  const payload = toAppointmentsPayload(ctx);
+  const a = payload.upcoming[0];
+
+  assert.equal(a.service_details.length, 2, "the paired form is what the agent states the visit from");
+  assert.deepEqual(a.service_lines, ["Backflow", "Alarm Systems"]);
+  assert.deepEqual(a.service_names, ["Annual Backflow Inspection", "Annual Fire Alarm Inspection"]);
+  assert.deepEqual(a.technician_names, ["Lead Tech", "Second Tech"]);
+  assert.equal(a.technicians.length, 2);
+  assert.equal(a.technicians[1].email, "s@co.test", "contact details survive, so 'can I reach them?' needs no extra call");
+
+  // The singular fields stay for back-compat but must not be the only ones.
+  assert.equal(a.service_line, "Backflow");
+  assert.equal(a.technician, "Lead Tech");
+
+  // Raw timestamps must never reach the agent — it reads them aloud verbatim.
+  assert.equal(a.scheduled_start, undefined);
 });

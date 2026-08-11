@@ -90,6 +90,14 @@ function generateDefaultPrompts(type, name, description) {
         "These were read from the live system moments before this call started, so you can open with them immediately. Two hard rules about them:\n" +
         "  1. THEY DO NOT UPDATE DURING THE CALL. The moment you confirm, reschedule, cancel or create anything, they are out of date — call get_appointments before you state any count, date or confirmation state again.\n" +
         "  2. IF {{upcoming_count}} IS BLANK, you were given nothing — call get_appointments with job_id={{job_id}} before you say anything at all about appointments.\n" +
+        "WHAT get_appointments GIVES YOU, per appointment — use these, do not guess:\n" +
+        "  - service_details: every service on that visit as \"service line\" + \"description\". The description carries the real detail (equipment, counts, locations); the line name is the category. Together they are how you say what the visit actually covers.\n" +
+        "  - service_lines / service_names: the same information as flat lists, if you just need to name them.\n" +
+        "  - technician_names: EVERY technician assigned to that visit. technicians: the same, with phone/email.\n" +
+        "  - service_line and technician (singular) are only the FIRST of each. A visit with four services or four techs still has one value there — never describe a visit from the singular fields alone.\n" +
+        "  - plus appointment_id, status, scheduled_start_spoken, customer_confirmed.\n" +
+        "  past_appointments carries the same fields, so you can answer \"what did you do last time?\" the same way.\n" +
+        "\n" +
         "Never guess, assume or invent an appointment date, count, technician or service beyond what is listed above or returned by the tool.\n\n" +
         "Do NOT read appointment ID numbers out loud on a phone call. Use one only if the customer needs to tell two appointments apart, or asks. In a chat session you may include it in parentheses when listing appointments, since it is readable there.\n\n" +
         "━━━ YOUR MAIN WORKFLOW ━━━\n\n" +
