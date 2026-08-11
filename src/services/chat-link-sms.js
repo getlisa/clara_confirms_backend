@@ -29,7 +29,7 @@
 const { sendSms } = require("../utils/sms");
 const { buildChatLinkUrl } = require("./chat-link-email");
 const chatLinksDb = require("../db/chat-links");
-const { shorten } = require("./link-shortener");
+const { shorten, warnIfLikelyMonetisedHost } = require("./link-shortener");
 const config = require("../config");
 const logger = require("../utils/logger");
 
@@ -85,6 +85,11 @@ async function buildSmsLinkUrl(token, link) {
     logger.warn("chat-link-sms: PUBLIC_API_URL unset — sending the unmasked link");
     return plain;
   }
+  // Names the likely cause when masking keeps falling back — a raw platform
+  // hostname gets the short link wrapped in an affiliate redirect, which
+  // resolvesCleanlyTo() then rejects.
+  warnIfLikelyMonetisedHost(cfg.publicApiUrl);
+
   if (!link?.id) return plain;
 
   // Already shortened on an earlier send/retry.

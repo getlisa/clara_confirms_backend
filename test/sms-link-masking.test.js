@@ -31,8 +31,13 @@ stub("utils/sms", { sendSms: async ({ to, body }) => { smsSent.push({ to, body }
 
 let shortenImpl = async () => "https://tinyurl.com/masked01";
 const shortenCalls = [];
+const monetisedWarnings = [];
 stub("services/link-shortener", {
   shorten: async (url) => { shortenCalls.push(url); return shortenImpl(url); },
+  // The double must expose the whole surface chat-link-sms imports; a missing
+  // export here is an undefined call at runtime, not a helpful error.
+  warnIfLikelyMonetisedHost: (host) => { monetisedWarnings.push(host); return false; },
+  resolvesCleanlyTo: async () => true,
 });
 
 const cfg = {
