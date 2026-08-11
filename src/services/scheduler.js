@@ -192,7 +192,9 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
               next.service_summary || next.service_line || jobCtx.job.title || "your upcoming visit";
             dynVars.next_appointment_date = next.scheduled_start_spoken;
             dynVars.next_appointment_id = String(next.appointment_id);
-            dynVars.next_technician = next.technician || "";
+            // The whole crew, not just appointments.technician_id — most
+            // multi-service visits send two to four technicians.
+            dynVars.next_technician = next.technician_summary || next.technician || "";
           }
           // One flat line per upcoming appointment — dynamic variables are
           // strings, so the list is pre-rendered here rather than asking the
@@ -208,7 +210,8 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
               const svc = a.service_names?.length ? a.service_names : a.service_lines;
               if (svc?.length) bits.push(`for ${svc.join("; ")}`);
               else if (a.service_line) bits.push(`for ${a.service_line}`);
-              if (a.technician) bits.push(`with ${a.technician}`);
+              const techs = a.technician_names?.length ? a.technician_names : (a.technician ? [a.technician] : []);
+              if (techs.length) bits.push(`with ${techs.join(", ")}`);
               bits.push(a.customer_confirmed ? "(confirmed)" : "(not yet confirmed)");
               return bits.join(" ");
             });

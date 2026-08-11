@@ -34,11 +34,22 @@ function formatServices(a) {
   return lines.length ? `for ${lines.join("; ")}` : null;
 }
 
+/**
+ * The whole crew, not just the lead. Most multi-service visits send more than
+ * one technician (240 of one company's 459 appointments, up to four), and
+ * naming one of four misrepresents who is turning up.
+ */
+function formatTechnicians(a) {
+  const names = a.technician_names?.length ? a.technician_names : (a.technician ? [a.technician] : []);
+  return names.length ? `with ${names.join(", ")}` : null;
+}
+
 function formatAppointment(a) {
   const parts = [a.scheduled_start_spoken];
   const svc = formatServices(a);
   if (svc) parts.push(svc);
-  if (a.technician) parts.push(`with ${a.technician}`);
+  const techs = formatTechnicians(a);
+  if (techs) parts.push(techs);
   parts.push(a.customer_confirmed ? "(confirmed)" : "(not yet confirmed)");
   return `- Appointment #${a.appointment_id}: ${parts.join(" ")}`;
 }
@@ -53,7 +64,8 @@ function formatHistoryAppointment(a) {
   const parts = [a.scheduled_start_spoken];
   const svc = formatServices(a);
   if (svc) parts.push(svc);
-  if (a.technician) parts.push(`with ${a.technician}`);
+  const techs = formatTechnicians(a);
+  if (techs) parts.push(techs);
   parts.push(`(${a.status})`);
   return `- Appointment #${a.appointment_id}: ${parts.join(" ")}`;
 }
