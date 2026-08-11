@@ -80,11 +80,18 @@ test("falls back to a neutral noun when nobody is named", () => {
 
 // ── 2. Contact info presented instead of asked for ───────────────────────────
 
-test("presents a known email instead of asking blind", () => {
+test("reads a known email back and requires an explicit yes before sending", () => {
   const out = prompt.build(ctx({ upcoming: [appt(1, "Thursday")] }),
     { companyName: "Clara Fire", recipientEmail: "jordan@pm.test" });
 
-  assert.ok(out.includes("I have your email on file as jordan@pm.test"));
+  // Pinned as intent, not as one exact sentence: the address must be read back
+  // rather than asked for blind, and the send must wait for a yes. The tool
+  // enforces the same rule (see service-link-email-confirmation.test.js) — the
+  // prompt exists so the agent asks rather than getting refused.
+  assert.ok(out.includes("jordan@pm.test"), "the known address is presented, not asked for");
+  assert.match(out, /is that the right one to send it to\?/);
+  assert.match(out, /EXPLICIT YES ON THE ADDRESS BEFORE SENDING/);
+  assert.match(out, /email_confirmed=true/);
   assert.ok(!out.includes("you don't have one on file for this conversation"));
 });
 

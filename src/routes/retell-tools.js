@@ -981,8 +981,32 @@ router.post("/resolve_service_link_contact", async (req, res) => {
     if (!companyId) return res.status(400).json({ error: "company_id missing" });
     const conversationId = getConversationId(req);
     if (!conversationId) return res.status(400).json({ error: "call/chat id missing from request" });
-    const { email, first_name, last_name, role, phone } = getArgs(req);
+    const { email, email_confirmed, first_name, last_name, role, phone } = getArgs(req);
     if (!email) return res.status(400).json({ error: "email is required" });
+
+    // Hard gate, deliberately ahead of the CRM search — mirrors the chat tool
+    // (confirmation-agent/tools/handlers/resolve-service-link-contact.js).
+    // An unconfirmed address isn't merely a bad send target: this endpoint
+    // CREATES a ServiceTrade contact when nothing matches, so acting on a
+    // misheard address writes a junk contact into the customer's CRM and mails
+    // a job link to a stranger. Voice transcription makes that likelier here
+    // than in chat, not less. The prompt asks too, but a prompt is advisory.
+    //
+    // Compared loosely: Retell sends tool arguments as JSON, but a boolean can
+    // arrive as the string "true" depending on how the model emits it.
+    if (email_confirmed !== true && String(email_confirmed).toLowerCase() !== "true") {
+      logger.info("resolve_service_link_contact: refused, email not confirmed by the customer", {
+        companyId, conversationId,
+      });
+      return res.json({
+        status: "needs_email_confirmation",
+        email,
+        message:
+          `Do not send yet. Read ${email} back to the customer and ask if it is the right address. ` +
+          `Call this tool again with email_confirmed=true once they say yes, or with the corrected ` +
+          `address they give you.`,
+      });
+    }
 
     const refs = await resolveConfirmationRefs(companyId, conversationId);
     if (!refs) return res.status(404).json({ error: "No scheduled call or chat found for this conversation" });

@@ -89,6 +89,15 @@ function build(ctx, {
     "",
     "Never invent an appointment, date, technician, service, or count — everything below is live, current data. If something isn't listed here, you don't know it — say so honestly rather than guessing or claiming a system error (only say something failed if a tool call you just made actually returned an error).",
     "",
+    "── WHO YOU ARE TALKING TO ──",
+    `Name: ${customerName}`,
+    recipientEmail ? `Email on file: ${recipientEmail}` : "Email on file: none",
+    recipientPhone ? `Phone on file: ${recipientPhone}` : "Phone on file: none",
+    recipientName && ctx.job.customer?.name && recipientName !== ctx.job.customer.name
+      ? `They are a contact for ${ctx.job.customer.name}, not the account holder — address them by their own name.`
+      : null,
+    "Use these details when they are relevant (confirming where to send something, or if they ask what we have on file). Never read the phone or email out unprompted, and never guess at a detail that is listed as none.",
+    "",
     "── CURRENT JOB DATA (live, current as of this message) ──",
     `Job: ${ctx.job.title || jobName} (job number ${ctx.job.job_number || ctx.job.id})`,
     ctx.job.description ? `Description: ${ctx.job.description}` : null,
@@ -219,9 +228,11 @@ function build(ctx, {
     "── SERVICE LINK (offer only after at least one appointment is confirmed) ──",
     "Ask if they'd like a link to track this job. If yes:",
     recipientEmail
-      ? `You already have an email on file: ${recipientEmail}. Present it instead of asking blind — e.g. "I have your email on file as ${recipientEmail} — is that still the best one to use?" Use it if they confirm; if they give a different one, use that instead.`
-      : "Ask for their email — you don't have one on file for this conversation.",
-    "Call resolve_service_link_contact with that email — do not ask for name/role unless that tool responds with status 'need_more_info'. Once resolved, the link itself displays automatically to the customer — call get_service_link and do not paste any URL yourself.",
+      ? `You already have an email on file: ${recipientEmail}. Read it back rather than asking blind — e.g. "I have your email as ${recipientEmail} — is that the right one to send it to?"`
+      : "Ask for their email — you don't have one on file for this conversation, so read back what they give you to check the spelling.",
+    "YOU MUST GET AN EXPLICIT YES ON THE ADDRESS BEFORE SENDING. Only once they have confirmed it — or given you a different one — call resolve_service_link_contact with that address and email_confirmed=true. Calling it with email_confirmed=false (or leaving it out) does nothing except tell you to go and ask; it will not send.",
+    "Never set email_confirmed=true for an address they haven't actually agreed to in their reply. If no existing contact matches, the tool CREATES one in our CRM, so a wrong address there is not just a misdirected link.",
+    "Do not ask for name/role unless the tool responds with status 'need_more_info'. Once resolved, the link displays automatically — call get_service_link and do not paste any URL yourself.",
     recipientPhone
       ? `You also have a phone number on file (${recipientPhone}) — you may pass it as the phone argument to resolve_service_link_contact too, no need to ask for it separately.`
       : null,
