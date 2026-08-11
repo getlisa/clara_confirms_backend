@@ -11,6 +11,37 @@ const callTypeConfigsDb = require("../db/call-type-configs");
 const logger = require("../utils/logger");
 const { CHAT_SESSION_INSTRUCTION } = require("./retell-flow");
 
+const serviceLineDescriptionsDb = require("../db/service-line-descriptions");
+
+/**
+ * The company's onsite-expectation notes, as a prompt block.
+ *
+ * These live in the `service_line_descriptions` table and were previously
+ * hard-baked into one company's stored voice prompt by hand. That made
+ * resetDefaultPrompts destructive: regenerating from code silently dropped
+ * them, with no repeatable way to put them back. Building the block here means
+ * a reset re-appends whatever the company currently has, so the table stays the
+ * single source of truth — the same table the chat agent already reads live
+ * (confirmation-agent/graph/build.js).
+ *
+ * Returns "" when a company has none, so nothing is appended.
+ */
+async function buildOnsiteExpectationsBlock(companyId) {
+  const rows = await serviceLineDescriptionsDb.listByCompany(companyId).catch(() => []);
+  if (!rows.length) return "";
+  const entries = rows.map((r) => `${r.title}:\n${r.description}`).join("\n\n");
+  return [
+    "",
+    "",
+    "━━━ ONSITE EXPECTATIONS — STATE THESE, DON'T WAIT TO BE ASKED ━━━",
+    "Every confirmation must tell the customer what to expect onsite: building access, noise, and rough duration. This is the note the site needs in order to prepare — giving tenants notice, unlocking units, expecting the panel to sound. A confirmation that skips it is incomplete, even if the customer never asks.",
+    "Pick the ONE entry matching this visit, by reading the appointment's own service_line/job text. If the job covers several services, use the single combined entry (e.g. alarm + sprinkler) rather than reading two. If nothing clearly matches, describe the visit only in general terms — never invent access or noise specifics.",
+    "On a call keep it to a sentence or two, in your own words — these are notes to convey, not a script to recite. Don't read the whole list.",
+    "",
+    entries,
+  ].join("\n");
+}
+
 /**
  * Reset DB prompts for all built-in call types for a company back to the
  * current defaults from generateDefaultPrompts().
@@ -25,11 +56,19 @@ async function resetDefaultPrompts(companyId, types = null) {
     const { begin_message, general_prompt } = callTypeConfigsDb.generateDefaultPrompts(
       seed.type, seed.name, seed.description
     );
+    // Only the confirmation prompt carries onsite expectations, and only for
+    // companies that have any. Appending here (rather than at push time) keeps
+    // the stored prompt the source of truth, so every path that pushes it —
+    // prompt-sync and retell-flow — carries the block without knowing about it.
+    const extra = seed.type === "customer_confirmation"
+      ? await buildOnsiteExpectationsBlock(companyId)
+      : "";
+
     const result = await db.query(
       `UPDATE call_type_configs
        SET begin_message = $1, general_prompt = $2, updated_at = NOW()
        WHERE company_id = $3 AND type = $4 AND is_custom = false`,
-      [begin_message, general_prompt, companyId, seed.type]
+      [begin_message, general_prompt + extra, companyId, seed.type]
     );
     if (result.rowCount > 0) {
       updated++;
