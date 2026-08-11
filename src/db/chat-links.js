@@ -94,6 +94,56 @@ async function claimRetellChatId(id, chatId) {
   return result.rows[0] || null;
 }
 
+/**
+ * Base62 short code for the /c/<code> redirect used in SMS.
+ *
+ * 10 chars from 60 bits of entropy. Short enough that the shortened form stays
+ * cheap, but the endpoint is public and unauthenticated and resolves to a live
+ * chat token, so it must be no more guessable than the token itself.
+ */
+const CODE_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+function generateShortCode(length = 10) {
+  const bytes = crypto.randomBytes(length);
+  let out = "";
+  for (let i = 0; i < length; i++) out += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
+  return out;
+}
+
+/**
+ * Claim a short code for this link, if it doesn't already have one.
+ *
+ * Same compare-and-swap as claimRetellChatId: null means a concurrent send won
+ * the race, and the caller should re-fetch and use the code that landed. Two
+ * dispatch workers handling the same link must never mint two codes — the
+ * second would be a second public entry point to the same conversation.
+ */
+async function claimShortCode(id, code) {
+  const result = await db.query(
+    `UPDATE chat_links SET short_code = $1 WHERE id = $2 AND short_code IS NULL RETURNING *`,
+    [code, id]
+  );
+  return result.rows[0] || null;
+}
+
+/** Cache the shortener's answer so a resend or retry doesn't call it again. */
+async function setShortUrl(id, shortUrl) {
+  const result = await db.query(
+    `UPDATE chat_links SET short_url = $1 WHERE id = $2 RETURNING *`,
+    [shortUrl, id]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * Resolve a short code. Returns the row even when expired — the redirect route
+ * needs to tell "expired" from "never existed", exactly as getByTokenRaw does
+ * for tokens.
+ */
+async function getByShortCode(code) {
+  const result = await db.query(`SELECT * FROM chat_links WHERE short_code = $1`, [code]);
+  return result.rows[0] || null;
+}
+
 async function setState(chatId, state) {
   const result = await db.query(
     `UPDATE chat_links SET state = $1 WHERE retell_chat_id = $2 RETURNING *`,
@@ -133,4 +183,5 @@ async function reopen(id, oldChatId, newChatId) {
 module.exports = {
   findByAppointment, findByJob, create, getByToken, getByTokenRaw, markOpened,
   getByRetellChatId, claimRetellChatId, setState, setStateByToken, reopen,
+  generateShortCode, claimShortCode, setShortUrl, getByShortCode,
 };

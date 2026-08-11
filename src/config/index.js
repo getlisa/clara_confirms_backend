@@ -47,6 +47,20 @@ module.exports = {
     fromEmail: process.env.SENDGRID_FROM_EMAIL || "developer@justclara.ai",
     fromName: process.env.SENDGRID_FROM_NAME || "Clara Confirms",
   },
+  // Masking the confirmation link in SMS. A carrier returned Twilio 30007
+  // ("Carrier violation") for our own domain while delivering the identical
+  // message carrying a tinyurl.com link, so the link is wrapped before it goes
+  // into an SMS body. Email is unaffected and keeps the full URL.
+  smsLinkMasking: {
+    // Default ON. Set SMS_LINK_MASKING=false to fall straight back to the
+    // plain URL if a shortener domain ever starts getting filtered itself.
+    enabled: process.env.SMS_LINK_MASKING !== "false",
+    provider: process.env.SMS_LINK_SHORTENER || "tinyurl",
+    // Where GET /c/<code> is served — the BACKEND's public origin. It cannot
+    // fall back to frontendUrl: that is a separate app which 404s on /c/.
+    // Blank disables masking (logged once) rather than minting a dead link.
+    publicApiUrl: (process.env.PUBLIC_API_URL || "").replace(/\/$/, ""),
+  },
   twilio: {
     accountSid: process.env.TWILIO_ACCOUNT_SID || "",
     authToken: process.env.TWILIO_AUTH_TOKEN || "",
