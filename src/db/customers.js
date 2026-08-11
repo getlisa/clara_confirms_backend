@@ -162,8 +162,7 @@ async function update(id, companyId, fields) {
  */
 async function getConfirmationContacts(customerId, companyId) {
   const { rows } = await db.query(
-    `SELECT c.id, c.first_name, c.last_name, c.phone, c.mobile,
-            c.alternate_phone, c.email, c.contact_role
+    `SELECT c.id, c.first_name, c.last_name, c.phone, c.mobile, c.email, c.contact_role, c.types
        FROM contacts c
        JOIN contact_companies cc ON cc.contact_id = c.id
       WHERE c.company_id = $1 AND cc.customer_id = $2
@@ -177,9 +176,9 @@ async function getConfirmationContacts(customerId, companyId) {
     last_name: c.last_name ?? null,
     phone: c.phone ?? null,
     mobile: c.mobile ?? null,
-    alternate_phone: c.alternate_phone ?? null,
     email: c.email ?? null,
     contact_role: c.contact_role ?? null,
+    contact_types: c.types ?? null,
   }));
 }
 
