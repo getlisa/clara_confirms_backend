@@ -17,6 +17,31 @@ const logger = require("../utils/logger");
 
 const isDev = process.env.NODE_ENV === "development";
 
+/**
+ * "<service line> — <description>" per service on a visit.
+ *
+ * Both halves matter and neither substitutes for the other: the line name is
+ * the category the customer recognises ("Alarm Systems"), the description is
+ * where the detail lives ("Annual Backflow Inspection (1-FL/2-Dom/1-Lawn/
+ * 1-Pool/Apollo RP IF4A/Located in Pool Mechanical Room)"). Falls back to
+ * whichever half exists rather than emitting a dangling separator.
+ *
+ * @param {object} appt — a shaped appointment from job-confirmation-context
+ * @param {object} [opts]
+ * @param {boolean} [opts.inline] — join with "; " for a one-line summary
+ *   instead of one service per line.
+ */
+function formatServiceDetails(appt, { inline = false } = {}) {
+  const details = appt?.service_details?.length
+    ? appt.service_details
+    : (appt?.service_lines || []).map((l) => ({ service_line: l, description: null }));
+  const parts = details
+    .map(({ service_line, description }) =>
+      service_line && description ? `${service_line} — ${description}` : (description || service_line))
+    .filter(Boolean);
+  return parts.length ? parts.join(inline ? "; " : "\n") : "";
+}
+
 // ── Time helpers (re-exported from ./office-hours for back-compat) ───────────
 const officeHours = require("./office-hours");
 const { toLocalHHMM, toLocalDayOfWeek, isWithinActiveHours, getNextWindowStart,
@@ -195,6 +220,27 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
             // The whole crew, not just appointments.technician_id — most
             // multi-service visits send two to four technicians.
             dynVars.next_technician = next.technician_summary || next.technician || "";
+
+            // The rich pair, one service per line: category AND the free-text
+            // description, which is where the real detail lives ("Annual
+            // Backflow Inspection (1-FL/2-Dom/1-Lawn/1-Pool/Apollo RP IF4A/
+            // Located in Pool Mechanical Room)"). next_service_line is only
+            // the short spoken categories for the opening sentence; this is
+            // what the agent reads when the customer asks what's actually
+            // being done, and what lets it match the right onsite-expectation
+            // entry.
+            dynVars.next_appointment_services = formatServiceDetails(next);
+
+            // Full crew with contact details, one per line, so the agent can
+            // answer "who's coming?" and "can I reach them?" without a tool
+            // call. next_technician stays the short spoken list.
+            dynVars.next_technicians = (next.technicians || [])
+              .filter((t) => t.name)
+              .map((t) => {
+                const contact = [t.phone, t.email].filter(Boolean).join(", ");
+                return contact ? `${t.name} (${contact})` : t.name;
+              })
+              .join("\n");
           }
           // One flat line per upcoming appointment — dynamic variables are
           // strings, so the list is pre-rendered here rather than asking the
@@ -207,8 +253,8 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
               // Full per-service wording here (not the short spoken summary):
               // this is reference context the agent reads, and it's what lets
               // it match the right onsite-expectation entry.
-              const svc = a.service_names?.length ? a.service_names : a.service_lines;
-              if (svc?.length) bits.push(`for ${svc.join("; ")}`);
+              const svc = formatServiceDetails(a, { inline: true });
+              if (svc) bits.push(`for ${svc}`);
               else if (a.service_line) bits.push(`for ${a.service_line}`);
               const techs = a.technician_names?.length ? a.technician_names : (a.technician ? [a.technician] : []);
               if (techs.length) bits.push(`with ${techs.join(", ")}`);

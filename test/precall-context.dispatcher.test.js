@@ -74,7 +74,7 @@ const scheduler = require("../src/services/scheduler");
  * Run one dispatcher pass for a single claimed row and return the dynamic
  * variables that would have gone to Retell.
  */
-async function dispatch({ row = {}, jobRecord = null, customerContact = null, comments = [] } = {}) {
+async function dispatch({ row = {}, jobRecord = null, customerContact = null, comments = [], crew = [] } = {}) {
   fakeDb.reset();
   logger.reset();
   lastCall = null;
@@ -84,7 +84,7 @@ async function dispatch({ row = {}, jobRecord = null, customerContact = null, co
   fakeDb.on("FROM companies WHERE id", [{ default_timezone: "America/New_York" }]);
   fakeDb.on("FROM scheduled_calls sc", []);
   fakeDb.on("company_name", [{ company_name: "Clara Fire", representative_name: "Clara" }]);
-  fakeDb.on("FROM appointment_technicians", []);
+  fakeDb.on("FROM appointment_technicians", crew);
   fakeDb.on("FROM scheduling_comments", comments.map((content) => ({ content })));
   fakeDb.on("FROM job_notes", []);
   fakeDb.on("FROM jobs j JOIN customers c", customerContact ? [customerContact] : []);
@@ -429,4 +429,107 @@ test("dispatch issues no extra queries for the pre-bound appointment facts", asy
   // round trip to the dispatch path.
   assert.equal(fakeDb.matched("FROM appointment_technicians").length, 1);
   assert.equal(fakeDb.matched(/FROM appointments a/).length, 0, "context comes from the job read, not a second appointment query");
+});
+
+// ── Service detail and crew as dynamic variables ─────────────────────────────
+//
+// next_service_line and next_technician are the SHORT spoken forms used in the
+// opening sentence. They deliberately drop detail, so on their own the agent
+// could not answer "what are you actually doing?" or "who's coming?" without a
+// tool round-trip — which is the latency this whole binding exists to avoid.
+// These two variables carry the rest.
+
+const svc = (name, description) => ({
+  service_line_name: name, service_line_trade: "Fire Protection", description,
+  status: "open", completion: null, estimated_price: null, duration: null,
+});
+
+test("next_appointment_services pairs each service line NAME with its description", async () => {
+  const { vars } = await dispatch({
+    jobRecord: job({ appointments: [appointment({
+      id: 11, start: inDays(3),
+      services: [
+        svc("Backflow", "Annual Backflow Inspection (1-FL/2-Dom/Pool Mechanical Room)"),
+        svc("Alarm Systems", "Annual Fire Alarm Inspection"),
+      ],
+    })] }),
+  });
+
+  const lines = vars.next_appointment_services.split("\n");
+  assert.deepEqual(lines, [
+    "Backflow — Annual Backflow Inspection (1-FL/2-Dom/Pool Mechanical Room)",
+    "Alarm Systems — Annual Fire Alarm Inspection",
+  ]);
+  assert.ok(!/Fire Protection/.test(vars.next_appointment_services),
+    "the trade repeats on every line for a fire contractor — noise, not information");
+});
+
+test("the rich detail survives in full while the spoken summary stays short", async () => {
+  const long = "Annual Fire Sprinkler Inspection (1-Wet)(1-Dry)(1-BF) riser in the north stairwell";
+  const { vars } = await dispatch({
+    jobRecord: job({ appointments: [appointment({
+      id: 11, start: inDays(3), services: [svc("Sprinkler", long)],
+    })] }),
+  });
+  assert.ok(vars.next_appointment_services.includes(long), "detail must not be truncated");
+  assert.equal(vars.next_service_line, "Sprinkler", "but the opening line says only the category");
+  assert.ok(!vars.next_service_line.includes("1-Wet"), "'(1-Wet)(1-Dry)' must never reach the opening sentence");
+});
+
+test("next_technicians lists the whole crew with contact details", async () => {
+  const { vars } = await dispatch({
+    crew: [
+      { appointment_id: 11, name: "Casey Nary", phone: null, email: "cnary@co.test" },
+      { appointment_id: 11, name: "Jack Valentine", phone: "+15551234567", email: null },
+    ],
+    jobRecord: job({ appointments: [appointment({ id: 11, start: inDays(3), technicianName: "Casey Nary" })] }),
+  });
+
+  assert.deepEqual(vars.next_technicians.split("\n"), [
+    "Casey Nary (cnary@co.test)",
+    "Jack Valentine (+15551234567)",
+  ]);
+  assert.equal(vars.next_technician, "Casey Nary and Jack Valentine", "the spoken form is names only");
+});
+
+test("a technician with no contact details is still named, without empty brackets", async () => {
+  const { vars } = await dispatch({
+    crew: [{ appointment_id: 11, name: "No Contact", phone: null, email: null }],
+    jobRecord: job({ appointments: [appointment({ id: 11, start: inDays(3) })] }),
+  });
+  assert.equal(vars.next_technicians, "No Contact");
+  assert.ok(!vars.next_technicians.includes("()"));
+});
+
+test("no services and no crew → both variables are empty strings, not 'undefined'", async () => {
+  const { vars } = await dispatch({
+    jobRecord: job({ appointments: [appointment({ id: 11, start: inDays(3), serviceLine: null, technicianName: null })] }),
+  });
+  assert.equal(vars.next_appointment_services, "");
+  assert.equal(vars.next_technicians, "");
+  for (const v of Object.values(vars)) {
+    assert.ok(!String(v).includes("undefined"), "a literal 'undefined' would be read aloud");
+  }
+});
+
+test("the upcoming list carries the same paired detail, not just categories", async () => {
+  const { vars } = await dispatch({
+    jobRecord: job({ appointments: [appointment({
+      id: 11, start: inDays(3), services: [svc("Backflow", "Annual Backflow Inspection")],
+    })] }),
+  });
+  assert.match(vars.upcoming_appointments, /Backflow — Annual Backflow Inspection/);
+});
+
+test("every appointment variable the prompt reads is registered as a dynamic variable", async () => {
+  const { vars } = await dispatch({
+    jobRecord: job({ appointments: [appointment({ id: 11, start: inDays(3), services: [svc("Backflow", "x")] })] }),
+  });
+  // Guards the failure mode where Retell speaks a literal "{{next_technicians}}"
+  // because the variable was bound at dispatch but never seeded.
+  const seeded = new Set(require("../src/db/dynamic-variable-definitions").VARIABLE_SEEDS.map((v) => v.name));
+  for (const k of ["next_appointment_services", "next_technicians", "next_service_line", "next_technician"]) {
+    assert.ok(k in vars, `${k} must be bound at dispatch`);
+    assert.ok(seeded.has(k), `${k} must be seeded, or a blank value renders as the literal placeholder`);
+  }
 });

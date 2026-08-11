@@ -359,10 +359,23 @@ async function fetchServicesByAppointment(companyId, appointmentIds) {
     [companyId, appointmentIds]
   );
   for (const r of rows) {
-    const serviceLine = [r.service_line_name, r.service_line_trade].filter(Boolean).join(" / ") || null;
+    const serviceLineName = r.service_line_name ?? null;
+    const serviceLineTrade = r.service_line_trade ?? null;
+
     if (!grouped.has(r.appointment_id)) grouped.set(r.appointment_id, []);
     grouped.get(r.appointment_id).push({
-      service_line:    serviceLine,
+      service_line_name: serviceLineName,
+      service_line_trade: serviceLineTrade,
+      // `service_line` is the NAME, and must keep being emitted: five call
+      // sites read it (the chat greeting, list_upcoming_appointments, the
+      // voice fallback, getJobById's per-appointment summary). Splitting the
+      // row into name/trade without it left every one of them undefined.
+      //
+      // Name only, not "Name / Trade": the trade is the same word on every
+      // line for a fire-protection contractor ("Alarm Systems / Fire
+      // Protection", "Sprinkler / Fire Protection"), so repeating it in
+      // speech is noise. It stays available as service_line_trade.
+      service_line:    serviceLineName || serviceLineTrade || null,
       description:     r.description ?? null,
       status:          r.status ?? null,
       completion:      r.completion ?? null,

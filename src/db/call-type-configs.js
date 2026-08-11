@@ -77,8 +77,12 @@ function generateDefaultPrompts(type, name, description) {
         "- Upcoming appointments: {{upcoming_count}}\n" +
         "- Still unconfirmed: {{unconfirmed_count}}\n" +
         "- Every upcoming one already confirmed? {{all_upcoming_confirmed}}\n" +
-        "- The next one: appointment {{next_appointment_id}} on {{next_appointment_date}} for {{next_service_line}}, technician {{next_technician}}\n" +
-        "- The full list (one per line — id, date, service, technician, confirmed state):\n" +
+        "- The next one: appointment {{next_appointment_id}} on {{next_appointment_date}} for {{next_service_line}}, with {{next_technician}}\n" +
+        "- What that visit actually covers (one service per line, as \"service line — description\"). The description is the detailed part: equipment, counts and locations. Use it when the customer asks what is being done, and to pick the right onsite-expectations entry. Do NOT read the whole block out verbatim — summarise it:\n" +
+        "{{next_appointment_services}}\n" +
+        "- Who is coming (the FULL crew, one per line, with contact details):\n" +
+        "{{next_technicians}}\n" +
+        "- The full list of upcoming visits (one per line — id, date, services, technicians, confirmed state):\n" +
         "{{upcoming_appointments}}\n\n" +
         "These were read from the live system moments before this call started, so you can open with them immediately. Two hard rules about them:\n" +
         "  1. THEY DO NOT UPDATE DURING THE CALL. The moment you confirm, reschedule, cancel or create anything, they are out of date — call get_appointments before you state any count, date or confirmation state again.\n" +

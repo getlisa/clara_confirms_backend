@@ -185,8 +185,29 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     // extinguisher + sprinkler), and naming only services[0] told the customer
     // about one of four — and left the agent unable to pick the combined
     // onsite-expectation entry, which is keyed on the full set.
-    const lines = dedupe(svc.map((s) => s.service_line));
+    // Prefer the explicit name field, falling back to the combined
+    // `service_line` — tolerant of both row shapes rather than assuming one.
+    const svcLine = (s) => s.service_line_name || s.service_line || null;
+    const lines = dedupe(svc.map(svcLine));
     const detail = dedupe(svc.map((s) => cleanServiceDescription(s.description)));
+
+    // Line name AND description, kept together. `lines` and `detail` above are
+    // deduped independently, which loses the pairing: three services collapse
+    // into two lists the agent can't reassociate. The description is the rich
+    // part ("Annual Backflow Inspection (1-FL/2-Dom/…/Pool Mechanical Room)")
+    // but is meaningless without the category it belongs to, so this is the
+    // form the prompt actually consumes. Deduped on the PAIR.
+    const seenPair = new Set();
+    const serviceDetails = [];
+    for (const s of svc) {
+      const line = svcLine(s);
+      const description = cleanServiceDescription(s.description);
+      if (!line && !description) continue;
+      const key = `${line} ${description}`;
+      if (seenPair.has(key)) continue;
+      seenPair.add(key);
+      serviceDetails.push({ service_line: line, description });
+    }
 
     // The whole crew, not just appointments.technician_id. 240 of company 9's
     // 459 appointments have more than one technician assigned (up to four), so
@@ -219,6 +240,11 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     // which is what matches the onsite-expectation entries.
     service_lines: lines.length ? lines : (jobServiceLines[0] ? [jobServiceLines[0]] : []),
     service_names: detail,
+    // [{service_line, description}] — the pairing, for anything that needs to
+    // state what the visit covers rather than just list categories.
+    service_details: serviceDetails.length
+      ? serviceDetails
+      : (jobServiceLines[0] ? [{ service_line: jobServiceLines[0], description: null }] : []),
     // Short spoken form for the opening line: "Backflow, Alarm Systems,
     // Portable Extinguishers and Sprinkler". Built from the category list
     // rather than the descriptions, which carry trade suffixes, embedded

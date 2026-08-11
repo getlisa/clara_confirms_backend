@@ -273,3 +273,93 @@ test("nothing renders a literal null, undefined or [object Object]", async () =>
     assert.ok(!out.includes(bad), `prompt must never contain a literal "${bad}"`);
   }
 });
+
+// ── Service line NAME + description, kept together ───────────────────────────
+//
+// `service_lines` and `service_names` are deduped independently, so on their
+// own they cannot be reassociated: three services become two lists. The
+// description is the rich half ("Annual Backflow Inspection (1-FL/2-Dom/…/Pool
+// Mechanical Room)") and the line name is the category it belongs to; the
+// prompt needs the pair.
+
+test("service_details pairs each line name with its own description", async () => {
+  const ctx = await ctxFor({ services: [
+    service("Backflow", "Annual Backflow Inspection"),
+    service("Alarm Systems", "Annual Fire Alarm Inspection"),
+    service("Sprinkler", "Annual Fire Sprinkler Inspection"),
+  ] });
+  assert.deepEqual(nextOf(ctx).service_details, [
+    { service_line: "Backflow", description: "Annual Backflow Inspection" },
+    { service_line: "Alarm Systems", description: "Annual Fire Alarm Inspection" },
+    { service_line: "Sprinkler", description: "Annual Fire Sprinkler Inspection" },
+  ]);
+});
+
+test("pairs are deduped on the PAIR, not on either half alone", async () => {
+  const ctx = await ctxFor({ services: [
+    service("Sprinkler", "Quarterly Inspection"),
+    service("Sprinkler", "Quarterly Inspection"),   // true duplicate
+    service("Sprinkler", "Annual Inspection"),      // same line, different work
+  ] });
+  const d = nextOf(ctx).service_details;
+  assert.equal(d.length, 2, "same line with different work is two services, not one");
+  assert.deepEqual(d.map((x) => x.description), ["Quarterly Inspection", "Annual Inspection"]);
+});
+
+test("a service with a line but no description keeps the line", async () => {
+  const ctx = await ctxFor({ services: [service("Backflow", null)] });
+  assert.deepEqual(nextOf(ctx).service_details, [{ service_line: "Backflow", description: null }]);
+});
+
+test("a service with neither line nor description is dropped entirely", async () => {
+  const ctx = await ctxFor({ services: [service(null, null), service("Backflow", "Annual Backflow Inspection")] });
+  assert.deepEqual(nextOf(ctx).service_details, [
+    { service_line: "Backflow", description: "Annual Backflow Inspection" },
+  ]);
+});
+
+test("the note-only description leaves the pair with its line intact", async () => {
+  const ctx = await ctxFor({ services: [service("Sprinkler", "**INTERNAL ONLY**")] });
+  assert.deepEqual(nextOf(ctx).service_details, [{ service_line: "Sprinkler", description: null }]);
+});
+
+test("both row shapes are tolerated — service_line_name and the combined service_line", async () => {
+  const ctx = await ctxFor({ services: [
+    { service_line_name: "Backflow", service_line_trade: "Fire Protection", description: "From the split shape" },
+    { service_line: "Sprinkler", description: "From the legacy shape" },
+  ] });
+  assert.deepEqual(nextOf(ctx).service_details.map((d) => d.service_line), ["Backflow", "Sprinkler"]);
+});
+
+// ── Regression guard ─────────────────────────────────────────────────────────
+
+test("db/jobs still emits `service_line` on each service", async () => {
+  // Splitting the row into service_line_name/service_line_trade without also
+  // emitting service_line left FIVE consumers reading undefined — the chat
+  // greeting, list_upcoming_appointments, the voice fallback and getJobById's
+  // own per-appointment summary all silently lost the service.
+  const realJobsDb = require.cache[require.resolve("../src/db/jobs")];
+  delete require.cache[require.resolve("../src/db/jobs")];
+  db.reset();
+  db.on("FROM jobs j", [{
+    id: 10, company_id: 9, customer_id: 1, status: "scheduled",
+    customer_name: "Acme", location_name: null,
+  }]);
+  db.on("FROM appointments a", [{ id: 1, job_id: 10, status: "scheduled", scheduled_start: future() }]);
+  db.on("FROM appointment_services aps", [{
+    appointment_id: 1, description: "Annual Backflow Inspection",
+    service_line_name: "Backflow", service_line_trade: "Fire Protection",
+    status: "open", completion: null, estimated_price: null, duration: null,
+  }]);
+  db.on("FROM appointment_technicians", []);
+  db.on("FROM quotations", []);
+
+  const fresh = require("../src/db/jobs");
+  const job = await fresh.getJobById(10, 9);
+  const s = job.appointments[0].services[0];
+  assert.equal(s.service_line, "Backflow", "service_line must survive as the NAME");
+  assert.equal(s.service_line_name, "Backflow");
+  assert.equal(job.appointments[0].service_line, "Backflow", "and roll up to the appointment");
+
+  if (realJobsDb) require.cache[require.resolve("../src/db/jobs")] = realJobsDb;
+});
