@@ -14,6 +14,9 @@ const TODO_TYPES = {
   SERVICE_LINK: "SERVICE_LINK",
   CRM_SYNC: "CRM_SYNC",
   APPOINTMENT_CANCELLED: "APPOINTMENT_CANCELLED",
+  // More contacts matched call_settings.confirmation_contact_types than the
+  // per-customer recipient cap allows — see services/confirmation-recipients.js.
+  RECIPIENTS_TRUNCATED: "RECIPIENTS_TRUNCATED",
 };
 
 /**

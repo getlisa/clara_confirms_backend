@@ -586,13 +586,21 @@ async function enqueueConfirmationForJobRow(companyId, callType, callSettings, t
     channelStrategy: callSettings.channel_strategy,
   });
 
-  const recipients = await resolveConfirmationRecipients(companyId, {
-    full_name: row.customer_name,
-    phone: row.customer_phone,
-    email: row.customer_email,
-    confirmation_include_customer: row.confirmation_include_customer,
-    confirmation_contact_ids: row.confirmation_contact_ids,
-  });
+  const recipients = await resolveConfirmationRecipients(
+    companyId,
+    {
+      // `id` is what lets the resolver reach this customer's contacts for the
+      // company-wide contact-type default (migration 087). Without it that
+      // rule is skipped and resolution falls back to the customer record.
+      id: row.customer_id,
+      full_name: row.customer_name,
+      phone: row.customer_phone,
+      email: row.customer_email,
+      confirmation_include_customer: row.confirmation_include_customer,
+      confirmation_contact_ids: row.confirmation_contact_ids,
+    },
+    { contactTypes: callSettings.confirmation_contact_types || [] }
+  );
 
   const scheduledAt = bypassOfficeHours || dev
     ? new Date()
@@ -712,6 +720,7 @@ async function enqueueJobConfirmation(companyId, jobId, { callType = "customer_c
             j.title AS job_name, j.description AS job_description, j.job_type,
             lead.id AS appointment_id, lead.status AS appointment_status,
             lead.scheduled_start AS lead_scheduled_start,
+            c.id AS customer_id,
             c.phone AS customer_phone, c.email AS customer_email, c.full_name AS customer_name,
             c.address_line1, c.city, c.state, c.is_voice, c.is_sms, c.is_email,
             c.confirmation_include_customer, c.confirmation_contact_ids
@@ -879,6 +888,7 @@ async function processScheduledUnconfirmed(companyId, trigger, callSettings, tz,
             lead.id AS appointment_id, lead.status AS appointment_status,
             lead.scheduled_start AS lead_scheduled_start,
             cnt.upcoming_count, cnt.unconfirmed_count,
+            c.id AS customer_id,
             c.phone AS customer_phone, c.email AS customer_email, c.full_name AS customer_name,
             c.address_line1, c.city, c.state, c.is_voice, c.is_sms, c.is_email,
             c.confirmation_include_customer, c.confirmation_contact_ids

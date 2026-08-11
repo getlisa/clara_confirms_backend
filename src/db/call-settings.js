@@ -22,6 +22,9 @@ const DEFAULTS = {
   sms_on_callback_enabled: false,
   chat_link_delivery_method: "email",
   job_confirmation_inference_enabled: false,
+  // Contact types whose contacts become the default confirmation recipients.
+  // Empty = off (today's behaviour). See migration 087.
+  confirmation_contact_types: [],
 };
 
 function rowToSettings(row) {
@@ -37,6 +40,7 @@ function rowToSettings(row) {
     sms_on_callback_enabled: row.sms_on_callback_enabled ?? false,
     chat_link_delivery_method: row.chat_link_delivery_method ?? "email",
     job_confirmation_inference_enabled: row.job_confirmation_inference_enabled ?? false,
+    confirmation_contact_types: row.confirmation_contact_types ?? [],
   };
 }
 
@@ -47,7 +51,8 @@ const SELECT_COLS = `
   auto_schedule_enabled, auto_dispatch_enabled,
   crm_comment_writeback_enabled, service_link_enabled,
   channel_strategy, sms_on_callback_enabled, chat_link_delivery_method,
-  job_confirmation_inference_enabled
+  job_confirmation_inference_enabled,
+  confirmation_contact_types
 `;
 
 async function getByCompanyId(companyId) {
@@ -56,6 +61,22 @@ async function getByCompanyId(companyId) {
     [companyId]
   );
   return result.rows[0] ? rowToSettings(result.rows[0]) : { ...DEFAULTS };
+}
+
+/**
+ * Values that must be stored canonically, applied HERE rather than in the
+ * route: the copilot's update-call-settings tool calls upsert() directly, so
+ * anything normalised only at the route would be stored raw when set by the
+ * agent — and `confirmation_contact_types` is matched with an exact
+ * comparison, so a stray capital or trailing space silently matches nobody.
+ */
+function normalizeValue(key, value) {
+  if (key === "confirmation_contact_types" && Array.isArray(value)) {
+    return [...new Set(
+      value.filter((t) => typeof t === "string").map((t) => t.trim().toLowerCase()).filter(Boolean)
+    )];
+  }
+  return value;
 }
 
 async function upsert(companyId, fields) {
@@ -67,11 +88,15 @@ async function upsert(companyId, fields) {
     "crm_comment_writeback_enabled", "service_link_enabled",
     "channel_strategy", "sms_on_callback_enabled", "chat_link_delivery_method",
     "job_confirmation_inference_enabled",
+    // TEXT[] — node-postgres serialises the JS array directly, so it needs no
+    // special case in the generic parameter builder below (a jsonb column
+    // would have; see migration 087).
+    "confirmation_contact_types",
   ];
   const keys = Object.keys(fields).filter((k) => allowed.includes(k));
   if (keys.length === 0) return getByCompanyId(companyId);
   const setClauses = keys.map((k, i) => `${k} = $${i + 2}`).join(", ");
-  const values = [companyId, ...keys.map((k) => fields[k])];
+  const values = [companyId, ...keys.map((k) => normalizeValue(k, fields[k]))];
   const result = await db.query(
     `INSERT INTO call_settings (company_id, ${keys.join(", ")})
      VALUES ($1, ${keys.map((_, i) => `$${i + 2}`).join(", ")})
