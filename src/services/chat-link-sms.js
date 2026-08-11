@@ -29,7 +29,7 @@
 const { sendSms } = require("../utils/sms");
 const { buildChatLinkUrl } = require("./chat-link-email");
 const chatLinksDb = require("../db/chat-links");
-const { shorten } = require("./link-shortener");
+const { shorten, resolvesCleanlyTo } = require("./link-shortener");
 const config = require("../config");
 const logger = require("../utils/logger");
 
@@ -81,8 +81,24 @@ async function buildSmsLinkUrl(token, link) {
   const cfg = config.smsLinkMasking || {};
   if (!cfg.enabled) return plain;
 
-  // Cached from an earlier send/retry — never re-mint for the same link.
-  if (link?.short_url) return link.short_url;
+  // Cached from an earlier send/retry — but VERIFIED before reuse, not trusted.
+  //
+  // A poisoned cache really happened: a row held
+  // "https://tinyurl.com/<our-own-short-code>", which is a 404 on TinyURL, and
+  // this function re-sent it to a customer three times without ever looking at
+  // it. Whatever wrote it, a cached value is only an optimisation — it must
+  // never be able to outlive its own correctness. If it no longer resolves to
+  // this link's chat URL, it is discarded and re-minted.
+  if (link?.short_url) {
+    // Defensive despite resolvesCleanlyTo documenting that it never throws —
+    // the same assumption already cost a confirmation once with shorten().
+    const ok = await resolvesCleanlyTo(link.short_url, plain).catch(() => false);
+    if (ok) return link.short_url;
+    logger.warn("chat-link-sms: cached short_url is stale or wrong — re-minting", {
+      linkId: link.id, cached: link.short_url,
+    });
+    if (link.id) await chatLinksDb.setShortUrl(link.id, null).catch(() => {});
+  }
 
   // The real chat URL is what gets shortened. An earlier version pointed the
   // shortener at our own /c/<code> redirect instead, on the theory that the

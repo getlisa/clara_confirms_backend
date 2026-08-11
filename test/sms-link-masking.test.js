@@ -31,9 +31,11 @@ stub("utils/sms", { sendSms: async ({ to, body }) => { smsSent.push({ to, body }
 
 let shortenImpl = async () => "https://tinyurl.com/masked01";
 const shortenCalls = [];
+let resolvesImpl = async () => true;
+const resolveCalls = [];
 stub("services/link-shortener", {
   shorten: async (url) => { shortenCalls.push(url); return shortenImpl(url); },
-  resolvesCleanlyTo: async () => true,
+  resolvesCleanlyTo: async (short, expected) => { resolveCalls.push([short, expected]); return resolvesImpl(short, expected); },
 });
 
 const cfg = {
@@ -69,6 +71,8 @@ function reset(over = {}) {
   db.reset(); logger.reset();
   smsSent.length = 0; shortenCalls.length = 0;
   shortenImpl = async () => "https://tinyurl.com/masked01";
+  resolvesImpl = async () => true;
+  resolveCalls.length = 0;
   cfg.smsLinkMasking = { enabled: true, provider: "tinyurl", ...over };
   // Defaults for the two writes the happy path makes. Registered here rather
   // than per-test so a test that forgets one gets working behaviour instead of
@@ -180,11 +184,39 @@ test("no link row → still masked, just not cached", async () => {
 
 // ── Idempotence ──────────────────────────────────────────────────────────────
 
-test("a cached short_url is reused — the shortener is not called again", async () => {
+test("a cached short_url is reused — but only after being verified", async () => {
   reset();
   await send({ link: { ...LINK, short_url: "https://tinyurl.com/cached" } });
-  assert.equal(shortenCalls.length, 0, "a resend or retry must not re-mint a link");
+  assert.equal(shortenCalls.length, 0, "a resend or retry must not re-mint a good link");
   assert.match(smsSent[0].body, /tinyurl\.com\/cached/);
+  assert.equal(resolveCalls.length, 1, "the cache is checked, not trusted");
+  assert.deepEqual(resolveCalls[0], ["https://tinyurl.com/cached", `https://confirms.justclara.ai/chat/${TOKEN}`]);
+});
+
+test("a POISONED cached short_url is discarded and re-minted", async () => {
+  // This really happened: a row held "https://tinyurl.com/<our-own-code>",
+  // a 404, and it was re-sent to a customer three times unchecked.
+  reset();
+  resolvesImpl = async (short) => !short.includes("S4b1esYZ6G");
+  await send({ link: { ...LINK, short_url: "https://tinyurl.com/S4b1esYZ6G" } });
+  assert.equal(shortenCalls.length, 1, "must re-mint rather than reuse a bad value");
+  assert.match(smsSent[0].body, /tinyurl\.com\/masked01/);
+  assert.ok(!smsSent[0].body.includes("S4b1esYZ6G"), "the bad link must never reach a customer again");
+});
+
+test("a poisoned cache is cleared so the next send does not re-check it", async () => {
+  reset();
+  resolvesImpl = async (short) => !short.includes("bad");
+  await send({ link: { ...LINK, short_url: "https://tinyurl.com/bad" } });
+  const cleared = db.calls.find((c) => c.sql.includes("SET short_url") && c.params[0] === null);
+  assert.ok(cleared, "the row should be nulled, not left to fail verification forever");
+});
+
+test("if the cached link cannot be verified, the send still happens", async () => {
+  reset();
+  resolvesImpl = async () => { throw new Error("network down"); };
+  await assert.doesNotReject(() => send({ link: { ...LINK, short_url: "https://tinyurl.com/cached" } }));
+  assert.equal(smsSent.length, 1);
 });
 
 test("no short code is claimed any more — nothing needs one", async () => {
@@ -238,4 +270,29 @@ test("a missing job name drops the clause rather than leaving a dangling 'for'",
   assert.ok(!/ for \./.test(smsSent[0].body));
   assert.ok(!smsSent[0].body.includes("null"));
   assert.match(smsSent[0].body, /appointment with Total Fire & Security/);
+});
+
+// ── The trailing-slash trap ──────────────────────────────────────────────────
+
+test("a trailing slash on FRONTEND_URL does not produce a double slash", () => {
+  // One character in .env caused a cascade: FRONTEND_URL ended in "/", so
+  // buildChatLinkUrl produced host//chat/<token>. The shortener normalised the
+  // double slash when resolving, so the interception guard compared the
+  // normalised target against the malformed original, declared the link
+  // hijacked, and fell back to the unmasked URL — which the carrier then
+  // blocked. Normalising in config is what stops all of that.
+  const path = require("path");
+  const configPath = require.resolve(path.join(__dirname, "..", "src", "config", "index.js"));
+  const before = process.env.FRONTEND_URL;
+  try {
+    for (const raw of ["https://x.test/", "https://x.test//", "https://x.test"]) {
+      process.env.FRONTEND_URL = raw;
+      delete require.cache[configPath];
+      const fresh = require(configPath);
+      assert.equal(fresh.frontendUrl, "https://x.test", `${raw} should normalise`);
+    }
+  } finally {
+    if (before === undefined) delete process.env.FRONTEND_URL; else process.env.FRONTEND_URL = before;
+    delete require.cache[configPath];
+  }
 });

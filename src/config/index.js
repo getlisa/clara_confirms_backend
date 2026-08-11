@@ -41,7 +41,13 @@ module.exports = {
     serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
     jwtSecret: process.env.SUPABASE_JWT_SECRET,
   },
-  frontendUrl: process.env.FRONTEND_URL || "http://localhost:8080",
+  // Trailing slash stripped: every consumer appends its own path
+  // (`${frontendUrl}/chat/...`, `/reset-password`, `/auth/link-login`), so a
+  // trailing slash in the env produced `host//chat/<token>`. That double slash
+  // was not merely ugly — the shortener normalised it away when resolving, so
+  // the interception guard compared the normalised target against the malformed
+  // original, declared the link hijacked, and fell back to the unmasked URL.
+  frontendUrl: (process.env.FRONTEND_URL || "http://localhost:8080").replace(/\/+$/, ""),
   sendgrid: {
     apiKey: process.env.SENDGRID_API_KEY || "",
     fromEmail: process.env.SENDGRID_FROM_EMAIL || "developer@justclara.ai",
