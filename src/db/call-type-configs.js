@@ -72,13 +72,20 @@ function generateDefaultPrompts(type, name, description) {
         "- Job: {{job_name}} (job number {{job_number}})\n" +
         "- Description: {{job_description}}\n" +
         "- Notes from our team on this job: {{job_comments}}\n" +
-        "- Customer address: {{customer_address}}\n\n" +
+        "- Customer address: {{customer_address}}\n" +
+        "- Their email on file: {{customer_email}}\n" +
+        "- Their phone on file: {{customer_phone}}\n" +
+        "  (Use these when relevant — confirming where to send something, or if they ask what we have on file. Never read them out unprompted. If one is blank we do not have it: ask, never guess.)\n\n" +
         "THIS JOB'S APPOINTMENTS (given to you up front — no tool call needed to start talking):\n" +
         "- Upcoming appointments: {{upcoming_count}}\n" +
         "- Still unconfirmed: {{unconfirmed_count}}\n" +
         "- Every upcoming one already confirmed? {{all_upcoming_confirmed}}\n" +
-        "- The next one: appointment {{next_appointment_id}} on {{next_appointment_date}} for {{next_service_line}}, technician {{next_technician}}\n" +
-        "- The full list (one per line — id, date, service, technician, confirmed state):\n" +
+        "- The next one: appointment {{next_appointment_id}} on {{next_appointment_date}} for {{next_service_line}}, with {{next_technician}}\n" +
+        "- What that visit actually covers (one service per line, as \"service line — description\"). The description is the detailed part: equipment, counts and locations. Use it when the customer asks what is being done, and to pick the right onsite-expectations entry. Do NOT read the whole block out verbatim — summarise it:\n" +
+        "{{next_appointment_services}}\n" +
+        "- Who is coming (the FULL crew, one per line, with contact details):\n" +
+        "{{next_technicians}}\n" +
+        "- The full list of upcoming visits (one per line — id, date, services, technicians, confirmed state):\n" +
         "{{upcoming_appointments}}\n\n" +
         "These were read from the live system moments before this call started, so you can open with them immediately. Two hard rules about them:\n" +
         "  1. THEY DO NOT UPDATE DURING THE CALL. The moment you confirm, reschedule, cancel or create anything, they are out of date — call get_appointments before you state any count, date or confirmation state again.\n" +
@@ -163,8 +170,10 @@ function generateDefaultPrompts(type, name, description) {
         "  → Ask: \"Would you like me to email you a service link where you can follow this job?\"\n" +
         "  → If NO: skip this section and wrap up.\n" +
         "  → If YES:\n" +
-        "     1. If {{customer_email}} is not empty, present it instead of asking blind: \"I have your email on file as {{customer_email}} — is that still the best one to use?\" Use it if they confirm; if they give a different one, use that instead. If {{customer_email}} IS empty, ask for the email address the normal way and confirm the spelling back to them.\n" +
-        "     2. Call resolve_service_link_contact with that email — do not ask for their name or role first.\n" +
+        "     1. Read the address back and get an explicit yes. If {{customer_email}} is not empty: \"I have your email as {{customer_email}} — is that the right one to send it to?\" If it IS empty, ask for it and read back what you heard, letter by letter if it is at all unusual.\n" +
+        "     2. ONLY after they say yes (or give you a different address), call resolve_service_link_contact with that email AND email_confirmed=true. Do not ask for their name or role first.\n" +
+        "        • Calling it without email_confirmed=true returns status \"needs_email_confirmation\" and sends nothing — go back and ask.\n" +
+        "        • Never set email_confirmed=true for an address they have not actually agreed to. If no contact matches, this tool CREATES one in our CRM, so a misheard address is not just a misdirected link.\n" +
         "        • If the result status is \"found\": confirm back with the customer (e.g. \"I found you in our system as [name] — is that right?\") and continue — no further info needed.\n" +
         "        • If the result status is \"need_more_info\": THEN, and only then, ask who this is for / their role (e.g. management, billing, on-site, scheduling, owner) and their first/last name, then call resolve_service_link_contact again including email, first_name, last_name, and role.\n" +
         "     3. If {{is_chat_session}} is \"true\": immediately call get_service_link. The link itself is displayed to the customer automatically as a preview card — do NOT type or paste the URL yourself, just say something like \"Perfect — here's your service link below! I've also sent it to [email].\" Do this every time, not just when asked.\n" +

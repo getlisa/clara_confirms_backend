@@ -314,14 +314,18 @@ async function triggerManualCall({
     /^\d+$/.test(String(hydrated.jobId || ""))
   ) {
     const { rows: custRows } = await db.query(
-      `SELECT c.full_name, c.phone, c.email,
+      `SELECT c.id, c.full_name, c.phone, c.email,
               c.confirmation_include_customer, c.confirmation_contact_ids
          FROM jobs j JOIN customers c ON c.id = j.customer_id
         WHERE j.id = $1 AND j.company_id = $2`,
       [hydrated.jobId, companyId]
     );
     if (custRows[0]) {
-      const recipients = await resolveConfirmationRecipients(companyId, custRows[0]);
+      // callSettings is already loaded above; passing the contact-type default
+      // keeps this manual path in step with the sweep (migration 087).
+      const recipients = await resolveConfirmationRecipients(companyId, custRows[0], {
+        contactTypes: callSettings.confirmation_contact_types || [],
+      });
       // The customer themselves (recipientContactId: null) is already the
       // row just inserted above — only fan out to the EXTRA contacts.
       const extras = recipients.filter((r) => r.recipientContactId != null);

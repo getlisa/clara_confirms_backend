@@ -14,6 +14,7 @@ const FIELDS = [
   "business_hours_end",
   "max_attempts",
   "alert_days_before",
+  "confirmation_contact_types",
 ];
 
 const schema = z
@@ -27,6 +28,7 @@ const schema = z
     business_hours_end: z.string().nullish().describe("Business hours end, 'HH:MM' (24h)."),
     max_attempts: z.number().int().min(1).max(10).nullish().describe("Max call attempts before giving up."),
     alert_days_before: z.number().int().min(0).max(30).nullish().describe("Days before an appointment to start confirming."),
+    confirmation_contact_types: z.array(z.string()).nullish().describe("CRM contact types (e.g. 'on-site', 'scheduling', 'property manager') whose contacts become the default confirmation recipients for every customer. Empty array turns this off and reverts to contacting the customer record. Contacts explicitly picked on an individual customer always take precedence."),
   })
   .refine((v) => FIELDS.some((f) => v[f] != null), {
     message: "Provide at least one setting to change.",

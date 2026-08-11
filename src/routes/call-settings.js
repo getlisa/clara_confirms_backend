@@ -63,7 +63,7 @@ router.patch("/", async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
-    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled, crm_comment_writeback_enabled, service_link_enabled, channel_strategy, sms_on_callback_enabled, chat_link_delivery_method } = req.body;
+    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled, crm_comment_writeback_enabled, service_link_enabled, channel_strategy, sms_on_callback_enabled, chat_link_delivery_method, confirmation_contact_types } = req.body;
     const fields = {};
     if (business_hours_start !== undefined) fields.business_hours_start = business_hours_start;
     if (business_hours_end   !== undefined) fields.business_hours_end   = business_hours_end;
@@ -130,6 +130,19 @@ router.patch("/", async (req, res) => {
         return res.status(400).json({ error: "chat_link_delivery_method must be 'email', 'sms', or 'both'" });
       fields.chat_link_delivery_method = chat_link_delivery_method;
     }
+    if (confirmation_contact_types !== undefined) {
+      if (!Array.isArray(confirmation_contact_types) ||
+          !confirmation_contact_types.every((t) => typeof t === "string" && t.trim() !== ""))
+        return res.status(400).json({ error: "confirmation_contact_types must be an array of strings" });
+      // Normalised on write (lower + trim + dedupe) so matching against
+      // lower(btrim(type)) is an exact comparison rather than a per-row
+      // transform of both sides. The source values are free text — company 9
+      // alone has 140 distinct spellings, including trailing spaces and case
+      // variants of the same label.
+      fields.confirmation_contact_types = [
+        ...new Set(confirmation_contact_types.map((t) => t.trim().toLowerCase())),
+      ];
+    }
     if (Object.keys(fields).length === 0)
       return res.status(400).json({ error: "No fields to update" });
     const settings = await callSettingsDb.upsert(companyId, fields);
@@ -156,6 +169,39 @@ router.patch("/", async (req, res) => {
   } catch (err) {
     logger.error("PATCH /call-settings failed", { error: err.message });
     return res.status(500).json({ error: "Failed to update call settings" });
+  }
+});
+
+/**
+ * GET /call-settings/contact-types
+ *
+ * Options for the confirmation_contact_types picker: every distinct contact
+ * type this company actually has, with how many contacts carry it.
+ *
+ * Not a fixed enum — these are free-text labels from the CRM and differ per
+ * company (company 9 alone has 140 distinct values). The counts matter because
+ * the values are inconsistent: "maintenance" and "Maintenace" both exist, as do
+ * "on-site" and "onsite", so a user needs to see and select each variant they
+ * care about. Normalised the same way the setting is stored, so what's returned
+ * here can be sent straight back in the PATCH.
+ */
+router.get("/contact-types", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const { rows } = await db.query(
+      `SELECT lower(btrim(t)) AS type, count(DISTINCT c.id)::int AS contact_count
+         FROM contacts c, jsonb_array_elements_text(c.types) t
+        WHERE c.company_id = $1 AND btrim(t) <> ''
+        GROUP BY 1
+        ORDER BY contact_count DESC, type`,
+      [companyId]
+    );
+    return res.json({ contact_types: rows });
+  } catch (err) {
+    logger.error("GET /call-settings/contact-types failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to load contact types" });
   }
 });
 

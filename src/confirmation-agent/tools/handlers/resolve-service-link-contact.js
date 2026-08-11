@@ -20,14 +20,36 @@ const { maybeSendServiceLinkNow } = require("../service-link-helpers");
 
 const schema = z.object({
   email: z.string().describe("The email address to send the service link to."),
+  email_confirmed: z.boolean().describe(
+    "Set true ONLY after the customer has explicitly confirmed this exact address in their reply — either agreeing to the one on file or giving you a new one. Never set true on an address you inferred, remembered, or read from context without asking."
+  ),
   first_name: z.string().nullish().describe("Only if no existing contact matched this email."),
   last_name: z.string().nullish().describe("Only if no existing contact matched this email."),
   role: z.string().nullish().describe("e.g. management, billing, on-site, scheduling, owner — only if no existing contact matched."),
   phone: z.string().nullish(),
 });
 
-async function run({ email, first_name, last_name, role, phone }, config) {
+async function run({ email, email_confirmed, first_name, last_name, role, phone }, config) {
   const { companyId, jobId, threadId, jobRef, customerRef } = config?.configurable?.ctx || {};
+
+  // Hard gate, deliberately ahead of the CRM search. An unconfirmed address is
+  // not just a bad send target — this tool CREATES a ServiceTrade contact when
+  // nothing matches, so acting on a guess writes a junk contact into the
+  // customer's CRM and mails a job link to whoever owns that address. The
+  // prompt also asks for confirmation, but a prompt is advisory; this is not.
+  if (email_confirmed !== true) {
+    logger.info("resolve_service_link_contact: refused, email not confirmed by the customer", {
+      companyId, jobId, threadId,
+    });
+    return JSON.stringify({
+      status: "needs_email_confirmation",
+      email,
+      message:
+        `Do not send yet. Read ${email} back to the customer and ask if it is the right address ` +
+        `(e.g. "I have ${email} — is that the best address for it?"). Call this tool again with ` +
+        `email_confirmed=true once they say yes, or with the corrected address they give you.`,
+    });
+  }
 
   const candidates = await serviceLink.searchContacts(companyId, email);
   const exactMatch = candidates.find((c) => c.email && c.email.toLowerCase() === email.toLowerCase());

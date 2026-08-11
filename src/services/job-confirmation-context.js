@@ -92,17 +92,26 @@ async function fetchTechniciansByAppointment(appointmentIds) {
   // `appointment_technicians` has no company_id — tenant scoping comes from the
   // appointment ids, which the caller already scoped via getJobById.
   const { rows } = await db.query(
+    // Ordered so the crew reads the same way on every turn and every call.
+    // Without it Postgres is free to return a different order each time, which
+    // on a re-rendered prompt looks like the crew changed.
     `SELECT at.appointment_id,
             t.first_name || ' ' || t.last_name AS name,
-            t.phone
+            t.phone, t.email
        FROM appointment_technicians at
        JOIN technicians t ON t.id = at.technician_id
-      WHERE at.appointment_id = ANY($1::int[])`,
+      WHERE at.appointment_id = ANY($1::int[])
+      ORDER BY at.appointment_id, t.first_name, t.last_name, t.id`,
     [appointmentIds]
   );
   for (const r of rows) {
     if (!grouped.has(r.appointment_id)) grouped.set(r.appointment_id, []);
-    grouped.get(r.appointment_id).push({ name: (r.name || "").trim() || null, phone: r.phone ?? null });
+    const list = grouped.get(r.appointment_id);
+    const name = (r.name || "").trim() || null;
+    // The same person can be attached twice (two service lines on one visit);
+    // the customer should hear them once.
+    if (name && list.some((t) => t.name === name)) continue;
+    list.push({ name, phone: r.phone ?? null, email: r.email ?? null });
   }
   return grouped;
 }
@@ -176,8 +185,38 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     // extinguisher + sprinkler), and naming only services[0] told the customer
     // about one of four — and left the agent unable to pick the combined
     // onsite-expectation entry, which is keyed on the full set.
-    const lines = dedupe(svc.map((s) => s.service_line));
+    // Prefer the explicit name field, falling back to the combined
+    // `service_line` — tolerant of both row shapes rather than assuming one.
+    const svcLine = (s) => s.service_line_name || s.service_line || null;
+    const lines = dedupe(svc.map(svcLine));
     const detail = dedupe(svc.map((s) => cleanServiceDescription(s.description)));
+
+    // Line name AND description, kept together. `lines` and `detail` above are
+    // deduped independently, which loses the pairing: three services collapse
+    // into two lists the agent can't reassociate. The description is the rich
+    // part ("Annual Backflow Inspection (1-FL/2-Dom/…/Pool Mechanical Room)")
+    // but is meaningless without the category it belongs to, so this is the
+    // form the prompt actually consumes. Deduped on the PAIR.
+    const seenPair = new Set();
+    const serviceDetails = [];
+    for (const s of svc) {
+      const line = svcLine(s);
+      const description = cleanServiceDescription(s.description);
+      if (!line && !description) continue;
+      const key = `${line} ${description}`;
+      if (seenPair.has(key)) continue;
+      seenPair.add(key);
+      serviceDetails.push({ service_line: line, description });
+    }
+
+    // The whole crew, not just appointments.technician_id. 240 of company 9's
+    // 459 appointments have more than one technician assigned (up to four), so
+    // naming only the single joined technician understated who is turning up.
+    // Falls back to that single technician when the junction is empty.
+    const crew = techsByAppt.get(appt.id) || [];
+    const crewNames = dedupe(crew.map((t) => t.name));
+    const fallbackName = appt.technician_name || null;
+    const technicianNames = crewNames.length ? crewNames : dedupe([fallbackName]);
     return ({
     appointment_id: appt.id,
     status: appt.status,
@@ -186,8 +225,13 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     scheduled_end_spoken: formatSpokenDateTime(appt.scheduled_end, tz),
     customer_confirmed: appt.customer_confirmed === true,
     technician_confirmed: appt.technician_confirmed === true,
+    // Kept for back-compat; explicitly "the lead", not "the technician".
     technician: appt.technician_name || null,
-    technicians: techsByAppt.get(appt.id) || [],
+    // Full crew with contact details, and the two derived forms the prompts
+    // and dynamic variables consume.
+    technicians: crew.length ? crew : (fallbackName ? [{ name: fallbackName, phone: appt.technician_phone ?? null, email: null }] : []),
+    technician_names: technicianNames,
+    technician_summary: spokenList(technicianNames),
     // Kept as-is: existing callers (and the back-compat single-value dynamic
     // variable) still read it. It is now explicitly "the first of", not "the".
     service_line: appt.service_line || jobServiceLines[0] || null,
@@ -196,6 +240,11 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     // which is what matches the onsite-expectation entries.
     service_lines: lines.length ? lines : (jobServiceLines[0] ? [jobServiceLines[0]] : []),
     service_names: detail,
+    // [{service_line, description}] — the pairing, for anything that needs to
+    // state what the visit covers rather than just list categories.
+    service_details: serviceDetails.length
+      ? serviceDetails
+      : (jobServiceLines[0] ? [{ service_line: jobServiceLines[0], description: null }] : []),
     // Short spoken form for the opening line: "Backflow, Alarm Systems,
     // Portable Extinguishers and Sprinkler". Built from the category list
     // rather than the descriptions, which carry trade suffixes, embedded
