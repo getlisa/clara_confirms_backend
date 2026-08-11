@@ -9,6 +9,7 @@ const db = require("../../../db");
 const jobsDb = require("../../../db/jobs");
 const chatLinksDb = require("../../../db/chat-links");
 const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
+const { maybeSendServiceLinkNow } = require("../service-link-helpers");
 const { resolveConfirmerLabel } = require("../confirmer-label");
 const logger = require("../../../utils/logger");
 
@@ -17,7 +18,7 @@ const schema = z.object({
 });
 
 async function run({ appointment_id }, config) {
-  const { companyId, threadId, recipientContactId } = config?.configurable?.ctx || {};
+  const { companyId, threadId, recipientContactId, jobRef } = config?.configurable?.ctx || {};
 
   // Don't blindly re-confirm — if this is already customer_confirmed=true
   // (confirmed earlier in this same conversation, or on a voice/SMS call
@@ -55,8 +56,26 @@ async function run({ appointment_id }, config) {
 
   if (threadId) await chatLinksDb.setStateByToken(threadId, "confirmation_accepted").catch(() => {});
   const jobStatus = await syncJobConfirmationStatus(companyId, appointment.job_id);
-  logger.info("ConfirmationAgent tool: confirm_appointment", { companyId, appointment_id, jobStatus });
-  return JSON.stringify({ success: true, appointment_id: appointment.id, job_status: jobStatus });
+
+  // Confirming is one of the two things that make the service link sendable;
+  // capturing the recipient is the other. Whichever happens LAST has to fire
+  // the send, or the link silently never goes out. The voice path has always
+  // done this from both of its confirm tools (routes/retell-tools.js) — chat
+  // fired it only from the recipient-capture step, so a customer who gave their
+  // email BEFORE confirming got no link at all. sendRecordedServiceLink is
+  // idempotent, so calling from both sides is safe.
+  const linkSend = await maybeSendServiceLinkNow(companyId, threadId, jobRef, appointment.job_id);
+
+  logger.info("ConfirmationAgent tool: confirm_appointment", {
+    companyId, appointment_id, jobStatus, serviceLink: linkSend?.reason || (linkSend?.sent ? "sent" : null),
+  });
+  return JSON.stringify({
+    success: true, appointment_id: appointment.id, job_status: jobStatus,
+    // Surfaced so the agent can say "I've sent it" vs "I'll send it once I have
+    // your email", rather than guessing.
+    service_link_sent: linkSend?.sent === true,
+    service_link_pending_reason: linkSend?.sent ? null : (linkSend?.reason ?? null),
+  });
 }
 
 module.exports = {

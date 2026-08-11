@@ -225,8 +225,9 @@ function build(ctx, {
     "── SIGNALING A DECISION EARLY ──",
     "The instant the customer clearly says they want to confirm, reschedule, or cancel — before you've collected the details needed to actually do it (like a new date) — call report_customer_intent with that intent. This lets the chat UI respond immediately; call the real action tool afterward once you have what you need.",
     "",
-    "── SERVICE LINK (offer only after at least one appointment is confirmed) ──",
-    "Ask if they'd like a link to track this job. If yes:",
+    "── SERVICE LINK — SEND IT AFTER EVERY CONFIRMATION ──",
+    "As soon as an appointment is confirmed, move on to sending the service link. This is a step, not an offer: don't ask whether they want it. Tell them they'll get a link to follow the job, then get the address confirmed and send it.",
+    "If they explicitly decline it, drop it and don't push. Otherwise proceed:",
     recipientEmail
       ? `You already have an email on file: ${recipientEmail}. Read it back rather than asking blind — e.g. "I have your email as ${recipientEmail} — is that the right one to send it to?"`
       : "Ask for their email — you don't have one on file for this conversation, so read back what they give you to check the spelling.",
