@@ -28,10 +28,21 @@ const MAX_INLINE_UPCOMING = 8;
  * hides which onsite-expectation entry applies.
  */
 function formatServices(a) {
-  const names = a.service_names?.length ? a.service_names : null;
-  const lines = a.service_lines?.length ? a.service_lines : (a.service_line ? [a.service_line] : []);
-  if (names) return `for ${names.join("; ")}`;
-  return lines.length ? `for ${lines.join("; ")}` : null;
+  // "<service line> — <description>" per service. Both halves are needed and
+  // neither substitutes: the line name is the category the customer recognises
+  // ("Backflow"), the description is where the detail lives ("Annual Backflow
+  // Inspection (1-FL/2-Dom/Pool Mechanical Room)"), and the category is also
+  // what the onsite-expectation entries are keyed on. Rendering descriptions
+  // alone — as this did — dropped the categories entirely.
+  const details = a.service_details?.length
+    ? a.service_details
+    : (a.service_lines?.length ? a.service_lines.map((l) => ({ service_line: l, description: null }))
+      : (a.service_line ? [{ service_line: a.service_line, description: null }] : []));
+  const parts = details
+    .map(({ service_line, description }) =>
+      service_line && description ? `${service_line} — ${description}` : (description || service_line))
+    .filter(Boolean);
+  return parts.length ? `for ${parts.join("; ")}` : null;
 }
 
 /**
@@ -42,6 +53,24 @@ function formatServices(a) {
 function formatTechnicians(a) {
   const names = a.technician_names?.length ? a.technician_names : (a.technician ? [a.technician] : []);
   return names.length ? `with ${names.join(", ")}` : null;
+}
+
+/**
+ * The crew with contact details, for the ONE visit under discussion.
+ *
+ * Deliberately not on every list line: this prompt is rebuilt on every turn, so
+ * four technicians' contacts across eight appointments would be paid for
+ * repeatedly for detail the customer almost never asks about.
+ */
+function formatCrewDetail(a) {
+  const crew = (a?.technicians || []).filter((t) => t.name);
+  if (!crew.length) return null;
+  return crew
+    .map((t) => {
+      const contact = [t.phone, t.email].filter(Boolean).join(", ");
+      return contact ? `${t.name} (${contact})` : t.name;
+    })
+    .join("; ");
 }
 
 function formatAppointment(a) {
@@ -196,8 +225,22 @@ function build(ctx, {
       lines.push(
         "── YOUR GOAL: CONFIRM THE NEXT UPCOMING APPOINTMENT ──",
         nextUnconfirmed
-          ? `Confirm THIS appointment first: Appointment #${nextUnconfirmed.appointment_id} — ${nextUnconfirmed.scheduled_start_spoken}${nextUnconfirmed.service_line ? ` for ${nextUnconfirmed.service_line}` : ""} — the EARLIEST one still marked "(not yet confirmed)" above. Do NOT ask about an appointment already marked "(confirmed)", even if it's chronologically earlier than this one — it's already settled, nothing to ask.`
+          // formatServices, not service_line: the singular field is only the
+          // FIRST of the visit's services, so this line used to name one
+          // service ("for OTHER") for a five-service visit — in the single
+          // most directive sentence in the prompt.
+          // The short category summary, not the full paired list: the visit's
+          // services and descriptions are already spelled out on its line
+          // above, and this prompt is rebuilt every turn, so repeating them
+          // here is paid for on every message for no added information.
+          ? `Confirm THIS appointment first: Appointment #${nextUnconfirmed.appointment_id} — ${nextUnconfirmed.scheduled_start_spoken}${nextUnconfirmed.service_summary ? ` for ${nextUnconfirmed.service_summary}` : ""} — the EARLIEST one still marked "(not yet confirmed)" above. Do NOT ask about an appointment already marked "(confirmed)", even if it's chronologically earlier than this one — it's already settled, nothing to ask.`
           : "Confirm the earliest upcoming appointment listed above first.",
+        // Full crew for THIS visit only — the list lines above carry names, this
+        // adds how to reach them, so "who's coming?" and "can I contact them?"
+        // need no tool call.
+        nextUnconfirmed && formatCrewDetail(nextUnconfirmed)
+          ? `Technicians assigned to that visit: ${formatCrewDetail(nextUnconfirmed)}. Share a technician's contact details only if the customer actually asks for them — never volunteer them.`
+          : null,
         "If the customer confirms it, call confirm_appointment with its appointment_id.",
         "If they ask about the other appointments: answer from the list above if it's all shown there; if the list was summarized by count instead, call list_upcoming_appointments rather than guessing.",
         "If they want to reschedule or cancel, establish WHICH appointment first (ask, if it's ambiguous which of several they mean), then call the matching tool with that appointment's own id — not necessarily the next one.",

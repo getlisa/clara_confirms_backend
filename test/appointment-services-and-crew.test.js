@@ -363,3 +363,65 @@ test("db/jobs still emits `service_line` on each service", async () => {
 
   if (realJobsDb) require.cache[require.resolve("../src/db/jobs")] = realJobsDb;
 });
+
+// ── The chat prompt must carry name AND description, plus crew contacts ──────
+
+test("chat lines pair the service line NAME with its description", async () => {
+  const ctx = await ctxFor({ services: [
+    service("Backflow", "Annual Backflow Inspection"),
+    service("Alarm Systems", "Annual Fire Alarm Inspection"),
+  ] });
+  const line = lineFor(ctx);
+  // Descriptions alone lose the category, which is what the onsite-expectation
+  // entries are keyed on — and what the customer recognises.
+  assert.match(line, /Backflow — Annual Backflow Inspection/);
+  assert.match(line, /Alarm Systems — Annual Fire Alarm Inspection/);
+});
+
+test("a service with no description still shows its category", async () => {
+  const ctx = await ctxFor({ services: [service("Backflow", null)] });
+  assert.match(lineFor(ctx), /for Backflow/);
+  assert.ok(!/Backflow —/.test(lineFor(ctx)), "no dangling em dash with nothing after it");
+});
+
+test("the confirm-this-appointment line names every service, not just the first", async () => {
+  const ctx = await ctxFor({ services: [
+    service("OTHER", "Compliance filing"),
+    service("Sprinkler", "Annual Fire Sprinkler Inspection"),
+    service("Backflow", "Annual Backflow Inspection"),
+  ] });
+  const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
+  const goal = out.split("\n").find((l) => l.startsWith("Confirm THIS appointment first"));
+  assert.ok(goal, "the goal line should exist");
+  // This is the most directive sentence in the prompt, and it used to read
+  // "for OTHER" — the singular first-of field — for a three-service visit.
+  for (const cat of ["OTHER", "Sprinkler", "Backflow"]) {
+    assert.ok(goal.includes(cat), `goal line should mention ${cat}`);
+  }
+  assert.ok(!goal.includes("Annual Backflow Inspection"),
+    "but not repeat the descriptions already listed on the appointment line above");
+});
+
+test("the crew's contact details are available for the visit under discussion", async () => {
+  const ctx = await ctxFor({
+    crew: [{ name: "Casey Nary", email: "cnary@co.test" }, { name: "Jack Valentine", phone: "+15551234567" }],
+  });
+  const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
+  assert.match(out, /Technicians assigned to that visit:/);
+  assert.match(out, /Casey Nary \(cnary@co\.test\)/);
+  assert.match(out, /Jack Valentine \(\+15551234567\)/);
+  assert.match(out, /only if the customer actually asks/, "must not be volunteered unprompted");
+});
+
+test("a technician with no contact details gets no empty brackets", async () => {
+  const ctx = await ctxFor({ crew: [{ name: "No Contact" }] });
+  const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
+  assert.match(out, /Technicians assigned to that visit: No Contact\./);
+  assert.ok(!out.includes("()"));
+});
+
+test("no crew → no crew-detail line at all", async () => {
+  const ctx = await ctxFor({ crew: [], technicianName: null });
+  const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
+  assert.ok(!out.includes("Technicians assigned to that visit"));
+});
