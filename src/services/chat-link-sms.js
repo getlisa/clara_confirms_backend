@@ -29,7 +29,7 @@
 const { sendSms } = require("../utils/sms");
 const { buildChatLinkUrl } = require("./chat-link-email");
 const chatLinksDb = require("../db/chat-links");
-const { shorten, warnIfLikelyMonetisedHost } = require("./link-shortener");
+const { shorten } = require("./link-shortener");
 const config = require("../config");
 const logger = require("../utils/logger");
 
@@ -79,44 +79,33 @@ function toGsm7(text) {
 async function buildSmsLinkUrl(token, link) {
   const plain = buildChatLinkUrl(token);
   const cfg = config.smsLinkMasking || {};
-
   if (!cfg.enabled) return plain;
-  if (!cfg.publicApiUrl) {
-    logger.warn("chat-link-sms: PUBLIC_API_URL unset — sending the unmasked link");
-    return plain;
-  }
-  // Names the likely cause when masking keeps falling back — a raw platform
-  // hostname gets the short link wrapped in an affiliate redirect, which
-  // resolvesCleanlyTo() then rejects.
-  warnIfLikelyMonetisedHost(cfg.publicApiUrl);
 
-  if (!link?.id) return plain;
+  // Cached from an earlier send/retry — never re-mint for the same link.
+  if (link?.short_url) return link.short_url;
 
-  // Already shortened on an earlier send/retry.
-  if (link.short_url) return link.short_url;
-
-  let code = link.short_code;
-  if (!code) {
-    const claimed = await chatLinksDb.claimShortCode(link.id, chatLinksDb.generateShortCode());
-    // null = a concurrent send won the race; use the code that landed rather
-    // than minting a second public entry point to the same conversation.
-    code = claimed?.short_code || (await chatLinksDb.getByToken(token))?.short_code;
-  }
-  if (!code) return plain;
-
-  // shorten() documents that it never throws, but this is the one call in the
-  // path whose failure would cost a customer their confirmation, so the caller
-  // does not rely on that promise being kept.
-  const short = await shorten(`${cfg.publicApiUrl}/c/${code}`).catch((err) => {
+  // The real chat URL is what gets shortened. An earlier version pointed the
+  // shortener at our own /c/<code> redirect instead, on the theory that the
+  // third party should never hold the chat token. That reasoning does not
+  // survive contact with the threat: the short link redirects INTO the chat
+  // either way, so anyone who obtains it reaches the conversation regardless of
+  // which string TinyURL stores. Revocation is also identical — expiring the
+  // chat_links row kills the chat whichever URL was shortened. So the
+  // indirection bought a deployed route, a PUBLIC_API_URL, a custom domain (to
+  // dodge shortener monetisation of *.vercel.app) and a short-code column, for
+  // no security gain. Exposure is bounded by the 24h chat_links TTL.
+  const short = await shorten(plain).catch((err) => {
     logger.warn("chat-link-sms: shortener threw, sending the unmasked link", { error: err.message });
     return null;
   });
   if (!short) return plain;
 
-  await chatLinksDb.setShortUrl(link.id, short).catch((err) =>
-    // Caching is an optimisation; failing to cache must not fail the send.
-    logger.warn("chat-link-sms: could not cache short_url", { error: err.message })
-  );
+  if (link?.id) {
+    await chatLinksDb.setShortUrl(link.id, short).catch((err) =>
+      // Caching is an optimisation; failing to cache must not fail the send.
+      logger.warn("chat-link-sms: could not cache short_url", { error: err.message })
+    );
+  }
   return short;
 }
 

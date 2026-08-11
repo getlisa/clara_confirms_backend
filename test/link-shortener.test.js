@@ -26,7 +26,7 @@ const { stub, silentLogger } = require("./helpers/stub-modules");
 
 const logger = silentLogger();
 stub("utils/logger", logger);
-stub("config", { smsLinkMasking: { enabled: true, provider: "tinyurl", publicApiUrl: "https://api.justclara.ai" } });
+stub("config", { smsLinkMasking: { enabled: true, provider: "tinyurl" } });
 
 const shortener = require("../src/services/link-shortener");
 
@@ -111,15 +111,4 @@ test("shorten() returns the link when it resolves cleanly", async () => {
 test("a 200 carrying an error string is not mistaken for a link", async () => {
   global.fetch = async () => ({ ok: true, status: 200, text: async () => "Error: invalid url" });
   assert.equal(await shortener.shorten("https://api.justclara.ai/c/abc"), null);
-});
-
-// ── The config smell that caused it ──────────────────────────────────────────
-
-test("raw platform hostnames are called out; real domains are not", () => {
-  for (const h of ["https://x.vercel.app", "https://x.netlify.app", "https://x.herokuapp.com", "https://x.onrender.com"]) {
-    assert.equal(shortener.warnIfLikelyMonetisedHost(h), true, `${h} should warn`);
-  }
-  for (const h of ["https://api.justclara.ai", "https://confirms.justclara.ai", "", "not a url"]) {
-    assert.equal(shortener.warnIfLikelyMonetisedHost(h), false, `${JSON.stringify(h)} should not warn`);
-  }
 });

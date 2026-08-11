@@ -31,18 +31,14 @@ stub("utils/sms", { sendSms: async ({ to, body }) => { smsSent.push({ to, body }
 
 let shortenImpl = async () => "https://tinyurl.com/masked01";
 const shortenCalls = [];
-const monetisedWarnings = [];
 stub("services/link-shortener", {
   shorten: async (url) => { shortenCalls.push(url); return shortenImpl(url); },
-  // The double must expose the whole surface chat-link-sms imports; a missing
-  // export here is an undefined call at runtime, not a helpful error.
-  warnIfLikelyMonetisedHost: (host) => { monetisedWarnings.push(host); return false; },
   resolvesCleanlyTo: async () => true,
 });
 
 const cfg = {
   frontendUrl: "https://confirms.justclara.ai",
-  smsLinkMasking: { enabled: true, provider: "tinyurl", publicApiUrl: "https://api.example.com" },
+  smsLinkMasking: { enabled: true, provider: "tinyurl" },
 };
 stub("config", cfg);
 
@@ -73,7 +69,7 @@ function reset(over = {}) {
   db.reset(); logger.reset();
   smsSent.length = 0; shortenCalls.length = 0;
   shortenImpl = async () => "https://tinyurl.com/masked01";
-  cfg.smsLinkMasking = { enabled: true, provider: "tinyurl", publicApiUrl: "https://api.example.com", ...over };
+  cfg.smsLinkMasking = { enabled: true, provider: "tinyurl", ...over };
   // Defaults for the two writes the happy path makes. Registered here rather
   // than per-test so a test that forgets one gets working behaviour instead of
   // a silent fallback that looks like the feature is off. `on` is
@@ -98,13 +94,12 @@ test("the SMS carries the masked link, never the filtered domain", async () => {
     "the whole reason this exists is that this domain got the message blocked");
 });
 
-test("the shortener is handed OUR redirect, never the chat token", async () => {
+test("the shortener is handed the real chat URL", async () => {
   reset();
   await send();
   assert.deepEqual(shortenCalls.length, 1);
-  assert.match(shortenCalls[0], /^https:\/\/api\.example\.com\/c\/[0-9a-zA-Z]{10}$/);
-  assert.ok(!shortenCalls[0].includes(TOKEN),
-    "the token is the auth credential for the chat — it must not reach a third party");
+  assert.equal(shortenCalls[0], `https://confirms.justclara.ai/chat/${TOKEN}`,
+    "no indirection: the short link redirects into the chat either way, so a /c/ hop bought nothing");
 });
 
 test("masked body is GSM-7 and fits in ONE segment", async () => {
@@ -170,45 +165,32 @@ test("masking disabled → exactly today's URL", async () => {
   assert.match(smsSent[0].body, /confirms\.justclara\.ai\/chat\/a{48}/);
 });
 
-test("PUBLIC_API_URL unset → plain URL rather than a dead /c/ link", async () => {
-  reset({ publicApiUrl: "" });
-  await send();
-  assert.equal(shortenCalls.length, 0);
-  assert.match(smsSent[0].body, /confirms\.justclara\.ai\/chat\//);
-  assert.ok(logger.records.warn.some(([m]) => /PUBLIC_API_URL/.test(m)), "must be loud, not silent");
-});
-
-test("no link row → plain URL", async () => {
+test("no link row → still masked, just not cached", async () => {
+  // Dropping the /c/ indirection removed the need for the row: the chat URL is
+  // built from the token alone, and the row is now only used to cache the
+  // result. Callers without it (e.g. a path that only has the token) get
+  // masking too, at the cost of re-minting next time.
   reset();
   db.on("FROM chat_links", []);
   await send({ link: null });
   assert.equal(smsSent.length, 1);
-  assert.match(smsSent[0].body, /confirms\.justclara\.ai\/chat\//);
+  assert.match(smsSent[0].body, /tinyurl\.com\/masked01/);
+  assert.equal(db.matched("SET short_url").length, 0, "nothing to cache against");
 });
 
 // ── Idempotence ──────────────────────────────────────────────────────────────
 
 test("a cached short_url is reused — the shortener is not called again", async () => {
   reset();
-  await send({ link: { ...LINK, short_code: "abc1234567", short_url: "https://tinyurl.com/cached" } });
+  await send({ link: { ...LINK, short_url: "https://tinyurl.com/cached" } });
   assert.equal(shortenCalls.length, 0, "a resend or retry must not re-mint a link");
   assert.match(smsSent[0].body, /tinyurl\.com\/cached/);
 });
 
-test("an existing short_code is reused rather than minting a second one", async () => {
+test("no short code is claimed any more — nothing needs one", async () => {
   reset();
-  await send({ link: { ...LINK, short_code: "existing00" } });
-  assert.equal(shortenCalls[0], "https://api.example.com/c/existing00");
-  assert.equal(db.matched("SET short_code").length, 0, "no second claim attempt");
-});
-
-test("losing the claim race uses the winner's code, not a second one", async () => {
-  reset();
-  db.on("SET short_code", []);                                  // CAS returns nothing = we lost
-  db.on("FROM chat_links WHERE token", [{ ...LINK, short_code: "winner0000" }]);
-  await send({ link: { ...LINK } });
-  assert.equal(shortenCalls[0], "https://api.example.com/c/winner0000",
-    "two workers on one link must never create two public entry points to the same chat");
+  await send();
+  assert.equal(db.matched("SET short_code").length, 0);
 });
 
 test("failing to cache the short_url does not fail the send", async () => {

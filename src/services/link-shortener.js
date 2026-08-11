@@ -144,26 +144,4 @@ async function shorten(url) {
   return null;
 }
 
-/**
- * Raw platform hostnames that shorteners are known to monetise. Not a
- * correctness check — resolvesCleanlyTo() is what actually protects the
- * customer — but the failure it causes (masking silently never engaging) is
- * confusing enough to deserve naming the likely cause.
- */
-const MONETISED_HOST_PATTERNS = [/\.vercel\.app$/i, /\.netlify\.app$/i, /\.herokuapp\.com$/i, /\.onrender\.com$/i];
-
-function warnIfLikelyMonetisedHost(publicApiUrl) {
-  if (!publicApiUrl) return false;
-  let host;
-  try { host = new URL(publicApiUrl).host; } catch { return false; }
-  if (!MONETISED_HOST_PATTERNS.some((re) => re.test(host))) return false;
-  logger.warn(
-    "link-shortener: PUBLIC_API_URL is a raw platform hostname, which shorteners often wrap in an " +
-    "affiliate redirect — masked links will be rejected and SMS will carry the plain URL. " +
-    "Point PUBLIC_API_URL at your own domain.",
-    { host }
-  );
-  return true;
-}
-
-module.exports = { shorten, looksLikeUrl, resolvesCleanlyTo, warnIfLikelyMonetisedHost, PROVIDERS };
+module.exports = { shorten, looksLikeUrl, resolvesCleanlyTo, PROVIDERS };

@@ -35,7 +35,6 @@ const enginesRoutes = require("./routes/engines");
 const manualCallsRoutes = require("./routes/manual-calls");
 const serviceLinkMessagesRoutes = require("./routes/service-link-messages");
 const chatLinksRoutes = require("./routes/chat-links");
-const shortLinksRoutes = require("./routes/short-links");
 const copilotRoutes = require("./routes/copilot");
 
 const app = express();
@@ -190,11 +189,6 @@ app.use("/service-link-messages", serviceLinkMessagesRoutes);
 
 // Shareable chat-widget links — generate (staff) + resolve (public, token-authed).
 app.use("/chat-links", chatLinksRoutes);
-
-// Masked SMS links: /c/<code> 302s to the real chat URL. Public — the
-// recipient is a customer with no account. Kept deliberately short because
-// the length of this URL is what a third-party shortener has to wrap.
-app.use("/c", shortLinksRoutes);
 
 // AI Copilot — embedded assistant. JWT for control endpoints, signed
 // query-string token for the SSE turn stream.

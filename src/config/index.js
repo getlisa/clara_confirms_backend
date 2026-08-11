@@ -56,10 +56,6 @@ module.exports = {
     // plain URL if a shortener domain ever starts getting filtered itself.
     enabled: process.env.SMS_LINK_MASKING !== "false",
     provider: process.env.SMS_LINK_SHORTENER || "tinyurl",
-    // Where GET /c/<code> is served — the BACKEND's public origin. It cannot
-    // fall back to frontendUrl: that is a separate app which 404s on /c/.
-    // Blank disables masking (logged once) rather than minting a dead link.
-    publicApiUrl: (process.env.PUBLIC_API_URL || "").replace(/\/$/, ""),
   },
   twilio: {
     accountSid: process.env.TWILIO_ACCOUNT_SID || "",
