@@ -34,6 +34,54 @@ const PROVIDERS = {
   clckru:  (url) => `https://clck.ru/--?url=${encodeURIComponent(url)}`,
 };
 
+/** Trailing-slash-insensitive comparison — shorteners normalise inconsistently. */
+const sameUrl = (a, b) => String(a).replace(/\/+$/, "") === String(b).replace(/\/+$/, "");
+
+/**
+ * Confirm a freshly minted short link actually goes where we asked, in ONE hop.
+ *
+ * This is not paranoia. TinyURL monetises some destinations: pointed at
+ * `clara-confirms-backend.vercel.app` it returned
+ *   tinyurl -> tinyurl.com/preview/deprecated/<code> -> redirect.viglink.com/?u=<ours>
+ * so a customer opening their appointment confirmation was routed through an
+ * interstitial and an affiliate ad network. The same shortener pointed at a
+ * justclara.ai host returns a clean 301. We cannot control which destinations a
+ * shortener decides to monetise, so we check the result instead of trusting it.
+ *
+ * The rule is deliberately strict — the first hop must be exactly our URL —
+ * rather than a blocklist of ad networks, which would need maintaining and
+ * would still miss the next one.
+ *
+ * @returns {Promise<boolean>} false = do not use this link
+ */
+async function resolvesCleanlyTo(shortUrl, expectedUrl) {
+  try {
+    const res = await fetch(shortUrl, {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    const location = res.headers.get("location");
+    if (!location) {
+      logger.warn("link-shortener: short link did not redirect at all", { shortUrl, status: res.status });
+      return false;
+    }
+    if (sameUrl(location, expectedUrl)) return true;
+
+    logger.warn("link-shortener: short link is being intercepted — refusing to use it", {
+      shortUrl, expected: expectedUrl, actual: location.slice(0, 200),
+    });
+    return false;
+  } catch (err) {
+    // Cannot verify => cannot trust. Falling back to the plain URL is worse for
+    // deliverability but never sends a customer somewhere we did not choose.
+    logger.warn("link-shortener: could not verify the short link, refusing to use it", {
+      shortUrl, error: err.message,
+    });
+    return false;
+  }
+}
+
 function looksLikeUrl(text) {
   if (!text) return false;
   const t = String(text).trim();
@@ -68,6 +116,9 @@ async function shorten(url) {
       const text = (await res.text()).trim();
 
       if (res.ok && looksLikeUrl(text)) {
+        // One extra round trip per MINT, not per send: the result is cached in
+        // chat_links.short_url, so a resend never re-checks.
+        if (!(await resolvesCleanlyTo(text, url))) return null;
         logger.info("link-shortener: shortened", { provider, short: text });
         return text;
       }
@@ -93,4 +144,4 @@ async function shorten(url) {
   return null;
 }
 
-module.exports = { shorten, looksLikeUrl, PROVIDERS };
+module.exports = { shorten, looksLikeUrl, resolvesCleanlyTo, PROVIDERS };

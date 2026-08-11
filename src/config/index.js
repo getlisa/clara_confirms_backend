@@ -41,7 +41,13 @@ module.exports = {
     serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
     jwtSecret: process.env.SUPABASE_JWT_SECRET,
   },
-  frontendUrl: process.env.FRONTEND_URL || "http://localhost:8080",
+  // Trailing slash stripped: every consumer appends its own path
+  // (`${frontendUrl}/chat/...`, `/reset-password`, `/auth/link-login`), so a
+  // trailing slash in the env produced `host//chat/<token>`. That double slash
+  // was not merely ugly — the shortener normalised it away when resolving, so
+  // the interception guard compared the normalised target against the malformed
+  // original, declared the link hijacked, and fell back to the unmasked URL.
+  frontendUrl: (process.env.FRONTEND_URL || "http://localhost:8080").replace(/\/+$/, ""),
   sendgrid: {
     apiKey: process.env.SENDGRID_API_KEY || "",
     fromEmail: process.env.SENDGRID_FROM_EMAIL || "developer@justclara.ai",
@@ -56,10 +62,6 @@ module.exports = {
     // plain URL if a shortener domain ever starts getting filtered itself.
     enabled: process.env.SMS_LINK_MASKING !== "false",
     provider: process.env.SMS_LINK_SHORTENER || "tinyurl",
-    // Where GET /c/<code> is served — the BACKEND's public origin. It cannot
-    // fall back to frontendUrl: that is a separate app which 404s on /c/.
-    // Blank disables masking (logged once) rather than minting a dead link.
-    publicApiUrl: (process.env.PUBLIC_API_URL || "").replace(/\/$/, ""),
   },
   twilio: {
     accountSid: process.env.TWILIO_ACCOUNT_SID || "",
