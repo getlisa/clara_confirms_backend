@@ -1,7 +1,12 @@
 # SMS Link Masking — Frontend Guide
 
-> **For the frontend agent.** Almost entirely backend. There is exactly **one**
-> frontend-visible change: a `?expired=1` query parameter on the chat URL.
+> **NO FRONTEND CHANGE IS REQUIRED.** This shipped entirely in the backend and
+> is already working. Read on only if you want the small optional polish in §1.
+>
+> The one thing you *could* do is honour a `?expired=1` query parameter on the
+> chat URL. Ignoring it changes nothing: `GET /chat-links/:token` still returns
+> `410 { code: "link_expired" }` exactly as it always has, and links have always
+> expired after 24h, so the app's existing handling already covers it.
 
 ---
 
@@ -16,7 +21,7 @@ SMS now carries a short link instead. Email is **unchanged** and still shows the
 full URL — there is no carrier filter on email, and a visible domain is what
 makes the mail look trustworthy.
 
-## 1. The one change: `?expired=1`
+## 1. Optional polish: `?expired=1`
 
 Masked SMS links point at `GET /c/<code>` on the API, which 302-redirects to the
 normal chat URL. When the underlying link has expired (24h TTL) the redirect
@@ -44,9 +49,11 @@ requirement.
 
 ## 3. Checklist
 
-- [ ] Read `?expired=1` on the chat route and render the existing expired state.
+Nothing is required. If you want the polish:
+
+- [ ] Read `?expired=1` on the chat route and render the existing expired state
+      immediately, instead of waiting for the 410.
 - [ ] Strip the parameter from the displayed URL if you tidy the address bar.
-- [ ] Nothing else.
 
 ---
 
