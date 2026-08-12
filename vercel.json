@@ -31,11 +31,19 @@
     },
     {
       "path": "/admin/crm-sync",
-      "schedule": "0 * * * *"
+      "schedule": "0 */2 * * *"
     },
     {
       "path": "/admin/engines/gc",
       "schedule": "17 * * * *"
+    },
+    {
+      "path": "/admin/servicetrade-webhooks/drain",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/admin/servicetrade-webhooks/gc",
+      "schedule": "23 * * * *"
     }
   ]
 }

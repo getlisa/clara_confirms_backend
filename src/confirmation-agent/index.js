@@ -122,6 +122,68 @@ function parseToolResult(content) {
   }
 }
 
+/**
+ * `on_chat_model_end` hands back either the AIMessage itself or an LLMResult
+ * wrapping it, depending on the provider integration — normalize both.
+ * (Same shape-tolerance as copilot/stream.js's private endMessage.)
+ */
+function endMessage(output) {
+  if (!output) return null;
+  if (output.tool_calls !== undefined || typeof output.content !== "undefined") return output;
+  return output.generations?.[0]?.[0]?.message || null;
+}
+
+/**
+ * Live token pump for one turn.
+ *
+ * Emits the SAME visible-message shapes toVisibleMessages produces, in the
+ * same order, but as they happen rather than after the whole turn:
+ *
+ *   delta …  → message   (one AI generation)
+ *   message              (a get_service_link result, when it lands)
+ *   delta …  → message   (the generation after the tool loop)
+ *
+ * The `message` event after a run of deltas carries the identical full text
+ * those deltas spelled out — the route forwards them as `message_delta` +
+ * `message_complete`, exactly the contract the frontend already consumes from
+ * the old simulated-typing implementation. Nothing about the wire protocol
+ * changes; only the deltas become real.
+ *
+ * Text is emitted for tool-calling ("thinking") generations too, because
+ * toVisibleMessages has always shown those — this must not quietly start
+ * hiding messages the transcript replay (GET /chat-links/:token) will show.
+ */
+async function pumpTurn(graph, input, config, onEvent) {
+  for await (const ev of graph.streamEvents(input, { ...config, version: "v2" })) {
+    switch (ev.event) {
+      case "on_chat_model_stream": {
+        const chunk = extractText(ev.data?.chunk);
+        if (chunk) await onEvent({ type: "delta", chunk });
+        break;
+      }
+      case "on_chat_model_end": {
+        const text = extractText(endMessage(ev.data?.output));
+        if (text) await onEvent({ type: "message", message: { role: "agent", content: text, created_at: null } });
+        break;
+      }
+      case "on_tool_end": {
+        if (ev.name !== "get_service_link") break;
+        const output = ev.data?.output;
+        const parsed = parseToolResult(typeof output === "string" ? output : output?.content);
+        if (parsed?.success && parsed?.url) {
+          await onEvent({
+            type: "message",
+            message: { role: "agent", type: "service_link", url: parsed.url, job_name: parsed.job_name ?? null, created_at: null },
+          });
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+}
+
 function describeAction(name, args, result) {
   switch (name) {
     case "confirm_appointment":
@@ -175,11 +237,15 @@ function summarizeOutcome(messages) {
   return lines;
 }
 
-async function runGraph(threadId, ctx, input) {
+async function runGraph(threadId, ctx, input, onEvent = null) {
   const graph = await getGraph();
   const config = { recursionLimit: 25, configurable: { thread_id: threadId, ctx } };
   const before = (await graph.getState(config)).values?.messages || [];
-  await graph.invoke(input, config);
+  // streamEvents drives the graph identically to invoke — same nodes, same
+  // checkpoint writes — it only additionally surfaces the callbacks. So the
+  // streaming and non-streaming paths cannot diverge in what they persist.
+  if (onEvent) await pumpTurn(graph, input, config, onEvent);
+  else await graph.invoke(input, config);
   const after = (await graph.getState(config)).values?.messages || [];
   const newMessages = after.slice(before.length);
 
@@ -233,14 +299,22 @@ async function ensureOpened({ companyId, jobId, token, companyName, recipientCon
   return { messages };
 }
 
-async function sendMessage({ companyId, jobId, token, companyName, content, recipientContactId = null, linkAppointmentId = null }) {
+/**
+ * Run one customer turn.
+ *
+ * @param {function|null} [onEvent] — called with `{type:"delta",chunk}` /
+ *   `{type:"message",message}` as the turn unfolds. Omit it for a plain
+ *   await-the-whole-turn call; the returned `messages` are the same either
+ *   way, so a caller that streams must NOT also render the return value.
+ */
+async function sendMessage({ companyId, jobId, token, companyName, content, recipientContactId = null, linkAppointmentId = null }, onEvent = null) {
   const { jobRef, customerRef, customerEmail, customerPhone } = await resolveJobRefs(companyId, jobId);
   const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone);
   const ctx = {
     companyId, jobId, threadId: token, jobRef, customerRef, companyName, recipientContactId, linkAppointmentId,
     recipientName, recipientEmail, recipientPhone,
   };
-  const messages = await runGraph(token, ctx, { messages: [new HumanMessage(content)] });
+  const messages = await runGraph(token, ctx, { messages: [new HumanMessage(content)] }, onEvent);
   return { messages };
 }
 

@@ -216,6 +216,10 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
             dynVars.next_service_line =
               next.service_summary || next.service_line || jobCtx.job.title || "your upcoming visit";
             dynVars.next_appointment_date = next.scheduled_start_spoken;
+            // A crew does not land on the minute, and "8:00 AM" is heard as
+            // exact. Precomputed in the context — never ask the agent to do
+            // clock arithmetic.
+            dynVars.next_arrival_window = next.arrival_window_spoken || "";
             dynVars.next_appointment_id = String(next.appointment_id);
             // The whole crew, not just appointments.technician_id — most
             // multi-service visits send two to four technicians.

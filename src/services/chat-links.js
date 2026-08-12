@@ -329,7 +329,13 @@ async function resolveChatLink(token) {
  * (non-streamed) result — the SSE framing/typing-simulation lives in the
  * route layer, which calls this and reveals the text progressively.
  */
-async function sendChatMessage(token, content) {
+/**
+ * @param {function|null} [onEvent] — forwarded to the agent so the caller can
+ *   stream the reply as it is generated. When supplied, the returned
+ *   `messages` have ALREADY been delivered through onEvent — render one or
+ *   the other, never both.
+ */
+async function sendChatMessage(token, content, onEvent = null) {
   const link = await chatLinksDb.getByToken(token);
   if (!link) return { ok: false, status: 404, error: "Chat link not found or expired" };
 
@@ -340,7 +346,7 @@ async function sendChatMessage(token, content) {
   const { messages } = await confirmationAgent.sendMessage({
     companyId: link.company_id, jobId: link.job_id, token, companyName: company.name, content,
     recipientContactId: link.recipient_contact_id, linkAppointmentId: link.appointment_id,
-  });
+  }, onEvent);
 
   const fresh = await chatLinksDb.getByToken(token);
   return {

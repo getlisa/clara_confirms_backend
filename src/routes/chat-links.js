@@ -140,15 +140,26 @@ router.get("/:token", openCors, async (req, res) => {
 });
 
 // ── SSE message send ─────────────────────────────────────────────────────────
-// Retell's chat completion has no token-level streaming — this simulates a
-// typing feel: a `typing` event immediately, then the real (multi-second,
-// tool-calling) completion round-trip, then the resulting text revealed in
-// small chunks, then a `done` event carrying the updated state/input_hint.
-const CHUNK_SIZE = 12; // characters per message_delta tick — small enough to feel like typing
+// The wire protocol is unchanged from the original Retell-backed version —
+// `typing`, then `message_delta` chunks, then `message_complete`, then `done`
+// with the updated state/input_hint — but the deltas are now REAL model
+// tokens, streamed from the LangGraph run as they are generated, rather than
+// the finished text sliced into 12-character ticks after the whole
+// (multi-second, tool-calling) turn had already completed. The frontend needs
+// no change; the wait before the first character just goes away.
+//
+// Emission is driven entirely by the onEvent callback below. The resolved
+// `result.messages` carry the same content and must NOT also be written, or
+// every reply would be sent twice.
 
 function sseSend(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
+
+// Proxies (and Vercel) drop an idle response; a turn can sit silent for tens
+// of seconds while a tool runs, which is exactly the gap streaming was meant
+// to make survivable. A comment line is ignored by every SSE client.
+const HEARTBEAT_MS = 15000;
 
 router.options("/:token/messages", openCors);
 router.post("/:token/messages", openCors, async (req, res) => {
@@ -161,35 +172,71 @@ router.post("/:token/messages", openCors, async (req, res) => {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
+    // Nginx buffers proxied responses by default, which would hold every
+    // delta back until the turn ended — reinstating the old wait invisibly.
+    "X-Accel-Buffering": "no",
   });
+  // Node coalesces small writes by default; each SSE frame must go out on its
+  // own or the deltas arrive in clumps.
+  res.flushHeaders?.();
+  if (typeof res.socket?.setNoDelay === "function") res.socket.setNoDelay(true);
+
+  const heartbeat = setInterval(() => res.write(": ping\n\n"), HEARTBEAT_MS);
+  // If the customer closes the tab mid-turn, stop writing into a dead socket.
+  // The graph run itself is deliberately NOT aborted — its tool calls may
+  // already have confirmed an appointment, and the checkpointer keeps the
+  // reply for the transcript replay on their next visit.
+  let aborted = false;
+  // MUST be res, not req: since Node 16 the request's own "close" fires as
+  // soon as its body has been fully read, which for a normal POST is
+  // immediately — guarding on that silently truncated every reply after the
+  // first chunk. The response closing before we end it is the real signal
+  // that the customer went away.
+  res.on("close", () => { if (!res.writableEnded) aborted = true; });
+
+  // Time-to-first-token is the only number that says whether streaming
+  // actually helped — total turn duration barely moves, since the same LLM
+  // and tool calls still run. Measured from the moment the request is
+  // accepted, so it includes link resolution and context hydration (the DB
+  // work before the model is even called), which is what the customer feels.
+  const startedAt = Date.now();
+  let firstTokenMs = null;
 
   try {
     sseSend(res, "typing", {});
 
-    const result = await chatLinksService.sendChatMessage(req.params.token, content);
+    // Defense in depth — every event in this stream must be role:"agent"
+    // (the doc promises the customer's own message is never echoed back);
+    // the real fix is upstream (the agent no longer includes it), but this
+    // guards against any future regression too.
+    const onEvent = (ev) => {
+      if (aborted) return;
+      if (ev.type === "delta") {
+        if (firstTokenMs === null) firstTokenMs = Date.now() - startedAt;
+        sseSend(res, "message_delta", { role: "agent", chunk: ev.chunk });
+      } else if (ev.type === "message" && ev.message.role === "agent") {
+        sseSend(res, "message_complete", ev.message);
+      }
+    };
+
+    const result = await chatLinksService.sendChatMessage(req.params.token, content, onEvent);
     if (!result.ok) {
       sseSend(res, "error", { error: result.error });
       return res.end();
     }
 
-    // Defense in depth — every event in this stream must be role:"agent"
-    // (the doc promises the customer's own message is never echoed back);
-    // the real fix is upstream (confirmationAgent.sendMessage no longer
-    // includes it), but this guards against any future regression too.
-    for (const message of result.messages.filter((m) => m.role === "agent")) {
-      const text = message.content || "";
-      for (let i = 0; i < text.length; i += CHUNK_SIZE) {
-        sseSend(res, "message_delta", { role: message.role, chunk: text.slice(i, i + CHUNK_SIZE) });
-      }
-      sseSend(res, "message_complete", message);
-    }
-
-    sseSend(res, "done", { state: result.state, input_hint: result.input_hint });
+    const totalMs = Date.now() - startedAt;
+    logger.info("Chat turn streamed", { token: req.params.token, firstTokenMs, totalMs });
+    // Also on the wire, so the timing is visible from the browser's network
+    // tab without server log access — the frontend may ignore both fields.
+    sseSend(res, "done", { state: result.state, input_hint: result.input_hint, first_token_ms: firstTokenMs, total_ms: totalMs });
     return res.end();
   } catch (err) {
     logger.error("POST /chat-links/:token/messages failed", { error: err.message });
     sseSend(res, "error", { error: "Failed to send message" });
     return res.end();
+  } finally {
+    clearInterval(heartbeat);
   }
 });
 

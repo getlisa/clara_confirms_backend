@@ -48,6 +48,16 @@ module.exports = {
   // the interception guard compared the normalised target against the malformed
   // original, declared the link hijacked, and fell back to the unmasked URL.
   frontendUrl: (process.env.FRONTEND_URL || "http://localhost:8080").replace(/\/+$/, ""),
+  // Public base URL of THIS backend. Needed only for inbound webhooks, where a
+  // third party has to reach us: ServiceTrade stores the hookUrl on its side and
+  // POSTs to it, so it cannot be derived from an incoming request and cannot be
+  // the frontend (a separate app that 404s on our routes — verified). Falls back
+  // to Vercel's own per-deployment hostname, which works but is NOT suitable for
+  // a registered webhook: it changes with every deployment, silently pointing a
+  // stored hookUrl at a dead host. Set PUBLIC_API_URL to a stable custom domain.
+  publicApiUrl: (process.env.PUBLIC_API_URL
+    || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "")
+  ).replace(/\/+$/, ""),
   sendgrid: {
     apiKey: process.env.SENDGRID_API_KEY || "",
     fromEmail: process.env.SENDGRID_FROM_EMAIL || "developer@justclara.ai",

@@ -11,6 +11,7 @@ const jobsDb = require("../../../db/jobs");
 const chatLinksDb = require("../../../db/chat-links");
 const { buildJobConfirmationContext } = require("../../../services/job-confirmation-context");
 const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
+const { maybeSendServiceLinkNow } = require("../service-link-helpers");
 const { resolveConfirmerLabel } = require("../confirmer-label");
 const logger = require("../../../utils/logger");
 
@@ -20,7 +21,7 @@ const schema = z.object({
 });
 
 async function run({ confirm_all, appointment_ids }, config) {
-  const { companyId, jobId, threadId, recipientContactId } = config?.configurable?.ctx || {};
+  const { companyId, jobId, threadId, recipientContactId, jobRef } = config?.configurable?.ctx || {};
   const wantsAll = confirm_all === true;
   const requestedIds = wantsAll ? [] : (appointment_ids || []).map((v) => String(v).trim()).filter(Boolean);
   if (!wantsAll && requestedIds.length === 0) {
@@ -65,13 +66,26 @@ async function run({ confirm_all, appointment_ids }, config) {
 
   if (targets.length && threadId) await chatLinksDb.setStateByToken(threadId, "confirmation_accepted").catch(() => {});
   const jobStatus = targets.length ? await syncJobConfirmationStatus(companyId, ctx.job.id) : ctx.job.status;
-  logger.info("ConfirmationAgent tool: confirm_job_appointments", { companyId, jobId, confirmAll: wantsAll, confirmed: targets.length, skipped: skipped.length, jobStatus });
+
+  // Mirrors confirm_appointment and the voice path: confirming is one of the
+  // two preconditions for the service link, so the send has to be attempted
+  // here too. Idempotent, and a no-op when no recipient has been captured yet.
+  const linkSend = targets.length
+    ? await maybeSendServiceLinkNow(companyId, threadId, jobRef, ctx.job.id)
+    : null;
+
+  logger.info("ConfirmationAgent tool: confirm_job_appointments", {
+    companyId, jobId, confirmAll: wantsAll, confirmed: targets.length, skipped: skipped.length, jobStatus,
+    serviceLink: linkSend?.reason || (linkSend?.sent ? "sent" : null),
+  });
 
   return JSON.stringify({
     success: true,
     confirmed: targets.map((a) => a.appointment_id),
     skipped,
     job_status: jobStatus,
+    service_link_sent: linkSend?.sent === true,
+    service_link_pending_reason: linkSend?.sent ? null : (linkSend?.reason ?? null),
     ...(targets.length === 0 && { message: "Nothing left to confirm — those appointments were already confirmed." }),
   });
 }

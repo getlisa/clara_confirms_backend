@@ -18,6 +18,8 @@ const {
 } = require("../services/prompt-sync");
 const crmRegistry = require("../services/crm");
 const enginesDb = require("../engines/core/db");
+const webhookProcessor = require("../services/servicetrade-webhook-processor");
+const webhooksDb = require("../db/servicetrade-webhooks");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -178,6 +180,43 @@ router.all("/engines/gc", async (req, res) => {
     return res.json({ ok: true, days, deleted, staleMinutes, reaped });
   } catch (err) {
     logger.error("Admin engines/gc failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/servicetrade-webhooks/drain — apply queued ServiceTrade webhook
+// events for every company that has any. Wired to an every-minute Vercel cron:
+// the receiving endpoint only has 5 seconds to answer before ServiceTrade
+// retries, so it does nothing but enqueue, and this is what actually applies
+// the changes. Without this cron the queue simply fills up.
+//
+// `router.all` because Vercel cron sends GET while a manual poke uses POST.
+router.all("/servicetrade-webhooks/drain", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const result = await webhookProcessor.drainAll();
+    // Only worth a log line when something happened — this runs 1,440 times a day.
+    if (result.companies > 0) logger.info("Admin: ServiceTrade webhook drain", result);
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error("Admin servicetrade-webhooks/drain failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/servicetrade-webhooks/gc — retention sweep for the event queue.
+// Rides the existing hourly GC slot rather than adding another cron.
+router.all("/servicetrade-webhooks/gc", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const deleted = await webhooksDb.purgeOld({
+      doneOlderThanDays: Math.max(parseInt(req.query.doneDays, 10) || 7, 1),
+      failedOlderThanDays: Math.max(parseInt(req.query.failedDays, 10) || 30, 1),
+    });
+    logger.info("Admin: ServiceTrade webhook queue GC", { deleted });
+    return res.json({ ok: true, deleted });
+  } catch (err) {
+    logger.error("Admin servicetrade-webhooks/gc failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });

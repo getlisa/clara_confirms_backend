@@ -787,6 +787,25 @@ Returns location detail with service requests, contacts, and assets.
 
 ---
 
+### Webhooks (realtime sync) — see `servicetrade-webhooks-frontend.md`
+
+ServiceTrade pushes entity changes to us instead of us waiting for the hourly
+poll (which is unchanged and still required). Four authenticated endpoints:
+
+| | |
+|---|---|
+| `GET /integrations/servicetrade/webhook` 🔒 | registration + ServiceTrade's own view + queue depth |
+| `POST /integrations/servicetrade/webhook` 🔒 | enable / repoint (idempotent) |
+| `DELETE /integrations/servicetrade/webhook` 🔒 | disable |
+| `POST /integrations/servicetrade/webhook/drain` 🔒 | apply queued events now ("refresh") |
+| `POST /webhooks/servicetrade/:secret` | **PUBLIC — called by ServiceTrade only.** Not part of the frontend surface. |
+
+Full request/response payloads, field types, error copy, UI status rules and the
+delivery constraints they follow from live in **`servicetrade-webhooks-frontend.md`**
+— deliberately the single source of truth, so the two documents cannot drift.
+
+---
+
 ## 9. Shared Types
 
 ### TypeScript interfaces

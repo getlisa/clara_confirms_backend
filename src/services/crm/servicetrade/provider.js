@@ -435,9 +435,11 @@ class ServiceTradeProvider extends CrmProvider {
       db.fetchExternalRefMap(companyId, "offices"),
     ]);
     const pairs = [];
+    const parents = new Set();
     for (const row of raw) {
       const locationId = locationsMap.get(String(row.servicetrade_id));
       if (!locationId) continue;
+      parents.add(locationId);
       const offices = Array.isArray(row.payload?.offices) ? row.payload.offices : [];
       for (const o of offices) {
         if (o?.id == null) continue;
@@ -445,7 +447,7 @@ class ServiceTradeProvider extends CrmProvider {
         if (officeId) pairs.push([locationId, officeId]);
       }
     }
-    await bulkInsertJunction("location_offices", "location_id", "office_id", pairs);
+    await replaceJunction("location_offices", "location_id", "office_id", pairs, parents);
   }
 
   /**
@@ -459,9 +461,11 @@ class ServiceTradeProvider extends CrmProvider {
       db.fetchExternalRefMap(companyId, "tags"),
     ]);
     const pairs = [];
+    const parents = new Set();
     for (const row of raw) {
       const locationId = locationsMap.get(String(row.servicetrade_id));
       if (!locationId) continue;
+      parents.add(locationId);
       const tags = Array.isArray(row.payload?.tags) ? row.payload.tags : [];
       for (const t of tags) {
         if (t?.id == null) continue;
@@ -469,7 +473,7 @@ class ServiceTradeProvider extends CrmProvider {
         if (tagId) pairs.push([locationId, tagId]);
       }
     }
-    await bulkInsertJunction("location_tags", "location_id", "tag_id", pairs);
+    await replaceJunction("location_tags", "location_id", "tag_id", pairs, parents);
   }
 
   /**
@@ -490,6 +494,30 @@ class ServiceTradeProvider extends CrmProvider {
     ]);
     const locationPairs = [];
     const companyPairs = [];
+    // Canonical contact ids whose payload ACTUALLY ASSERTS their links, and so
+    // may have stale ones deleted. Two separate sets because a payload can
+    // carry locations without companies, or the reverse.
+    //
+    // Not simply "every contact processed", and the reason is a real hazard:
+    // servicetrade_contacts.payload is the raw object verbatim
+    // (mapContactRow → `payload: c`) and is REPLACED wholesale on upsert
+    // (`payload = EXCLUDED.payload`), never merged. A contact written from a
+    // thin embed — location.primaryContact, which carries no `locations` key —
+    // therefore leaves raw with no link information at all. Treating that as
+    // "this contact has no locations" would DELETE every real link it has.
+    // Whether the thin embed or the rich /contact?companyId= roster writes last
+    // within a run is order-dependent, so this cannot be assumed away.
+    //
+    // Measured on a real account before enabling this: raw matched ServiceTrade
+    // exactly for all 7 contacts (including one with 5 locations), so the guard
+    // costs nothing today — it just refuses to act on a payload that never told
+    // us anything.
+    //
+    // Residual gap, deliberately left: a contact removed from its LAST location
+    // is not cleaned, because its payload then asserts nothing. Closing that
+    // needs the raw upsert to merge these arrays rather than replace them.
+    const locationParents = new Set();
+    const companyParents = new Set();
     // Every duplicate's links are walked, but resolved onto the CANONICAL
     // contact — so the surviving record ends up linked to every customer and
     // location any of its duplicates was seen at.
@@ -509,6 +537,7 @@ class ServiceTradeProvider extends CrmProvider {
       const locations = Array.isArray(row.payload?.locations) && row.payload.locations.length
                        ? row.payload.locations
                        : row.payload?.location ? [row.payload.location] : [];
+      if (locations.length) locationParents.add(contactId);
       for (const l of locations) {
         if (l?.id == null) continue;
         const locationId = locationsMap.get(String(l.id));
@@ -518,14 +547,15 @@ class ServiceTradeProvider extends CrmProvider {
       const companiesArr = Array.isArray(row.payload?.companies) && row.payload.companies.length
                           ? row.payload.companies
                           : row.payload?.company ? [row.payload.company] : [];
+      if (companiesArr.length) companyParents.add(contactId);
       for (const c of companiesArr) {
         if (c?.id == null) continue;
         const customerId = customersMap.get(String(c.id));
         if (customerId) companyPairs.push([contactId, customerId]);
       }
     }
-    await bulkInsertJunction("contact_locations", "contact_id", "location_id", locationPairs);
-    await bulkInsertJunction("contact_companies", "contact_id", "customer_id", companyPairs);
+    await replaceJunction("contact_locations", "contact_id", "location_id", locationPairs, locationParents);
+    await replaceJunction("contact_companies", "contact_id", "customer_id", companyPairs, companyParents);
   }
 
   async _normalizeTechnicians(companyId, engine = null) {
@@ -619,9 +649,11 @@ class ServiceTradeProvider extends CrmProvider {
       db.fetchExternalRefMap(companyId, "offices"),
     ]);
     const pairs = [];
+    const parents = new Set();
     for (const row of raw) {
       const jobId = jobsMap.get(String(row.servicetrade_id));
       if (!jobId) continue;
+      parents.add(jobId);
       const offices = Array.isArray(row.payload?.offices) ? row.payload.offices : [];
       for (const o of offices) {
         if (o?.id == null) continue;
@@ -629,7 +661,7 @@ class ServiceTradeProvider extends CrmProvider {
         if (officeId) pairs.push([jobId, officeId]);
       }
     }
-    await bulkInsertJunction("job_offices", "job_id", "office_id", pairs);
+    await replaceJunction("job_offices", "job_id", "office_id", pairs, parents);
   }
 
   /** Junction: job ↔ tags. Reads `tags[]` embedded in servicetrade_jobs.payload. */
@@ -640,9 +672,11 @@ class ServiceTradeProvider extends CrmProvider {
       db.fetchExternalRefMap(companyId, "tags"),
     ]);
     const pairs = [];
+    const parents = new Set();
     for (const row of raw) {
       const jobId = jobsMap.get(String(row.servicetrade_id));
       if (!jobId) continue;
+      parents.add(jobId);
       const tags = Array.isArray(row.payload?.tags) ? row.payload.tags : [];
       for (const t of tags) {
         if (t?.id == null) continue;
@@ -650,7 +684,7 @@ class ServiceTradeProvider extends CrmProvider {
         if (tagId) pairs.push([jobId, tagId]);
       }
     }
-    await bulkInsertJunction("job_tags", "job_id", "tag_id", pairs);
+    await replaceJunction("job_tags", "job_id", "tag_id", pairs, parents);
   }
 
   /**
@@ -775,9 +809,11 @@ class ServiceTradeProvider extends CrmProvider {
       db.fetchExternalRefMap(companyId, "technicians"),
     ]);
     const pairs = [];
+    const parents = new Set();
     for (const row of raw) {
       const appointmentId = appointmentsMap.get(String(row.servicetrade_id));
       if (!appointmentId) continue;
+      parents.add(appointmentId);
       const techs = Array.isArray(row.payload?.techs) ? row.payload.techs : [];
       for (const t of techs) {
         if (t?.id == null) continue;
@@ -785,7 +821,7 @@ class ServiceTradeProvider extends CrmProvider {
         if (technicianId) pairs.push([appointmentId, technicianId]);
       }
     }
-    await bulkInsertJunction("appointment_technicians", "appointment_id", "technician_id", pairs);
+    await replaceJunction("appointment_technicians", "appointment_id", "technician_id", pairs, parents);
   }
 
   /** Junction: appointment ↔ offices. Reads `offices[]` embedded in servicetrade_appointments.payload. */
@@ -796,9 +832,11 @@ class ServiceTradeProvider extends CrmProvider {
       db.fetchExternalRefMap(companyId, "offices"),
     ]);
     const pairs = [];
+    const parents = new Set();
     for (const row of raw) {
       const appointmentId = appointmentsMap.get(String(row.servicetrade_id));
       if (!appointmentId) continue;
+      parents.add(appointmentId);
       const offices = Array.isArray(row.payload?.offices) ? row.payload.offices : [];
       for (const o of offices) {
         if (o?.id == null) continue;
@@ -806,7 +844,7 @@ class ServiceTradeProvider extends CrmProvider {
         if (officeId) pairs.push([appointmentId, officeId]);
       }
     }
-    await bulkInsertJunction("appointment_offices", "appointment_id", "office_id", pairs);
+    await replaceJunction("appointment_offices", "appointment_id", "office_id", pairs, parents);
   }
 
   /**
@@ -954,9 +992,11 @@ class ServiceTradeProvider extends CrmProvider {
       db.fetchExternalRefMap(companyId, "technicians"),
     ]);
     const pairs = [];
+    const parents = new Set();
     for (const row of raw) {
       const serviceRequestId = requestsMap.get(String(row.servicetrade_id));
       if (!serviceRequestId) continue;
+      parents.add(serviceRequestId);
       const techs = Array.isArray(row.payload?.preferredTechs) ? row.payload.preferredTechs : [];
       for (const t of techs) {
         if (t?.id == null) continue;
@@ -964,7 +1004,7 @@ class ServiceTradeProvider extends CrmProvider {
         if (technicianId) pairs.push([serviceRequestId, technicianId]);
       }
     }
-    await bulkInsertJunction("service_request_preferred_techs", "service_request_id", "technician_id", pairs);
+    await replaceJunction("service_request_preferred_techs", "service_request_id", "technician_id", pairs, parents);
   }
 
   /**
@@ -1028,9 +1068,11 @@ class ServiceTradeProvider extends CrmProvider {
       db.fetchExternalRefMap(companyId, "technicians"),
     ]);
     const pairs = [];
+    const parents = new Set();
     for (const row of raw) {
       const opportunityId = opportunitiesMap.get(String(row.servicetrade_id));
       if (!opportunityId) continue; // not an opportunity (had a job) — no junction rows to write
+      parents.add(opportunityId);
       const techs = Array.isArray(row.payload?.preferredTechs) ? row.payload.preferredTechs : [];
       for (const t of techs) {
         if (t?.id == null) continue;
@@ -1038,7 +1080,7 @@ class ServiceTradeProvider extends CrmProvider {
         if (technicianId) pairs.push([opportunityId, technicianId]);
       }
     }
-    await bulkInsertJunction("service_opportunity_preferred_techs", "service_opportunity_id", "technician_id", pairs);
+    await replaceJunction("service_opportunity_preferred_techs", "service_opportunity_id", "technician_id", pairs, parents);
   }
 
   // ── Normalizers (delegate to pure mappers) ─────────────────────────────────
@@ -1148,6 +1190,53 @@ async function bulkInsertJunction(table, colA, colB, pairs, { batchSize = 1000 }
     queryCount++;
   }
   logger.info("bulkInsertJunction: table upserted", { table, pairs: pairs.length, batchSize, queries: queryCount });
+}
+
+/**
+ * Junction write with REPLACE-SET semantics, scoped to the parents this pass
+ * actually looked at.
+ *
+ * bulkInsertJunction above can only ever ADD a link. Nothing deleted one, so a
+ * link removed in the CRM survived every subsequent sync forever — verified on a
+ * real account: a contact unlinked from a location in ServiceTrade stayed
+ * attached in `contact_locations`, and would still have been sent that
+ * location's confirmations. The raw table was correct the whole time; only the
+ * normalized junction was stale. The hourly poll had this bug too — webhooks
+ * only made it visible in a minute instead of an hour.
+ *
+ * @param parentIds EVERY parent this pass processed — NOT merely the parents
+ *   appearing in `pairs`. This distinction is the whole correctness argument:
+ *   a parent whose links were ALL removed contributes zero pairs, so deriving
+ *   the scope from `pairs` would skip exactly the case that needs cleaning
+ *   (the last contact removed from a location, the last technician unassigned
+ *   from an appointment). Conversely the scope must never be "everything",
+ *   because the appointment passes are watermark-filtered — deleting outside
+ *   the processed set would wipe live links for parents the pass never read.
+ */
+async function replaceJunction(table, colA, colB, pairs, parentIds, { batchSize = 1000 } = {}) {
+  const parents = [...new Set(parentIds)].filter((id) => id != null);
+  if (!parents.length) return;
+
+  // Delete first, then insert: the pairs that survive are re-added by the
+  // INSERT below, and every write here is idempotent, so a crash between the
+  // two leaves rows to be restored by the next run rather than duplicated.
+  const flatA = pairs.map(([a]) => a);
+  const flatB = pairs.map(([, b]) => b);
+  const { rowCount: removed } = await db.query(
+    `DELETE FROM ${table} t
+      WHERE t.${colA} = ANY($1::bigint[])
+        AND NOT EXISTS (
+          SELECT 1 FROM (SELECT unnest($2::bigint[]) AS a, unnest($3::bigint[]) AS b) v
+           WHERE v.a = t.${colA} AND v.b = t.${colB}
+        )`,
+    [parents, flatA, flatB]
+  );
+
+  await bulkInsertJunction(table, colA, colB, pairs, { batchSize });
+
+  if (removed > 0) {
+    logger.info("replaceJunction: stale links removed", { table, removed, parents: parents.length, pairs: pairs.length });
+  }
 }
 
 /**
