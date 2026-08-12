@@ -223,6 +223,7 @@ function summarizeOutcome(messages) {
   }
 
   const lines = [];
+  const appointmentIds = new Set();
   for (const m of messages) {
     const type = m?._getType?.() || m?.type;
     if (type !== "ai" || !Array.isArray(m.tool_calls)) continue;
@@ -232,9 +233,14 @@ function summarizeOutcome(messages) {
       if (!result?.success) continue;
       const line = describeAction(tc.name, tc.args, result);
       if (line) lines.push(line);
+      // Which visits were actually touched — the CRM comment's summary names
+      // their services and dates, so it must not guess from the whole job.
+      for (const id of [result.appointment_id ?? tc.args?.appointment_id, ...(result.confirmed || [])]) {
+        if (id != null && String(id).trim() !== "") appointmentIds.add(String(id));
+      }
     }
   }
-  return lines;
+  return { lines, appointmentIds: [...appointmentIds] };
 }
 
 async function runGraph(threadId, ctx, input, onEvent = null) {
@@ -266,10 +272,13 @@ async function runGraph(threadId, ctx, input, onEvent = null) {
       logger.warn("ConfirmationAgent: failed to set chat_ended state", { error: err.message, threadId })
     );
 
-    const summaryLines = summarizeOutcome(after);
+    const { lines: summaryLines, appointmentIds } = summarizeOutcome(after);
     await postConfirmationAgentComment({
       companyId: ctx.companyId, jobId: ctx.jobId, threadId,
-      summaryLines, messageCount: after.length,
+      summaryLines, appointmentIds, messageCount: after.length,
+      // Who we were actually talking to — a nominated contact when the link was
+      // sent to one, otherwise the customer record.
+      recipientName: ctx.recipientName || null,
     }).catch((err) => logger.warn("ConfirmationAgent: outcome comment post failed", { error: err.message, threadId }));
   }
 

@@ -21,6 +21,7 @@ const entityTypesDb = require("../db/servicetrade-entity-types");
 const callSettingsDb = require("../db/call-settings");
 const callLogsDb = require("../db/call-logs");
 const logger = require("../utils/logger");
+const conversationSummary = require("./conversation-summary");
 
 const CALL_TYPES_WITH_WRITEBACK = [
   "customer_confirmation",
@@ -68,13 +69,34 @@ function deriveLabel(callType, outcome, custom) {
   return null;
 }
 
+/** Company timezone, for rendering visit dates the office will recognise. */
+async function companyTimezone(companyId) {
+  try {
+    const { rows } = await db.query(`SELECT default_timezone FROM companies WHERE id = $1`, [companyId]);
+    return rows[0]?.default_timezone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
 function commentMarker(retellCallId) {
   return `[clara-call:${retellCallId}]`;
 }
 
-function buildCommentContent(label, callSummary, retellCallId) {
-  const summary = (callSummary && String(callSummary).trim()) || "No summary available.";
-  return `Clara call outcome: the customer ${label}.\n\nCall summary: ${summary}\n\n${commentMarker(retellCallId)}`;
+/**
+ * @param {string|null} llmSummary  the model's sentence, or null → fall back to
+ *   Retell's own call summary, which is what shipped before.
+ * @param {string|null} whoConfirmed the contact we actually spoke to.
+ */
+function buildCommentContent(label, callSummary, retellCallId, { llmSummary = null, whoConfirmed = null, plainSummary = null } = {}) {
+  const fallback = llmSummary || plainSummary || (callSummary && String(callSummary).trim()) || "No summary available.";
+  return [
+    `Call outcome: the customer ${label}.`,
+    `Who confirmed: ${whoConfirmed || "unknown"}`,
+    `Summary: ${fallback}`,
+    "",
+    commentMarker(retellCallId),
+  ].join("\n");
 }
 
 /**
@@ -87,9 +109,7 @@ function buildCommentContent(label, callSummary, retellCallId) {
  * current ServiceTrade ids are < 2^53 (JS-safe).
  */
 function commentVisibility() {
-  const raw = process.env.SERVICETRADE_COMMENT_VISIBILITY;
-  if (raw && raw.trim()) return raw.split(",").map((s) => s.trim()).filter(Boolean);
-  return ["public"];
+  return ["tech", "schedule", "billing"];
 }
 
 function buildCommentBody({ entityId, entityType, content }) {
@@ -286,7 +306,29 @@ async function postCallComment({ companyId, scheduledCall, outcome, custom, call
     targets: targets.map((t) => ({ entityKey: t.entityKey, entityType: t.entityType, entityIds: t.entityIds })),
   });
 
-  const content = buildCommentContent(label, callSummary, retellCallId);
+  // Who we actually spoke to. scheduled_calls.recipient_name is set when the
+  // call went to a nominated contact (migration 081) rather than the customer
+  // record itself, so it is preferred over customer_name.
+  const whoConfirmed = scheduledCall?.recipient_name || scheduledCall?.customer_name || null;
+
+  // Best-effort: a failure here leaves llmSummary null and buildCommentContent
+  // falls back to Retell's own summary, which is what shipped before.
+  let llmSummary = null;
+  let plainSummary = null;
+  try {
+    const [facts, transcript] = await Promise.all([
+      conversationSummary.buildOutcomeFacts(companyId, [scheduledCall?.appointment_id], await companyTimezone(companyId)),
+      conversationSummary.loadCallTranscript(companyId, retellCallId),
+    ]);
+    plainSummary = conversationSummary.renderPlainSummary(facts.visits);
+    llmSummary = await conversationSummary.summarizeConversation({
+      channel: "phone call", personName: whoConfirmed, outcomeFacts: facts.lines, transcript,
+    });
+  } catch (err) {
+    logger.warn("servicetrade comment: summary step failed, using fallback", { companyId, retellCallId, error: err.message });
+  }
+
+  const content = buildCommentContent(label, callSummary, retellCallId, { llmSummary, whoConfirmed, plainSummary });
 
   // Flatten to (entityKey, entityType, entityId) so we post one comment per
   // entity — a confirmation call writes to both the appointment and the job.
@@ -343,9 +385,48 @@ function chatCommentMarker(threadId, messageCount) {
   return `[clara-chat:${threadId}:${messageCount}]`;
 }
 
-function buildChatCommentContent(summaryLines, threadId, messageCount) {
-  const body = summaryLines.map((l) => `- ${l}`).join("\n");
-  return `Clara chat outcome:\n${body}\n\n${chatCommentMarker(threadId, messageCount)}`;
+/**
+ * @param {string|null} llmSummary  the model's sentence, or null → fall back to
+ *   the deterministic tool-derived lines, which is what shipped before.
+ * @param {string|null} whoConfirmed the contact we were actually talking to.
+ */
+/**
+ * One id-free line describing what the conversation actually did, derived from
+ * the deterministic tool-call lines rather than from anything the model wrote.
+ */
+function describeChatOutcome(summaryLines) {
+  const counts = { confirmed: 0, rescheduled: 0, cancelled: 0, booked: 0 };
+  for (const line of summaryLines) {
+    if (/\bconfirmed\b/i.test(line)) {
+      const m = line.match(/confirmed (\d+) appointment/i);
+      counts.confirmed += m ? Number(m[1]) : 1;
+    } else if (/\brescheduled\b/i.test(line)) counts.rescheduled += 1;
+    else if (/\bcancelled\b/i.test(line)) counts.cancelled += 1;
+    else if (/\bbooked\b/i.test(line)) counts.booked += 1;
+  }
+  const parts = [];
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  if (counts.confirmed) parts.push(`confirmed ${plural(counts.confirmed, "visit")}`);
+  if (counts.rescheduled) parts.push(`rescheduled ${plural(counts.rescheduled, "visit")}`);
+  if (counts.cancelled) parts.push(`cancelled ${plural(counts.cancelled, "visit")}`);
+  if (counts.booked) parts.push(`booked ${plural(counts.booked, "visit")}`);
+  return parts.length ? `the customer ${parts.join(", ")}.` : "see summary below.";
+}
+
+function buildChatCommentContent(summaryLines, threadId, messageCount, { llmSummary = null, whoConfirmed = null, plainSummary = null } = {}) {
+  // Counts, not ids. The outcome line is computed from the real tool calls, so
+  // it cannot be wrong; stripping the "#110726" keeps it readable for the office.
+  const outcome = describeChatOutcome(summaryLines);
+  // Fallbacks in order: the model's sentence, then the deterministic
+  // services-and-dates rendering, then the raw tool lines as a last resort.
+  const summary = llmSummary || plainSummary || summaryLines.map((l) => `- ${l}`).join("\n");
+  return [
+    `Chat outcome: ${outcome}`,
+    `Who confirmed: ${whoConfirmed || "unknown"}`,
+    `Summary: ${summary}`,
+    "",
+    chatCommentMarker(threadId, messageCount),
+  ].join("\n");
 }
 
 /**
@@ -369,7 +450,7 @@ function buildChatCommentContent(summaryLines, threadId, messageCount) {
  * @param {string[]} args.summaryLines human-readable lines, one per successful action
  * @param {number} args.messageCount   full message count at post time (see chatCommentMarker)
  */
-async function postConfirmationAgentComment({ companyId, jobId, threadId, summaryLines, messageCount }) {
+async function postConfirmationAgentComment({ companyId, jobId, threadId, summaryLines, messageCount, appointmentIds = [], recipientName = null }) {
   if (!summaryLines || summaryLines.length === 0) {
     logger.info("servicetrade comment (chat): nothing reportable; skipping", { companyId, threadId, jobId });
     return;
@@ -387,7 +468,38 @@ async function postConfirmationAgentComment({ companyId, jobId, threadId, summar
     return;
   }
 
-  const content = buildChatCommentContent(summaryLines, threadId, messageCount);
+  // Who we were actually chatting with. Falls back to the customer on the job
+  // when the link went to the customer record rather than a nominated contact.
+  let whoConfirmed = recipientName;
+  if (!whoConfirmed) {
+    const { rows } = await db.query(
+      `SELECT COALESCE(NULLIF(TRIM(cu.full_name), ''),
+                       TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name))) AS name
+         FROM jobs j LEFT JOIN customers cu ON cu.id = j.customer_id
+        WHERE j.id = $1 AND j.company_id = $2`,
+      [jobId, companyId]
+    ).catch(() => ({ rows: [] }));
+    whoConfirmed = rows[0]?.name || null;
+  }
+
+  // Best-effort: on any failure llmSummary stays null and the deterministic
+  // tool-derived lines are used instead — the text shipped before this change.
+  let llmSummary = null;
+  let plainSummary = null;
+  try {
+    const [facts, transcript] = await Promise.all([
+      conversationSummary.buildOutcomeFacts(companyId, appointmentIds, await companyTimezone(companyId)),
+      conversationSummary.loadChatTranscript(companyId, threadId),
+    ]);
+    plainSummary = conversationSummary.renderPlainSummary(facts.visits);
+    llmSummary = await conversationSummary.summarizeConversation({
+      channel: "web chat", personName: whoConfirmed, outcomeFacts: facts.lines, transcript,
+    });
+  } catch (err) {
+    logger.warn("servicetrade comment (chat): summary step failed, using fallback", { companyId, threadId, error: err.message });
+  }
+
+  const content = buildChatCommentContent(summaryLines, threadId, messageCount, { llmSummary, whoConfirmed, plainSummary });
   const marker = chatCommentMarker(threadId, messageCount);
   const posts = targets.flatMap((t) => t.entityIds.map((entityId) => ({ entityKey: t.entityKey, entityType: t.entityType, entityId })));
 
