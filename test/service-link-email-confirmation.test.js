@@ -122,7 +122,7 @@ function chatPrompt(opts = {}) {
 test("the contact's email and phone are given as context, not buried in the send step", () => {
   const out = chatPrompt({ recipientName: "Dana Reed", recipientEmail: "dana@acme.test", recipientPhone: "+15551234567" });
   const header = out.slice(0, out.indexOf("── CURRENT JOB DATA"));
-  assert.match(header, /WHO YOU ARE TALKING TO/);
+  assert.match(header, /CONTACT & JOB DATA/);
   assert.match(header, /dana@acme\.test/, "email must be visible before the service-link section");
   assert.match(header, /\+15551234567/);
   assert.match(header, /Dana Reed/);
@@ -130,15 +130,18 @@ test("the contact's email and phone are given as context, not buried in the send
 
 test("missing details read as 'none', never as a blank or the word null", () => {
   const out = chatPrompt({ recipientName: "Dana Reed" });
-  assert.match(out, /Email on file: none/);
-  assert.match(out, /Phone on file: none/);
+  assert.match(out, /- Email: none on file/);
+  assert.match(out, /- Phone: none on file/);
   assert.ok(!out.includes("Email on file: null"));
   assert.ok(!out.includes("Email on file: undefined"));
 });
 
-test("a contact who isn't the account holder is flagged as such", () => {
+test("the person is named, and the site is flagged as a place rather than a person", () => {
   const out = chatPrompt({ recipientName: "Dana Reed", recipientEmail: "dana@acme.test" });
-  assert.match(out, /not the account holder/, "so the agent doesn't address them as the customer");
+  assert.match(out, /You are texting Dana Reed\./,
+    "the agent addresses the human, not the account");
+  assert.match(out, /is a LOCATION NAME — not a person/,
+    "and knows the account name is a place, so it never salutes it");
 });
 
 test("when the recipient IS the account holder, that note is omitted", () => {
@@ -148,7 +151,7 @@ test("when the recipient IS the account holder, that note is omitted", () => {
 
 test("the agent is told not to volunteer the contact details", () => {
   const out = chatPrompt({ recipientEmail: "dana@acme.test", recipientPhone: "+15551234567" });
-  assert.match(out, /Never read the phone or email out unprompted/i);
+  assert.match(out, /Never read them out unprompted/i);
 });
 
 // ── The chat prompt states the gate ──────────────────────────────────────────
@@ -162,11 +165,11 @@ test("the prompt requires an explicit yes and names the parameter", () => {
 
 test("with no email on file the prompt asks and reads back, rather than inventing one", () => {
   const out = chatPrompt({});
-  assert.match(out, /Ask for their email/);
+  assert.match(out, /We have no email on file for this conversation — ask for it/);
   assert.match(out, /read back what they give you/);
 });
 
 test("the prompt explains WHY a wrong address matters — it writes to the CRM", () => {
   const out = chatPrompt({ recipientEmail: "dana@acme.test" });
-  assert.match(out, /CREATES one in our CRM/);
+  assert.match(out, /CREATES one in the CRM/);
 });

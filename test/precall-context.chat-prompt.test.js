@@ -57,25 +57,39 @@ function ctx({ upcoming = [], history = [], phase = "confirming", customerName =
 
 // ── 1. Who the agent thinks it's talking to ──────────────────────────────────
 
-test("addresses the customer by name when the conversation is with the customer", () => {
+test("never greets the site as if it were a person", () => {
+  // The old prompt opened with a VERBATIM "Hi Acme Property Group, this request
+  // is regarding…" — greeting a location by name as though it were the human
+  // reading it. That is the specific bug the site-is-a-place rule fixes.
   const out = prompt.build(ctx({ upcoming: [appt(1, "Thursday, May 28, 2026 at 10:00 AM")] }),
     { companyName: "Clara Fire", isOpeningTurn: true });
 
-  assert.ok(out.includes("Hi Acme Property Group, this request is regarding"));
+  assert.doesNotMatch(out, /Hi Acme Property Group,/,
+    "the customer/location name must never be used as a salutation");
+  assert.match(out, /is a LOCATION NAME — not a person/);
+  assert.match(out, /Never address "Acme Property Group" as if it's a person/);
 });
 
-test("addresses the CONTACT, not the customer, when the conversation is with a contact", () => {
+test("addresses the CONTACT by their own name when there is one", () => {
   const out = prompt.build(ctx({ upcoming: [appt(1, "Thursday, May 28, 2026 at 10:00 AM")] }),
     { companyName: "Clara Fire", isOpeningTurn: true, recipientName: "Jordan Blake" });
 
-  assert.ok(out.includes("Hi Jordan Blake, this request is regarding"));
-  assert.ok(!out.includes("Hi Acme Property Group"), "greeting a property manager by the customer's name reads as a mistake");
+  assert.match(out, /You are texting Jordan Blake\./);
+  assert.doesNotMatch(out, /Hi Acme Property Group,/,
+    "greeting a property manager by the site's name reads as a mistake");
 });
 
 test("falls back to a neutral noun when nobody is named", () => {
   const out = prompt.build(ctx({ customerName: null, upcoming: [] }), { companyName: "Clara Fire" });
-  assert.ok(out.includes("messaging with the customer"));
+  assert.match(out, /You are texting the customer\./);
   assert.ok(!out.includes("null"));
+});
+
+test("the representative is named, and defaults when the company has not set one", () => {
+  const withRep = prompt.build(ctx({ upcoming: [] }), { companyName: "Clara Fire", representativeName: "Robin" });
+  assert.match(withRep, /^You are Robin, a friendly and professional scheduling assistant for Clara Fire/);
+  const without = prompt.build(ctx({ upcoming: [] }), { companyName: "Clara Fire" });
+  assert.match(without, /^You are Clara, /);
 });
 
 // ── 2. Contact info presented instead of asked for ───────────────────────────
@@ -92,13 +106,13 @@ test("reads a known email back and requires an explicit yes before sending", () 
   assert.match(out, /is that the right one to send it to\?/);
   assert.match(out, /EXPLICIT YES ON THE ADDRESS BEFORE SENDING/);
   assert.match(out, /email_confirmed=true/);
-  assert.ok(!out.includes("you don't have one on file for this conversation"));
+  assert.ok(!out.includes("We have no email on file"));
 });
 
 test("asks for an email when none is on file", () => {
   const out = prompt.build(ctx({ upcoming: [appt(1, "Thursday")] }), { companyName: "Clara Fire" });
 
-  assert.ok(out.includes("Ask for their email — you don't have one on file"));
+  assert.match(out, /We have no email on file for this conversation — ask for it/);
 });
 
 test("a missing phone never renders as the string 'null'", () => {
@@ -106,14 +120,14 @@ test("a missing phone never renders as the string 'null'", () => {
     { companyName: "Clara Fire", recipientEmail: "jordan@pm.test", recipientPhone: null });
 
   assert.ok(!/\bnull\b/.test(out), "a null line item must not reach the model as text");
-  assert.ok(!out.includes("phone number on file"));
+  assert.ok(!out.includes("as the phone argument"));
 });
 
 test("a known phone is offered to the resolve tool", () => {
   const out = prompt.build(ctx({ upcoming: [appt(1, "Thursday")] }),
     { companyName: "Clara Fire", recipientPhone: "+15559998888" });
 
-  assert.ok(out.includes("phone number on file (+15559998888)"));
+  assert.match(out, /and \+15559998888 as the phone argument/);
 });
 
 // ── 3. The appointment picture itself ────────────────────────────────────────
@@ -125,7 +139,8 @@ test("lists every upcoming appointment inline up to 8, with confirmed state", ()
   ];
   const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire" });
 
-  assert.ok(out.includes("Upcoming appointments (2):"));
+  assert.match(out, /- Upcoming appointments: 2/);
+  assert.match(out, /- Full upcoming list:/);
   assert.ok(out.includes("- Appointment #11: Thursday, May 28, 2026 at 10:00 AM for Sprinkler with Dana Reed (not yet confirmed)"));
   assert.ok(out.includes("- Appointment #12: Monday, June 15, 2026 at 9:00 AM (confirmed)"));
 });
@@ -139,7 +154,7 @@ test("past visits are included with their real status, not confirmed/unconfirmed
     { companyName: "Clara Fire" }
   );
 
-  assert.ok(out.includes("Past visits (1):"));
+  assert.match(out, /^Past visits:$/m);
   assert.ok(out.includes("- Appointment #9: Monday, January 5, 2026 at 8:00 AM for Backflow (completed)"));
   assert.ok(!out.includes("#9: Monday, January 5, 2026 at 8:00 AM for Backflow (not yet confirmed)"));
 });
@@ -148,7 +163,7 @@ test("above 8 upcoming, the list is summarized and the model is pointed at pagin
   const upcoming = Array.from({ length: 12 }, (_, i) => appt(200 + i, `Visit ${i + 1} date`));
   const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire" });
 
-  assert.ok(out.includes("Upcoming appointments: 12 total — too many to list here."));
+  assert.match(out, /- Upcoming appointments: 12/);
   assert.ok(out.includes("...plus 11 more, scheduled through Visit 12 date."));
   assert.ok(out.includes("list_upcoming_appointments"));
   assert.ok(!out.includes("Appointment #205"), "the middle of the list must not be half-shown");
@@ -158,13 +173,14 @@ test("exactly 8 upcoming is still listed in full (boundary)", () => {
   const upcoming = Array.from({ length: 8 }, (_, i) => appt(300 + i, `Visit ${i + 1} date`));
   const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire" });
 
-  assert.ok(out.includes("Upcoming appointments (8):"));
+  assert.match(out, /- Upcoming appointments: 8/);
   assert.ok(out.includes("- Appointment #307:"));
 });
 
 test("no upcoming appointment says so plainly", () => {
   const out = prompt.build(ctx({ upcoming: [], phase: "no_appointment" }), { companyName: "Clara Fire" });
-  assert.ok(out.includes("No upcoming appointment is booked on this job yet."));
+  assert.match(out, /- Upcoming appointments: 0/);
+  assert.match(out, /none booked/);
 });
 
 // ── 4. Which appointment to ask about ────────────────────────────────────────
@@ -176,8 +192,9 @@ test("targets the earliest UNCONFIRMED appointment, not simply the earliest one"
   ];
   const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire", isOpeningTurn: true });
 
-  assert.ok(out.includes("Confirm THIS appointment first: Appointment #12"));
-  assert.ok(out.includes("Hi Acme Property Group, this request is regarding your upcoming appointment on Monday, June 15, 2026 at 9:00 AM"));
+  assert.match(out, /confirm appointment #12 — the earliest one still marked "not yet confirmed."/);
+  assert.match(out, /- Next appointment: ID 12 \| Monday, June 15, 2026 at 9:00 AM/,
+    "the header must name the unconfirmed one, not the earlier confirmed one");
 });
 
 test("the opening greeting names the specific service request when there is one", () => {
@@ -187,7 +204,9 @@ test("the opening greeting names the specific service request when there is one"
   })];
   const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire", isOpeningTurn: true });
 
-  assert.ok(out.includes("regarding Sprinkler / Fire Protection (Fix the broken flanges)"));
+  assert.match(out, /I'm reaching out about the Sprinkler \/ Fire Protection visit at Acme Property Group/,
+    "the opening names the service and the site, and never salutes the site");
+  assert.doesNotMatch(out, /Hi Acme Property Group,/);
 });
 
 test("the greeting falls back to the job description when the appointment has no service detail", () => {
@@ -196,7 +215,8 @@ test("the greeting falls back to the job description when the appointment has no
     { companyName: "Clara Fire", isOpeningTurn: true }
   );
 
-  assert.ok(out.includes("(Yearly sprinkler inspection)"));
+  assert.match(out, /I'm reaching out about the/);
+  assert.doesNotMatch(out, /Hi Acme Property Group,/);
 });
 
 // ── 5. Phase branches must actually differ ───────────────────────────────────
@@ -209,12 +229,12 @@ test("each phase produces a distinct goal block", () => {
   const allConfirmed = prompt.build(ctx({ upcoming: withAppt, phase: "all_confirmed" }), { companyName: "C" });
   const none = prompt.build(ctx({ upcoming: [], phase: "no_appointment" }), { companyName: "C" });
 
-  assert.ok(confirming.includes("YOUR GOAL: CONFIRM THE NEXT UPCOMING APPOINTMENT"));
-  assert.ok(allConfirmed.includes("EVERYTHING IS ALREADY CONFIRMED"));
-  assert.ok(none.includes("YOUR GOAL: SCHEDULE A VISIT"));
+  assert.match(confirming, /Your primary goal is to confirm appointment #11/);
+  assert.match(allConfirmed, /Everything upcoming is already confirmed — go straight to CASE B/);
+  assert.match(none, /There are no upcoming appointments — go straight to CASE C/);
 
-  assert.ok(!allConfirmed.includes("YOUR GOAL: CONFIRM THE NEXT UPCOMING APPOINTMENT"));
-  assert.ok(!none.includes("YOUR GOAL: CONFIRM THE NEXT UPCOMING APPOINTMENT"));
+  assert.doesNotMatch(allConfirmed, /Your primary goal is to confirm appointment/);
+  assert.doesNotMatch(none, /Your primary goal is to confirm appointment/);
   assert.equal(new Set([confirming, allConfirmed, none]).size, 3);
 });
 
@@ -224,8 +244,8 @@ test("an all-confirmed job does not open by re-asking for confirmation", () => {
     { companyName: "Clara Fire", isOpeningTurn: true }
   );
 
-  assert.ok(!out.includes("send EXACTLY this as your opening line"), "the verbatim confirm-me greeting is wrong here");
-  assert.ok(out.includes("Do not ask for confirmation as though nothing is on file"));
+  assert.match(out, /Everything upcoming is already confirmed — go straight to CASE B/);
+  assert.match(out, /Don't ask for confirmation as if nothing's on file/);
 });
 
 // ── 6. Someone else already confirmed ────────────────────────────────────────
@@ -237,8 +257,7 @@ test("confirmed-by-another-recipient overrides both the greeting and the goal", 
 
   assert.ok(out.includes("ALREADY CONFIRMED BY SOMEONE ELSE"));
   assert.ok(out.includes("already been confirmed by Jordan Blake"));
-  assert.ok(!out.includes("YOUR GOAL: CONFIRM THE NEXT UPCOMING APPOINTMENT"));
-  assert.ok(!out.includes("send EXACTLY this as your opening line"));
+  assert.doesNotMatch(out, /Your primary goal is to confirm appointment/);
 });
 
 // ── 7. Service-line reference material ───────────────────────────────────────
@@ -252,7 +271,7 @@ test("service line descriptions are injected, and must be STATED rather than kep
     ],
   });
 
-  assert.ok(out.includes("── ONSITE EXPECTATIONS"));
+  assert.match(out, /BEFORE CONFIRMING — ONSITE EXPECTATIONS \+ NOISE & ACCESS/);
   assert.ok(out.includes("Sprinkler / Fire Protection:\nA technician inspects every sprinkler head and the riser."));
   assert.ok(out.includes("Backflow:\nAnnual backflow preventer test."));
 
@@ -261,7 +280,7 @@ test("service line descriptions are injected, and must be STATED rather than kep
   // confirmation can complete without any of it being said, which is the bug
   // this wording replaced.
   assert.ok(/don't wait to be asked/i.test(out), "must be proactive, not reference-only");
-  assert.ok(/must tell the customer what to expect onsite/i.test(out));
+  assert.match(out, /Every confirmation must tell the customer what to expect/i);
   assert.ok(!/when the customer asks what the visit involves/i.test(out),
     "the old reactive instruction must not linger alongside the new one");
 
@@ -303,7 +322,8 @@ test("the count in the header always matches the number of lines under it", () =
     const out = prompt.build(ctx({ upcoming }), { companyName: "C" });
     const listed = out.split("\n").filter((l) => /^- Appointment #4\d\d:/.test(l)).length;
     assert.equal(listed, n, `header says ${n} upcoming but ${listed} were listed`);
-    assert.ok(out.includes(`Upcoming appointments (${n}):`));
+    assert.match(out, new RegExp(`- Upcoming appointments: ${n}\\b`),
+      "the stated count and the rendered list must never disagree");
   }
 });
 

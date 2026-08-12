@@ -391,15 +391,20 @@ test("the confirm-this-appointment line names every service, not just the first"
     service("Backflow", "Annual Backflow Inspection"),
   ] });
   const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
-  const goal = out.split("\n").find((l) => l.startsWith("Confirm THIS appointment first"));
-  assert.ok(goal, "the goal line should exist");
+  // Services now live on the dedicated "what the next visit covers" line.
+  const goal = out.split("\n").find((l) => l.startsWith("  ") && l.includes("Sprinkler"));
+  assert.ok(goal, "the services line should exist");
   // This is the most directive sentence in the prompt, and it used to read
   // "for OTHER" — the singular first-of field — for a three-service visit.
   for (const cat of ["OTHER", "Sprinkler", "Backflow"]) {
     assert.ok(goal.includes(cat), `goal line should mention ${cat}`);
   }
-  assert.ok(!goal.includes("Annual Backflow Inspection"),
-    "but not repeat the descriptions already listed on the appointment line above");
+  // The descriptions ARE included here by design — the line is specified as
+  // "service line — description", and the description is where the real detail
+  // lives. Note this duplicates the upcoming-list line, which carries the same
+  // pairing; the cost is paid on every turn since the prompt is rebuilt each one.
+  assert.ok(goal.includes("Annual Backflow Inspection"),
+    "the description is the detailed half and belongs on this line");
 });
 
 test("the crew's contact details are available for the visit under discussion", async () => {
@@ -407,23 +412,24 @@ test("the crew's contact details are available for the visit under discussion", 
     crew: [{ name: "Casey Nary", email: "cnary@co.test" }, { name: "Jack Valentine", phone: "+15551234567" }],
   });
   const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
-  assert.match(out, /Technicians assigned to that visit:/);
+  assert.match(out, /- Full crew for the next visit:/);
   assert.match(out, /Casey Nary \(cnary@co\.test\)/);
   assert.match(out, /Jack Valentine \(\+15551234567\)/);
-  assert.match(out, /only if the customer actually asks/, "must not be volunteered unprompted");
+  assert.match(out, /only if the customer asks — never volunteer them/,
+    "must not be volunteered unprompted");
 });
 
 test("a technician with no contact details gets no empty brackets", async () => {
   const ctx = await ctxFor({ crew: [{ name: "No Contact" }] });
   const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
-  assert.match(out, /Technicians assigned to that visit: No Contact\./);
+  assert.match(out, /- Full crew for the next visit:\n  No Contact$/m);
   assert.ok(!out.includes("()"));
 });
 
 test("no crew → no crew-detail line at all", async () => {
   const ctx = await ctxFor({ crew: [], technicianName: null });
   const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
-  assert.ok(!out.includes("Technicians assigned to that visit"));
+  assert.match(out, /- Full crew for the next visit:\n  no technician assigned yet$/m);
 });
 
 // ── Arrival window ───────────────────────────────────────────────────────────
@@ -436,16 +442,26 @@ test("no crew → no crew-detail line at all", async () => {
 const { formatArrivalWindow } = require("../src/utils/timezone");
 const TZ = "America/Chicago";
 
-test("the window brackets the scheduled start by 30 minutes", () => {
-  assert.equal(formatArrivalWindow("2026-08-28T13:00:00Z", TZ), "between 7:30 AM and 8:30 AM");
+test("the window runs FORWARD one hour from the scheduled start", () => {
+  // 8 AM -> "between 8 AM and 9 AM". Never earlier than the time the customer
+  // was given: a window that opened before it would promise an arrival the
+  // office never committed to.
+  assert.equal(formatArrivalWindow("2026-08-28T13:00:00Z", TZ), "between 8 AM and 9 AM");
+  assert.equal(formatArrivalWindow("2026-08-28T14:00:00Z", TZ), "between 9 AM and 10 AM");
+});
+
+test("a whole hour drops the :00 the voice would read aloud", () => {
+  assert.equal(formatArrivalWindow("2026-08-28T13:00:00Z", TZ), "between 8 AM and 9 AM");
+  // but a real minute value is kept
+  assert.match(formatArrivalWindow("2026-08-28T13:15:00Z", TZ), /^between 8:15 AM and 9:15 AM$/);
 });
 
 test("crossing noon keeps the meridiem right", () => {
-  assert.equal(formatArrivalWindow("2026-08-28T17:15:00Z", TZ), "between 11:45 AM and 12:45 PM");
+  assert.equal(formatArrivalWindow("2026-08-28T16:30:00Z", TZ), "between 11:30 AM and 12:30 PM");
 });
 
 test("crossing midnight keeps the meridiem right", () => {
-  assert.equal(formatArrivalWindow("2026-08-28T05:20:00Z", TZ), "between 11:50 PM and 12:50 AM");
+  assert.equal(formatArrivalWindow("2026-08-29T04:30:00Z", TZ), "between 11:30 PM and 12:30 AM");
 });
 
 test("a DST fall-back night yields null rather than 'between 1:00 AM and 1:00 AM'", () => {
@@ -468,7 +484,9 @@ test("the context exposes the window on each appointment", async () => {
 test("the chat prompt states the window and forbids computing it", async () => {
   const ctx = await ctxFor({ services: [service("Backflow", "Annual Backflow Inspection")] });
   const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
-  assert.match(out, /Arrival window for that visit: the crew should arrive between /);
-  assert.match(out, /30 minutes either side/);
-  assert.match(out, /do not work out the window yourself/i);
+  assert.match(out, /- Arrival window for next visit: between /);
+  assert.match(out, /pre-computed — always use this, never calculate it yourself/);
+  assert.doesNotMatch(out, /either side/,
+    "the window is forward-looking now; 'either side' would promise an arrival before the scheduled time");
+  assert.match(out, /within one hour AFTER the scheduled time — never earlier than scheduled/);
 });

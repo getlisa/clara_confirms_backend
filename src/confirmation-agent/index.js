@@ -291,11 +291,11 @@ async function runGraph(threadId, ctx, input, onEvent = null) {
  * getOrCreateSession, but there's no dead-session case to reopen: the
  * checkpointer keeps the thread alive indefinitely.
  */
-async function ensureOpened({ companyId, jobId, token, companyName, recipientContactId = null, linkAppointmentId = null }) {
+async function ensureOpened({ companyId, jobId, token, companyName, companyPhone = null, representativeName = null, recipientContactId = null, linkAppointmentId = null }) {
   const { jobRef, customerRef, customerEmail, customerPhone } = await resolveJobRefs(companyId, jobId);
   const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone);
   const ctx = {
-    companyId, jobId, threadId: token, jobRef, customerRef, companyName, recipientContactId, linkAppointmentId,
+    companyId, jobId, threadId: token, jobRef, customerRef, companyName, companyPhone, representativeName, recipientContactId, linkAppointmentId,
     recipientName, recipientEmail, recipientPhone,
   };
 
@@ -316,11 +316,11 @@ async function ensureOpened({ companyId, jobId, token, companyName, recipientCon
  *   await-the-whole-turn call; the returned `messages` are the same either
  *   way, so a caller that streams must NOT also render the return value.
  */
-async function sendMessage({ companyId, jobId, token, companyName, content, recipientContactId = null, linkAppointmentId = null }, onEvent = null) {
+async function sendMessage({ companyId, jobId, token, companyName, companyPhone = null, representativeName = null, content, recipientContactId = null, linkAppointmentId = null }, onEvent = null) {
   const { jobRef, customerRef, customerEmail, customerPhone } = await resolveJobRefs(companyId, jobId);
   const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone);
   const ctx = {
-    companyId, jobId, threadId: token, jobRef, customerRef, companyName, recipientContactId, linkAppointmentId,
+    companyId, jobId, threadId: token, jobRef, customerRef, companyName, companyPhone, representativeName, recipientContactId, linkAppointmentId,
     recipientName, recipientEmail, recipientPhone,
   };
   const messages = await runGraph(token, ctx, { messages: [new HumanMessage(content)] }, onEvent);

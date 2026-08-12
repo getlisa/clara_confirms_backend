@@ -154,20 +154,58 @@ function formatSpokenTime(iso, tz) {
 }
 
 /**
- * The arrival window around a scheduled start, as "between 7:30 AM and 8:30 AM".
+ * Friendly name for a timezone, e.g. "Central Time" — for telling a customer
+ * which zone a time is in.
+ *
+ * Derived from the company's own `default_timezone`, never hardcoded: the
+ * companies on this platform sit in America/New_York, America/Chicago and
+ * America/Vancouver, so a fixed "Central Time" would misstate a real
+ * appointment by up to three hours for two thirds of them.
+ *
+ * Falls back to the raw IANA name rather than guessing, so a zone we have no
+ * label for reads as "America/Halifax time" — clumsy but never wrong.
+ */
+function timezoneLabel(tz) {
+  if (!tz) return null;
+  try {
+    // The runtime already knows these names; asking it avoids maintaining a map
+    // that silently rots as zones change.
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "long" })
+      .formatToParts(new Date());
+    const name = parts.find((p) => p.type === "timeZoneName")?.value;
+    // "Central Daylight Time" / "Central Standard Time" -> "Central Time": the
+    // customer does not need to be told which half of the year it is.
+    if (name) return name.replace(/\b(Standard|Daylight|Summer)\s+/i, "");
+  } catch {
+    /* unknown zone — fall through */
+  }
+  return `${tz} time`;
+}
+
+/**
+ * The arrival window for a scheduled start, as "between 8 AM and 9 AM".
+ *
+ * FORWARD-LOOKING, not centred: the window runs from the scheduled time to
+ * `minutes` after it, so an 8 AM visit is "between 8 AM and 9 AM" and a 9 AM
+ * visit is "between 9 AM and 10 AM". It previously straddled the start (±30),
+ * which told a customer the crew might turn up BEFORE the time they were given
+ * — the opposite of how a service window is normally promised.
  *
  * Computed rather than left to the agent: a model doing this arithmetic in its
- * head gets hour and noon boundaries wrong (8:00 minus 30 is 7:30, not 8:30;
- * 12:15 PM minus 30 is 11:45 AM, crossing meridiem). Both bounds are formatted
- * from real Date arithmetic in the company's timezone, so DST transitions and
+ * head gets hour and noon boundaries wrong (11:30 AM plus an hour is 12:30 PM,
+ * crossing meridiem; 11:30 PM crosses midnight). Both bounds are formatted from
+ * real Date arithmetic in the company's timezone, so DST transitions and
  * midnight crossings are handled by the formatter rather than by guesswork.
  */
-function formatArrivalWindow(iso, tz, minutes = 30) {
+function formatArrivalWindow(iso, tz, minutes = 60) {
   if (!iso) return null;
   const t = new Date(iso).getTime();
   if (Number.isNaN(t)) return null;
-  const from = formatSpokenTime(new Date(t - minutes * 60_000).toISOString(), tz);
-  const to = formatSpokenTime(new Date(t + minutes * 60_000).toISOString(), tz);
+  // A whole hour reads as "8 AM", not "8:00 AM" — the window is nearly always
+  // on the hour, and the text-to-speech voice says the trailing ":00" out loud.
+  const trim = (s) => (s ? s.replace(/:00(?=\s)/, "") : s);
+  const from = trim(formatSpokenTime(new Date(t).toISOString(), tz));
+  const to = trim(formatSpokenTime(new Date(t + minutes * 60_000).toISOString(), tz));
   if (!from || !to) return null;
   // On a DST fall-back night the same wall-clock time occurs twice, so both
   // bounds can format identically — "between 1:00 AM and 1:00 AM" is worse than
@@ -214,6 +252,7 @@ function toLocalDateOnly(input, tz) {
 module.exports = {
   formatSpokenTime,
   formatArrivalWindow,
+  timezoneLabel,
   DEFAULT_TZ,
   getCompanyTimezone,
   localToUTC,

@@ -44,8 +44,11 @@ const MAX_COMMENTS = 3;
 const MAX_COMMENT_CHARS = 500;
 const MAX_PAST_APPOINTMENTS = 5;
 
-// How much either side of the scheduled start a crew may realistically arrive.
-const ARRIVAL_WINDOW_MINUTES = 30;
+// How long after the scheduled start a crew may realistically arrive.
+// The window runs FORWARD from the scheduled time — an 8 AM visit is
+// "between 8 AM and 9 AM" — rather than straddling it, which would have told
+// the customer the crew might arrive before the time they were given.
+const ARRIVAL_WINDOW_MINUTES = 60;
 
 /** Distinct, non-empty, order-preserving. */
 function dedupe(values) {
