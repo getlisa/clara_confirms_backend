@@ -129,7 +129,9 @@ async function createChatLinkForJob(companyId, jobId, callType = "customer_confi
  */
 async function loadLinkContext(link) {
   const { rows: coRows } = await db.query(
-    `SELECT name, default_timezone FROM companies WHERE id = $1`,
+    `SELECT c.name, c.default_timezone, c.phone_number, a.representative_name
+       FROM companies c LEFT JOIN agent_settings a ON a.company_id = c.id
+      WHERE c.id = $1`,
     [link.company_id]
   );
   const company = coRows[0];
@@ -201,7 +203,7 @@ async function sendConfirmationEmail(link, overrideEmail = null) {
   const sent = await chatLinkEmail.sendConfirmationLinkEmail({
     email,
     customerName: hydrated.params.customerName || null,
-    companyName: company.name,
+    companyName: company.name, companyPhone: company.phone_number || null, representativeName: company.representative_name || null,
     jobName: hydrated.params.jobName || null,
     token: link.token,
   });
@@ -260,7 +262,7 @@ async function sendConfirmationSms(link, overridePhone = null) {
   const sent = await chatLinkSms.sendConfirmationLinkSms({
     phone,
     customerName: hydrated.params.customerName || null,
-    companyName: company.name,
+    companyName: company.name, companyPhone: company.phone_number || null, representativeName: company.representative_name || null,
     jobName: hydrated.params.jobName || null,
     token: link.token,
   });
@@ -301,7 +303,7 @@ async function resolveChatLink(token) {
   await chatLinksDb.markOpened(link.id);
 
   const { messages } = await confirmationAgent.ensureOpened({
-    companyId: link.company_id, jobId: link.job_id, token, companyName: company.name,
+    companyId: link.company_id, jobId: link.job_id, token, companyName: company.name, companyPhone: company.phone_number || null, representativeName: company.representative_name || null,
     recipientContactId: link.recipient_contact_id, linkAppointmentId: link.appointment_id,
   });
 
@@ -344,7 +346,7 @@ async function sendChatMessage(token, content, onEvent = null) {
   const { company, hydrated } = ctx;
 
   const { messages } = await confirmationAgent.sendMessage({
-    companyId: link.company_id, jobId: link.job_id, token, companyName: company.name, content,
+    companyId: link.company_id, jobId: link.job_id, token, companyName: company.name, companyPhone: company.phone_number || null, representativeName: company.representative_name || null, content,
     recipientContactId: link.recipient_contact_id, linkAppointmentId: link.appointment_id,
   }, onEvent);
 

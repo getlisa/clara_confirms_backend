@@ -117,6 +117,8 @@ async function buildGraph() {
     // prompt.js's phase-specific branches read `ctx.phase`.
     const sys = new SystemMessage(prompt.build({ ...state.jobCtx, phase: state.phase }, {
       companyName: ctx.companyName,
+      companyPhone: ctx.companyPhone,
+      representativeName: ctx.representativeName,
       isOpeningTurn,
       confirmedByOtherLabel: state.confirmedByOtherLabel,
       serviceLineDescriptions: state.serviceLineDescriptions,
