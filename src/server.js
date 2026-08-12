@@ -36,6 +36,7 @@ const manualCallsRoutes = require("./routes/manual-calls");
 const serviceLinkMessagesRoutes = require("./routes/service-link-messages");
 const chatLinksRoutes = require("./routes/chat-links");
 const copilotRoutes = require("./routes/copilot");
+const servicetradeWebhooksRoutes = require("./routes/servicetrade-webhooks");
 
 const app = express();
 
@@ -193,6 +194,12 @@ app.use("/chat-links", chatLinksRoutes);
 // AI Copilot — embedded assistant. JWT for control endpoints, signed
 // query-string token for the SSE turn stream.
 app.use("/copilot", copilotRoutes);
+
+// Inbound ServiceTrade webhooks — PUBLIC. ServiceTrade sends no signature of
+// any kind, so the unguessable secret in the path is the only authentication;
+// see the route file. Deliberately NOT under /integrations/servicetrade, which
+// is JWT-authenticated.
+app.use("/webhooks/servicetrade", servicetradeWebhooksRoutes);
 
 // 404 handler
 app.use((req, res) => {

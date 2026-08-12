@@ -881,7 +881,67 @@ async function deleteAllSyncData(companyId) {
   await db.query("DELETE FROM servicetrade_sync_state   WHERE company_id = $1", [companyId]);
 }
 
+/**
+ * Reconcile one job's appointment set against what ServiceTrade just returned.
+ *
+ * /appointment?jobId= returns a job's COMPLETE set, so an appointment we hold
+ * that the response no longer contains has been deleted upstream. Nothing else
+ * detects that: every other write in this engine is an upsert, so a vanished
+ * appointment would sit in the platform as `scheduled` forever — still counted
+ * by the job-status derivation, still eligible to be confirmed and called.
+ *
+ * `keepIds` MUST come from a fetch that paged all the way through; the caller
+ * checks that. A truncated response is indistinguishable from "these were
+ * deleted", and acting on one would cancel live visits.
+ *
+ * An EMPTY keepIds is legitimate and meaningful — a job whose every appointment
+ * was deleted — so there is deliberately no `if (!keepIds.length) return` guard.
+ *
+ * Two different treatments, on purpose:
+ *   - the RAW row is DELETED, because raw is meant to mirror ServiceTrade and
+ *     the record genuinely no longer exists there;
+ *   - the PLATFORM row is MARKED `cancelled`, never deleted. `chat_links`,
+ *     `appointment_services`, `appointment_technicians` and `appointment_notes`
+ *     all cascade off appointments.id — deleting would silently destroy a
+ *     customer's live confirmation link along with the visit. `cancelled` is an
+ *     existing allowed status, it drops the row out of every outstanding-work
+ *     query, and it keeps the history readable.
+ *
+ * Already-`completed` appointments are left alone: a finished visit that was
+ * later tidied out of the CRM is still a thing that happened, and rewriting it
+ * to `cancelled` would corrupt the job-status derivation.
+ *
+ * @returns {Promise<{removed: string[], cancelled: number}>}
+ */
+async function reconcileAppointmentsForJob(companyId, servicetradeJobId, keepIds) {
+  const keep = keepIds.map(String);
+  const { rows: removedRows } = await db.query(
+    `DELETE FROM servicetrade_appointments
+      WHERE company_id = $1
+        AND servicetrade_job_id::text = $2
+        AND NOT (servicetrade_id::text = ANY($3::text[]))
+      RETURNING servicetrade_id::text AS ref`,
+    [companyId, String(servicetradeJobId), keep]
+  );
+  const removed = removedRows.map((r) => r.ref);
+  if (removed.length === 0) return { removed, cancelled: 0 };
+
+  const { rowCount: cancelled } = await db.query(
+    `UPDATE appointments
+        SET status = 'cancelled',
+            cancellation_reason = COALESCE(cancellation_reason, 'Deleted in ServiceTrade'),
+            updated_at = NOW()
+      WHERE company_id = $1
+        AND source = 'servicetrade'
+        AND external_ref = ANY($2::text[])
+        AND status NOT IN ('completed', 'cancelled')`,
+    [companyId, removed]
+  );
+  return { removed, cancelled };
+}
+
 module.exports = {
+  reconcileAppointmentsForJob,
   // Sync state
   getSyncState,
   updateSyncState,

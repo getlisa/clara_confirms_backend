@@ -14,6 +14,8 @@ const enginesDb = require("../engines/core/db");
 const credentialsDb = require("../db/servicetrade-credentials");
 const syncDb = require("../db/servicetrade-sync");
 const { syncAccountTimezone } = require("../services/servicetrade-account");
+const webhookRegistration = require("../services/servicetrade-webhook-registration");
+const webhookProcessor = require("../services/servicetrade-webhook-processor");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -430,6 +432,72 @@ router.get("/service-requests", async (req, res) => {
   } catch (err) {
     logger.error("ServiceTrade service requests list error", { error: err.message });
     return res.status(500).json({ error: "Failed to list service requests" });
+  }
+});
+
+// ── Webhooks ────────────────────────────────────────────────────────────────
+// Realtime push alongside the hourly poll, which is unchanged and remains the
+// correctness backstop (ServiceRequest is not webhookable, and ServiceTrade
+// discards a message after 3 failed delivery attempts).
+//
+// The RECEIVING endpoint is not here — it is public, at
+// POST /webhooks/servicetrade/:secret, because ServiceTrade cannot send a JWT.
+
+// GET /integrations/servicetrade/webhook — local registration + ServiceTrade's
+// own view of it + the queue depth.
+router.get("/webhook", async (req, res) => {
+  try {
+    const result = await webhookRegistration.status(req.user.companyId);
+    return res.json(result);
+  } catch (err) {
+    logger.error("ServiceTrade webhook status error", { error: err.message });
+    return res.status(500).json({ error: "Failed to read webhook status" });
+  }
+});
+
+// POST /integrations/servicetrade/webhook — create or repoint the subscription.
+// Idempotent: re-posting updates the existing subscription instead of adding a
+// second one (ServiceTrade would then deliver every message twice).
+router.post("/webhook", async (req, res) => {
+  try {
+    const result = await webhookRegistration.register(req.user.companyId, {
+      // Override only for testing against a tunnel; production uses PUBLIC_API_URL.
+      baseUrl: req.body?.base_url || undefined,
+      includeChangesets: req.body?.include_changesets !== false,
+    });
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+    return res.json(result);
+  } catch (err) {
+    logger.error("ServiceTrade webhook register error", { error: err.message });
+    return res.status(500).json({ error: "Failed to register webhook" });
+  }
+});
+
+router.delete("/webhook", async (req, res) => {
+  try {
+    const result = await webhookRegistration.unregister(req.user.companyId);
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+    return res.json(result);
+  } catch (err) {
+    logger.error("ServiceTrade webhook unregister error", { error: err.message });
+    return res.status(500).json({ error: "Failed to remove webhook" });
+  }
+});
+
+// POST /integrations/servicetrade/webhook/drain — apply this company's queued
+// events now. Backs a "refresh" button: the every-minute cron already does this,
+// so this is for a user who does not want to wait for the next tick.
+//
+// Scoped to the caller's own company, and safe to hammer — claimPending uses
+// FOR UPDATE SKIP LOCKED, so a concurrent cron tick and ten impatient clicks
+// cannot process the same event twice.
+router.post("/webhook/drain", async (req, res) => {
+  try {
+    const result = await webhookProcessor.drainCompany(req.user.companyId);
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error("ServiceTrade webhook drain error", { companyId: req.user.companyId, error: err.message });
+    return res.status(500).json({ error: "Failed to apply queued webhook events" });
   }
 });
 

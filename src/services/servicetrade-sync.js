@@ -684,6 +684,23 @@ async function runSync(companyId, options = {}) {
   const full = !!options.full;
   const range = options.range || "month";
   const engine = options.engine || null;
+
+  // Targeted mode: refresh exactly these ServiceTrade job ids and nothing else.
+  // Presence of the KEY decides the mode, not its length — an empty array must
+  // sync nothing, never silently fall through to the whole month window, which
+  // is what a webhook drain that resolved no job ids would otherwise trigger.
+  const targeted = Array.isArray(options.jobIds);
+  // Kept as STRINGS. ServiceTrade ids are ~2.3e15 — Number() is exact there
+  // today but only just, and a silently rounded id would fetch the wrong job.
+  // The id is only ever interpolated into a URL path, so nothing needs it
+  // numeric.
+  const targetedJobIds = targeted
+    ? [...new Set(options.jobIds.map(String).filter((s) => /^[0-9]{1,19}$/.test(s)))]
+    : null;
+  if (targeted && targetedJobIds.length === 0) {
+    return { success: true, counts: {}, incomplete: [], targeted: true, skipped: "no job ids" };
+  }
+
   const credentials = await credentialsDb.getByCompanyId(companyId);
   if (!credentials) return { success: false, error: "ServiceTrade not connected" };
 
@@ -720,12 +737,27 @@ async function runSync(companyId, options = {}) {
     // options.scheduleDateFrom/scheduleDateTo (unix seconds) for a custom
     // window instead. A full sync still fetches every scheduled job
     // regardless of date, same convention as /servicerequest.
+    //
+    // options.jobIds skips this list call entirely and syncs exactly those job
+    // ids — the webhook path, where ServiceTrade has already told us WHICH job
+    // changed. Everything downstream is untouched: the whole graph around a job
+    // (appointments, customer, location, contacts, offices, tags, technicians,
+    // comments) fans out from the per-id detail fetch below, so a targeted run
+    // refreshes all of it without a second code path to keep in step.
     if (engine) await engine.transition("fetching_jobs", { full });
-    logger.info("ServiceTrade sync: fetching jobs", { companyId });
-    const { rows: jobStubs, complete: jobListComplete } = await fetchAllPages(companyId, "/job", "jobs", credentials, {
-      ...buildJobParams({ full, scheduleDateFrom: options.scheduleDateFrom, scheduleDateTo: options.scheduleDateTo }),
-      ...(full ? {} : cursorParams(state?.last_jobs_updated_at)),
-    });
+    let jobStubs;
+    let jobListComplete;
+    if (targeted) {
+      jobStubs = targetedJobIds.map((id) => ({ id }));
+      jobListComplete = true;
+      logger.info("ServiceTrade sync: targeted job ids", { companyId, count: jobStubs.length });
+    } else {
+      logger.info("ServiceTrade sync: fetching jobs", { companyId });
+      ({ rows: jobStubs, complete: jobListComplete } = await fetchAllPages(companyId, "/job", "jobs", credentials, {
+        ...buildJobParams({ full, scheduleDateFrom: options.scheduleDateFrom, scheduleDateTo: options.scheduleDateTo }),
+        ...(full ? {} : cursorParams(state?.last_jobs_updated_at)),
+      }));
+    }
     complete.jobs = jobListComplete;
 
     let jobs = [];
@@ -953,9 +985,45 @@ async function runSync(companyId, options = {}) {
       const perJobAppts = await mapWithConcurrency(jobs, API_CONCURRENCY, async (j) => {
         const { rows, sideLoad, complete: ok } = await fetchAllPagesWithSideLoad(companyId, "/appointment", "appointments", credentials, { jobId: String(j.id) });
         if (!ok) appointmentsIncomplete = true;
-        return rows.map((a) => flattenAppointmentEntry(a, sideLoad));
+        // Per-job completeness, kept separate from the global flag: the stale
+        // prune below may only run for jobs whose OWN fetch paged all the way
+        // through. A partial fetch looks identical to "these appointments were
+        // deleted", and acting on it would delete live visits.
+        return { rows: rows.map((a) => flattenAppointmentEntry(a, sideLoad)), complete: ok };
       });
       complete.appointments = !appointmentsIncomplete;
+
+      // ── Appointments deleted in the CRM ────────────────────────────────
+      // /appointment?jobId= returns a job's COMPLETE appointment set, so an
+      // appointment we hold that the response no longer contains has been
+      // deleted upstream. Nothing else can tell us: every write in this engine
+      // is an upsert, so a vanished appointment would otherwise sit in the
+      // platform as `scheduled` forever and stay eligible to be confirmed and
+      // called. ServiceTrade's `deleted` webhook covers the same ground but
+      // only while messages are actually delivered — it discards a message
+      // after 3 failed attempts — whereas this needs no event at all.
+      for (let i = 0; i < jobs.length; i++) {
+        const perJob = perJobAppts[i];
+        if (!perJob?.complete) continue;
+        // Every id must be usable. Filtering a bad one OUT of the keep-set
+        // would silently promote "we could not read this id" into "delete this
+        // appointment" — the same class of mistake as treating a truncated
+        // fetch as a deletion. If anything is unreadable, trust none of it.
+        const keep = perJob.rows.map((a) => String(a?.id));
+        if (!keep.every((id) => /^[0-9]+$/.test(id))) {
+          logger.warn("ServiceTrade sync: unreadable appointment id, skipping delete detection for this job", {
+            companyId, jobId: String(jobs[i].id), ids: keep,
+          });
+          continue;
+        }
+        const { removed, cancelled } = await syncDb.reconcileAppointmentsForJob(companyId, String(jobs[i].id), keep);
+        if (removed.length) {
+          counts.appointmentsDeleted = (counts.appointmentsDeleted || 0) + removed.length;
+          logger.info("ServiceTrade sync: appointments deleted upstream", {
+            companyId, jobId: String(jobs[i].id), removed, cancelledInPlatform: cancelled,
+          });
+        }
+      }
 
       // Keyed by id, not pushed to arrays: the same appointment/service-request
       // can legitimately appear on more than one per-job fetch page (and the
@@ -970,7 +1038,7 @@ async function runSync(companyId, options = {}) {
       const apptServiceRequestRowsById = new Map();
       for (let i = 0; i < jobs.length; i++) {
         const jobId = Number(jobs[i].id);
-        for (const a of perJobAppts[i]) {
+        for (const a of (perJobAppts[i]?.rows || [])) {
           if (!a || a.id == null) continue;
           apptRowsById.set(Number(a.id), mapAppointmentRow(a, jobId));
           for (const t of Array.isArray(a.techs) ? a.techs : []) {
@@ -1157,6 +1225,18 @@ async function runSync(companyId, options = {}) {
     // whenever those cursors re-cover a job.
     const now = Math.floor(Date.now() / 1000);
     const incomplete = Object.entries(complete).filter(([, ok]) => !ok).map(([entity]) => entity);
+
+    // A targeted run touches NO cursor and NO sync-status field. It covered one
+    // or two specific jobs, so advancing last_jobs_updated_at to now would tell
+    // the next incremental run that everything up to this moment is already
+    // handled — silently losing every OTHER job that changed since the last
+    // real sync. It also must not write last_sync_at, which the UI presents as
+    // "everything is up to date as of then".
+    if (targeted) {
+      logger.info("ServiceTrade targeted sync done", { companyId, jobIds: targetedJobIds, counts });
+      return { success: true, counts, incomplete, targeted: true };
+    }
+
     await syncDb.updateSyncState(companyId, {
       last_sync_at:                  now,
       last_full_sync_at:             full ? now : (state?.last_full_sync_at ?? null),
