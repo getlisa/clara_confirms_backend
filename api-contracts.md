@@ -787,6 +787,36 @@ Returns location detail with service requests, contacts, and assets.
 
 ---
 
+### Chat-link status & monitoring — see `chat-link-status-frontend.md`
+
+Every chat link records its lifecycle: `sent` → `in_progress` → `ended`, or
+`expired` (the 24h window lapsed before the agent closed the conversation). This
+is ADDITIONAL to `chat_links.state`, which is unchanged and still drives the
+widget's `input_hint`.
+
+| | |
+|---|---|
+| `GET /chat-links` 🔒 | monitoring list — `?status=`, `?limit=`, `?offset=` |
+| `GET /chat-links/:id/sends` 🔒 | per-send history for one link (email/SMS, manual vs scheduled) |
+| `GET /chat-links/:id/messages` 🔒 | the conversation, for the Logs detail sheet |
+
+`GET /chat-links` returns `{ chat_links, counts, pagination }`. `counts` always
+carries all four keys and covers the whole company; `pagination.total` respects
+the filter. `status` is also returned alongside `state` on `GET /chat-links/:token`
+and the `done` SSE event.
+
+`:id` on the two detail endpoints is the **numeric id**, never the token — the
+token is the customer's credential for that conversation.
+
+Do not monitor on `state` — it defaults to `chat_started` at creation, so an
+unopened link reads as a started conversation. Nor should you read an outcome from
+it: `state` records intent (saying "yes" sets `confirmation_accepted` before
+anything reaches the CRM). `outcome_comment_posted_at` is the field that means an
+outcome really landed — it is how an `expired` link can legitimately carry a CRM
+comment, when the customer confirmed and then abandoned the chat.
+
+---
+
 ### Webhooks (realtime sync) — see `servicetrade-webhooks-frontend.md`
 
 ServiceTrade pushes entity changes to us instead of us waiting for the hourly

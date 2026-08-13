@@ -46,6 +46,7 @@ router.post("/", async (req, res) => {
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
     const result = await manualCall.triggerManualCall({
+      triggeredByUserId: req.user?.userId ?? null,
       companyId,
       triggerType:   req.body?.trigger_type || req.body?.call_type, // accept either; FE should send trigger_type
       appointmentId: req.body?.appointment_id != null ? Number(req.body.appointment_id) : undefined,

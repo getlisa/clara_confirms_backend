@@ -52,9 +52,23 @@ function build() {
 }
 
 /** @returns {object[]} the LangChain tool objects offered for this phase, always including end_conversation. */
-function getToolsForPhase(phase) {
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.isOpeningTurn] — true when the agent has not spoken yet.
+ *   On that turn the customer has said NOTHING, so there is no intent to report
+ *   and nothing to end. Binding those tools anyway caused a real duplicate
+ *   greeting: the model emitted its opening AND called report_customer_intent in
+ *   the same message, the tool call routed agent → tools → recompute_context →
+ *   agent, and the second pass greeted all over again. Withholding the tool is
+ *   the structural fix — the same principle as the phase gate itself: constrain
+ *   what the model CAN do, rather than instructing it not to.
+ */
+function getToolsForPhase(phase, { isOpeningTurn = false } = {}) {
   const toolsByName = build();
-  const names = new Set([...(PHASE_TOOLS[phase] || []), "end_conversation", "report_customer_intent"]);
+  const names = new Set([
+    ...(PHASE_TOOLS[phase] || []),
+    ...(isOpeningTurn ? [] : ["end_conversation", "report_customer_intent"]),
+  ]);
   return [...names].map((n) => toolsByName.get(n)).filter(Boolean);
 }
 

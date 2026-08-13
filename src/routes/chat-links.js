@@ -15,6 +15,9 @@ const express = require("express");
 const cors = require("cors");
 const { authenticate, getCompanyId } = require("../auth");
 const chatLinksService = require("../services/chat-links");
+const chatLinksDb = require("../db/chat-links");
+const sendEventsDb = require("../db/chat-link-send-events");
+const confirmationAgent = require("../confirmation-agent");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -28,6 +31,11 @@ router.post("/appointments/:id", authenticate, async (req, res) => {
     const result = await chatLinksService.createChatLinkForAppointment(companyId, Number(req.params.id), callType);
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
 
+    // A staff member clicked. Attribute it, so the Logs detail sheet can answer
+    // "did someone send this by hand, and who?" — the dispatcher's own sends
+    // leave origin at its 'scheduler' default.
+    await chatLinksDb.setOrigin(result.token, { origin: "manual", userId: req.user?.userId ?? null })
+      .catch((err) => logger.warn("chat link: failed to record manual origin", { error: err.message }));
     return res.status(201).json({ token: result.token });
   } catch (err) {
     logger.error("POST /chat-links/appointments/:id failed", { error: err.message });
@@ -44,6 +52,11 @@ router.post("/jobs/:id", authenticate, async (req, res) => {
     const result = await chatLinksService.createChatLinkForJob(companyId, Number(req.params.id), callType);
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
 
+    // A staff member clicked. Attribute it, so the Logs detail sheet can answer
+    // "did someone send this by hand, and who?" — the dispatcher's own sends
+    // leave origin at its 'scheduler' default.
+    await chatLinksDb.setOrigin(result.token, { origin: "manual", userId: req.user?.userId ?? null })
+      .catch((err) => logger.warn("chat link: failed to record manual origin", { error: err.message }));
     return res.status(201).json({ token: result.token });
   } catch (err) {
     logger.error("POST /chat-links/jobs/:id failed", { error: err.message });
@@ -64,6 +77,19 @@ router.post("/appointments/:id/send-email", authenticate, async (req, res) => {
     const result = await chatLinksService.sendConfirmationEmailForAppointment(companyId, Number(req.params.id), callType, overrideEmail);
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
 
+    if (result.token) {
+      await chatLinksDb.setOrigin(result.token, { origin: "manual", userId: req.user?.userId ?? null })
+        .catch((err) => logger.warn("chat link: failed to record manual origin", { error: err.message }));
+      // Who the conversation is now with. A manual send goes to the address on
+      // file (or a typed override) — we never learn a person's NAME here, so it
+      // is cleared rather than left pointing at whoever a previous send used.
+      await chatLinksDb.setRecipient(result.token, { name: null, email: result.email ?? null })
+        .catch((err) => logger.warn("chat link: failed to snapshot recipient", { error: err.message }));
+      await sendEventsDb.recordSafe({
+        companyId, token: result.token, medium: "email", destination: result.email ?? null,
+        origin: "manual", triggeredByUserId: req.user?.userId ?? null, ok: result.sent !== false,
+      });
+    }
     return res.json(result);
   } catch (err) {
     logger.error("POST /chat-links/appointments/:id/send-email failed", { error: err.message });
@@ -81,6 +107,19 @@ router.post("/jobs/:id/send-email", authenticate, async (req, res) => {
     const result = await chatLinksService.sendConfirmationEmailForJob(companyId, Number(req.params.id), callType, overrideEmail);
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
 
+    if (result.token) {
+      await chatLinksDb.setOrigin(result.token, { origin: "manual", userId: req.user?.userId ?? null })
+        .catch((err) => logger.warn("chat link: failed to record manual origin", { error: err.message }));
+      // Who the conversation is now with. A manual send goes to the address on
+      // file (or a typed override) — we never learn a person's NAME here, so it
+      // is cleared rather than left pointing at whoever a previous send used.
+      await chatLinksDb.setRecipient(result.token, { name: null, email: result.email ?? null })
+        .catch((err) => logger.warn("chat link: failed to snapshot recipient", { error: err.message }));
+      await sendEventsDb.recordSafe({
+        companyId, token: result.token, medium: "email", destination: result.email ?? null,
+        origin: "manual", triggeredByUserId: req.user?.userId ?? null, ok: result.sent !== false,
+      });
+    }
     return res.json(result);
   } catch (err) {
     logger.error("POST /chat-links/jobs/:id/send-email failed", { error: err.message });
@@ -100,6 +139,16 @@ router.post("/appointments/:id/send-sms", authenticate, async (req, res) => {
     const result = await chatLinksService.sendConfirmationSmsForAppointment(companyId, Number(req.params.id), callType, overridePhone);
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
 
+    if (result.token) {
+      await chatLinksDb.setOrigin(result.token, { origin: "manual", userId: req.user?.userId ?? null })
+        .catch((err) => logger.warn("chat link: failed to record manual origin", { error: err.message }));
+      await chatLinksDb.setRecipient(result.token, { name: null, phone: result.phone ?? null })
+        .catch((err) => logger.warn("chat link: failed to snapshot recipient", { error: err.message }));
+      await sendEventsDb.recordSafe({
+        companyId, token: result.token, medium: "sms", destination: result.phone ?? null,
+        origin: "manual", triggeredByUserId: req.user?.userId ?? null, ok: result.sent !== false,
+      });
+    }
     return res.json(result);
   } catch (err) {
     logger.error("POST /chat-links/appointments/:id/send-sms failed", { error: err.message });
@@ -117,10 +166,109 @@ router.post("/jobs/:id/send-sms", authenticate, async (req, res) => {
     const result = await chatLinksService.sendConfirmationSmsForJob(companyId, Number(req.params.id), callType, overridePhone);
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
 
+    if (result.token) {
+      await chatLinksDb.setOrigin(result.token, { origin: "manual", userId: req.user?.userId ?? null })
+        .catch((err) => logger.warn("chat link: failed to record manual origin", { error: err.message }));
+      await chatLinksDb.setRecipient(result.token, { name: null, phone: result.phone ?? null })
+        .catch((err) => logger.warn("chat link: failed to snapshot recipient", { error: err.message }));
+      await sendEventsDb.recordSafe({
+        companyId, token: result.token, medium: "sms", destination: result.phone ?? null,
+        origin: "manual", triggeredByUserId: req.user?.userId ?? null, ok: result.sent !== false,
+      });
+    }
     return res.json(result);
   } catch (err) {
     logger.error("POST /chat-links/jobs/:id/send-sms failed", { error: err.message });
     return res.status(500).json({ error: "Failed to send confirmation sms" });
+  }
+});
+
+// GET /chat-links — STAFF monitoring view: every chat link for the company with
+// where it stands in its lifecycle (sent → in_progress → ended, or expired).
+// Deliberately separate from the conversation `state` that drives the widget:
+// `state` defaults to chat_started at creation, so it reports an unsent link as
+// an active chat and cannot answer "what is outstanding right now".
+router.get("/", authenticate, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const status = req.query.status ? String(req.query.status) : null;
+    if (status && !["sent", "in_progress", "ended", "expired"].includes(status)) {
+      return res.status(400).json({ error: "status must be one of sent, in_progress, ended, expired" });
+    }
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const search = req.query.search ? String(req.query.search) : null;
+    const [{ rows, total }, counts] = await Promise.all([
+      chatLinksDb.listForMonitoring(companyId, { status, limit, offset, search }),
+      chatLinksDb.statusCounts(companyId),
+    ]);
+    return res.json({ chat_links: rows, counts, pagination: { limit, offset, total } });
+  } catch (err) {
+    logger.error("GET /chat-links failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to list chat links" });
+  }
+});
+
+// GET /chat-links/:id/sends — every send of one link, oldest first.
+//
+// Keyed on the numeric id, never the token: the token IS the credential for that
+// customer's conversation and must not travel through a staff URL.
+// Numeric id validated in the handler, not in the path: this
+// path-to-regexp version rejects inline "(\\d+)" patterns outright and the
+// whole route file fails to load — taking the app with it.
+router.get("/:id/sends", authenticate, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "Invalid chat link id" });
+
+    const link = await chatLinksDb.getByIdForCompany(companyId, id);
+    if (!link) return res.status(404).json({ error: "Chat link not found" });
+
+    const events = await sendEventsDb.listForToken(companyId, link.token);
+    return res.json({ send_events: events });
+  } catch (err) {
+    logger.error("GET /chat-links/:id/sends failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to load send history" });
+  }
+});
+
+// GET /chat-links/:id/messages — the conversation itself, for the Logs detail
+// sheet. The call equivalent is GET /calls/:id's `transcript`; this is the chat
+// one, and like that endpoint it is fetched on demand rather than shipped with
+// every list row.
+//
+// Numeric id, never the token (see /sends above), and validated in the handler
+// because an inline pattern in the path breaks route loading here.
+router.get("/:id/messages", authenticate, async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "Invalid chat link id" });
+
+    const link = await chatLinksDb.getByIdForCompany(companyId, id);
+    if (!link) return res.status(404).json({ error: "Chat link not found" });
+
+    // Read-only: this must never start a conversation the customer has not.
+    const { messages, message_count } = await confirmationAgent.getConversation(companyId, link.token);
+    return res.json({
+      chat_link_id: link.id,
+      status: link.status,
+      state: link.state,
+      outcome_comment_posted_at: link.outcome_comment_posted_at ?? null,
+      message_count,
+      messages,
+    });
+  } catch (err) {
+    logger.error("GET /chat-links/:id/messages failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to load conversation" });
   }
 });
 

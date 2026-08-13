@@ -413,10 +413,14 @@ function describeChatOutcome(summaryLines) {
   return parts.length ? `the customer ${parts.join(", ")}.` : "see summary below.";
 }
 
-function buildChatCommentContent(summaryLines, threadId, messageCount, { llmSummary = null, whoConfirmed = null, plainSummary = null } = {}) {
+function buildChatCommentContent(summaryLines, threadId, messageCount, { llmSummary = null, whoConfirmed = null, plainSummary = null, expired = false } = {}) {
   // Counts, not ids. The outcome line is computed from the real tool calls, so
   // it cannot be wrong; stripping the "#110726" keeps it readable for the office.
-  const outcome = describeChatOutcome(summaryLines);
+  // `expired` marks an outcome recovered from a conversation the customer
+  // abandoned — the office should be able to tell that from a clean close, since
+  // nobody said goodbye and the link has since lapsed.
+  const outcome = describeChatOutcome(summaryLines)
+    + (expired ? " The chat then lapsed without a formal close." : "");
   // Fallbacks in order: the model's sentence, then the deterministic
   // services-and-dates rendering, then the raw tool lines as a last resort.
   const summary = llmSummary || plainSummary || summaryLines.map((l) => `- ${l}`).join("\n");
@@ -450,7 +454,7 @@ function buildChatCommentContent(summaryLines, threadId, messageCount, { llmSumm
  * @param {string[]} args.summaryLines human-readable lines, one per successful action
  * @param {number} args.messageCount   full message count at post time (see chatCommentMarker)
  */
-async function postConfirmationAgentComment({ companyId, jobId, threadId, summaryLines, messageCount, appointmentIds = [], recipientName = null }) {
+async function postConfirmationAgentComment({ companyId, jobId, threadId, summaryLines, messageCount, appointmentIds = [], recipientName = null, expired = false }) {
   if (!summaryLines || summaryLines.length === 0) {
     logger.info("servicetrade comment (chat): nothing reportable; skipping", { companyId, threadId, jobId });
     return;
@@ -499,7 +503,7 @@ async function postConfirmationAgentComment({ companyId, jobId, threadId, summar
     logger.warn("servicetrade comment (chat): summary step failed, using fallback", { companyId, threadId, error: err.message });
   }
 
-  const content = buildChatCommentContent(summaryLines, threadId, messageCount, { llmSummary, whoConfirmed, plainSummary });
+  const content = buildChatCommentContent(summaryLines, threadId, messageCount, { llmSummary, whoConfirmed, plainSummary, expired });
   const marker = chatCommentMarker(threadId, messageCount);
   const posts = targets.flatMap((t) => t.entityIds.map((entityId) => ({ entityKey: t.entityKey, entityType: t.entityType, entityId })));
 

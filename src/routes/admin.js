@@ -20,6 +20,7 @@ const crmRegistry = require("../services/crm");
 const enginesDb = require("../engines/core/db");
 const webhookProcessor = require("../services/servicetrade-webhook-processor");
 const webhooksDb = require("../db/servicetrade-webhooks");
+const chatLinksDb = require("../db/chat-links");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -200,6 +201,41 @@ router.all("/servicetrade-webhooks/drain", async (req, res) => {
     return res.json({ ok: true, ...result });
   } catch (err) {
     logger.error("Admin servicetrade-webhooks/drain failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/chat-links/backfill-outcome-comments — one-off catch-up.
+//
+// The sweep can only act on links at the moment they expire; anything that
+// expired before that code existed is already status='expired' and invisible to
+// it. Observed live: link 69 confirmed an appointment and its confirmation never
+// reached ServiceTrade.
+//
+// Optional ?companyId= to scope the first run, and ?limit= (default 200).
+// Posting is still gated per company by crm_comment_writeback_enabled.
+router.all("/chat-links/backfill-outcome-comments", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const companyId = req.query.companyId ? Number(req.query.companyId) : null;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
+    const links = await chatLinksDb.listExpiredAwaitingOutcomeComment({ companyId, limit });
+
+    const confirmationAgent = require("../confirmation-agent");
+    const results = { considered: links.length, posted: 0, no_outcome: 0, errors: 0, details: [] };
+    for (const link of links) {
+      const r = await confirmationAgent
+        .postExpiredOutcomeComment({ companyId: link.company_id, jobId: link.job_id, token: link.token })
+        .catch((err) => ({ posted: false, reason: "error", error: err.message }));
+      if (r.posted) results.posted += 1;
+      else if (r.reason === "error") results.errors += 1;
+      else results.no_outcome += 1;
+      results.details.push({ chat_link_id: link.id, company_id: link.company_id, ...r });
+    }
+    logger.info("Admin: chat-link outcome-comment backfill", { companyId, ...results, details: undefined });
+    return res.json({ ok: true, ...results });
+  } catch (err) {
+    logger.error("Admin chat-links/backfill-outcome-comments failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });

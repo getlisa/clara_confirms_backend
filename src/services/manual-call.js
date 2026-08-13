@@ -60,6 +60,9 @@ async function triggerManualCall({
   companyId, triggerType,
   appointmentId, jobId: rawJobId, quotationId, phoneNumber = null, email = null,
   immediate = true, force = false, scheduledAt = null, channel = null,
+  // Who clicked. Every row this service creates is by definition a manual
+  // trigger, so origin is stamped here rather than passed in.
+  triggeredByUserId = null,
 }) {
   // ── 1. Validate trigger_type and resolve the company's configured call_type ─
   if (!triggerType || !VALID_TRIGGER_TYPES.includes(triggerType)) {
@@ -265,6 +268,7 @@ async function triggerManualCall({
   let row;
   try {
     row = await scheduledCallsDb.create({
+      origin: "manual", triggeredByUserId,
       companyId,
       ...hydrated.params,
       scheduledAt:       fireAt,
@@ -333,6 +337,7 @@ async function triggerManualCall({
         if (!recipient.phone && !recipient.email) continue; // nothing to send to
         try {
           const extraRow = await scheduledCallsDb.create({
+            origin: "manual", triggeredByUserId,
             companyId,
             ...hydrated.params,
             phoneNumber: recipient.phone,

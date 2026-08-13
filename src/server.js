@@ -37,6 +37,7 @@ const serviceLinkMessagesRoutes = require("./routes/service-link-messages");
 const chatLinksRoutes = require("./routes/chat-links");
 const copilotRoutes = require("./routes/copilot");
 const servicetradeWebhooksRoutes = require("./routes/servicetrade-webhooks");
+const logsRoutes = require("./routes/logs");
 
 const app = express();
 
@@ -194,6 +195,9 @@ app.use("/chat-links", chatLinksRoutes);
 // AI Copilot — embedded assistant. JWT for control endpoints, signed
 // query-string token for the SSE turn stream.
 app.use("/copilot", copilotRoutes);
+
+// Unified activity log — calls + chat links as one paginated list.
+app.use("/logs", logsRoutes);
 
 // Inbound ServiceTrade webhooks — PUBLIC. ServiceTrade sends no signature of
 // any kind, so the unguessable secret in the path is the only authentication;

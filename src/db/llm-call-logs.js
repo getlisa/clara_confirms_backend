@@ -24,4 +24,24 @@ async function logCall({
   );
 }
 
-module.exports = { logCall };
+/**
+ * One row per LLM call for a thread, oldest first.
+ *
+ * Used to attach timestamps to a transcript: the LangGraph checkpointer holds
+ * the authoritative messages but stores no per-message time, while this table
+ * has `created_at` per turn. It is lossy on its own — tool RESULTS are not
+ * recorded and `ai_message` is NULL on pure-tool turns — so it supplements the
+ * checkpointer rather than replacing it.
+ */
+async function listTurns(companyId, threadId) {
+  const { rows } = await db.query(
+    `SELECT human_message, ai_message, created_at
+       FROM confirmation_agent_llm_logs
+      WHERE company_id = $1 AND thread_id = $2
+      ORDER BY id`,
+    [companyId, threadId]
+  );
+  return rows;
+}
+
+module.exports = { logCall, listTurns };

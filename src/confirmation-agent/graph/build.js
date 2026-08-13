@@ -105,12 +105,13 @@ async function buildGraph() {
 
   async function agentNode(state, config) {
     const ctx = config?.configurable?.ctx || {};
-    const tools = getToolsForPhase(state.phase);
+
     // True only before any AI message exists in this thread — matches
     // exactly when index.js's ensureOpened invokes with the synthetic
     // trigger message, so the opening-greeting instruction never resurfaces
     // mid-conversation.
     const isOpeningTurn = !state.messages.some((m) => (m._getType?.() || m.type) === "ai");
+    const tools = getToolsForPhase(state.phase, { isOpeningTurn });
     // state.jobCtx (buildJobConfirmationContext's raw result) has no `phase`
     // field of its own — phase is a separate Annotation this graph computes
     // alongside it (phaseFromContext) — so it must be merged in explicitly;

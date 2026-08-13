@@ -14,9 +14,9 @@ function quotationDedupeKeys(quotationId, linkedJobId) {
   return [...new Set(keys)];
 }
 
-async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest = false, maxAttempts = 3, callPriority, bypassOfficeHours, channel, linkDelivery, retryCount, recipientContactId, recipientName, recipientEmail }) {
+async function create({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest = false, maxAttempts = 3, callPriority, bypassOfficeHours, channel, linkDelivery, retryCount, recipientContactId, recipientName, recipientEmail, origin, triggeredByUserId }) {
   try {
-    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest, maxAttempts, callPriority, bypassOfficeHours, channel, linkDelivery, recipientContactId, recipientName, recipientEmail, ...(retryCount != null && { retryCount }) });
+    return await insertScheduledCall({ companyId, callType, phoneNumber, jobId, jobDate, appointmentId, customerName, technicianName, customerAddress, jobName, jobDescription, jobType, totalAmount, callContext, scheduledAt, isTest, maxAttempts, callPriority, bypassOfficeHours, channel, linkDelivery, recipientContactId, recipientName, recipientEmail, origin, triggeredByUserId, ...(retryCount != null && { retryCount }) });
   } catch (err) {
     if (err.code === "23505") {
       const dup = new Error("Duplicate active scheduled call");
@@ -38,6 +38,10 @@ async function insertScheduledCall({
   // until migration 081's confirmation-recipients feature). recipientName/
   // recipientEmail are a snapshot at enqueue time — see migration 081.
   recipientContactId = null, recipientName = null, recipientEmail = null,
+  // Who caused this row to exist. Defaults to the sweep, because that is what
+  // creates all but the hand-triggered ones; the manual route passes 'manual'
+  // plus the staff member's id.
+  origin = "scheduler", triggeredByUserId = null,
 }) {
   const result = await db.query(
     `INSERT INTO scheduled_calls
@@ -46,8 +50,13 @@ async function insertScheduledCall({
         job_name, job_description, job_type, total_amount, call_context,
         scheduled_at, is_test, max_attempts,
         call_priority, parent_call_id, retry_count, bypass_office_hours, channel, link_delivery,
-        recipient_contact_id, recipient_name, recipient_email)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+        recipient_contact_id, recipient_name, recipient_email,
+        origin, triggered_by_user_id, triggered_by_name)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
+             $27, $28,
+             CASE WHEN $28::int IS NULL THEN NULL
+                  ELSE (SELECT NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '')
+                          FROM users u WHERE u.id = $28::int) END)
      RETURNING *`,
     [companyId, callType, phoneNumber, jobId ?? null, jobDate ?? null, appointmentId ?? null,
      customerName ?? null, technicianName ?? null, customerAddress ?? null,
@@ -55,7 +64,8 @@ async function insertScheduledCall({
      callContext ? JSON.stringify(callContext) : null,
      scheduledAt, isTest, maxAttempts,
      callPriority, parentCallId ?? null, retryCount, !!bypassOfficeHours, channel || "voice", linkDelivery ?? null,
-     recipientContactId ?? null, recipientName ?? null, recipientEmail ?? null]
+     recipientContactId ?? null, recipientName ?? null, recipientEmail ?? null,
+     origin, triggeredByUserId ?? null]
   );
   return result.rows[0];
 }

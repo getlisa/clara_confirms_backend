@@ -122,7 +122,13 @@ function build(ctx, {
   companyPhone = null, representativeName = null,
 } = {}) {
   const rep = representativeName || "Clara";
-  const customerName = recipientName || ctx.job.customer?.name || "the customer";
+  // A PERSON's name, or nothing. Deliberately does NOT fall back to the customer
+  // record: on this platform that is an account, never a human (every customer
+  // row has first_name/last_name NULL and a full_name like "Holiday Inn
+  // Express-NE City"), and on 72 of 215 live jobs it is the *same string* as the
+  // location — so the old fallback had this prompt saying both '"X" is a
+  // LOCATION NAME, never address it as a person' and 'You are texting X.'
+  const customerName = recipientName || null;
   const jobName = ctx.job.title || "job";
   // The SITE. Prefer the real location name; a customer record is a billing
   // entity and often reads as nothing a person would call a place.
@@ -159,7 +165,9 @@ function build(ctx, {
     "CONTACT & JOB DATA",
     "════════════════════════════════════",
     "",
-    `You are texting ${customerName}.`,
+    customerName
+      ? `You are texting ${customerName}. That is the person we sent this link to — address them by that name.`
+      : `We do not have the NAME of the person on the other end: the link went to the account's own contact details${siteName ? `, not to a named contact at ${siteName}` : ""}. Open without a name ("Hi there") and never guess one. "${ctx.job.customer?.name || siteName || "The account"}" is an account/location, not a person — never use it as a name.`,
     "Contact on file:",
     `- Email: ${recipientEmail || "none on file"}`,
     `- Phone: ${recipientPhone || "none on file"}`,
@@ -297,6 +305,18 @@ function build(ctx, {
         next
           ? `This is the first message — open by naming who you are and what this is about, then go straight into the goal below. E.g. "Hi, this is ${rep} with ${companyName || "us"} — I'm reaching out about the ${next.service_summary || next.service_line || "upcoming"} visit at ${siteName || "your site"} on ${next.scheduled_start_spoken}."`
           : `This is the first message — open by naming who you are and what this is about. E.g. "Hi, this is ${rep} with ${companyName || "us"} — I'm reaching out about the ${jobName}."`,
+        ""
+      );
+    }
+
+    if (!isOpeningTurn) {
+      // Belt to the tool-gate's braces. ANY tool call made in the opening
+      // message routes the graph back through the agent node a second time,
+      // and the model — having produced text it never saw a reply to — greets
+      // again. Observed live: a greeting plus report_customer_intent produced
+      // two openings inside one turn.
+      push(
+        "YOU HAVE ALREADY INTRODUCED YOURSELF in this conversation. Never send another opening or greeting message — no \"Hi [name]\", no re-stating who you are or why you are reaching out. Continue from where the conversation left off.",
         ""
       );
     }
