@@ -11,6 +11,8 @@ const { resolveConfirmationRecipients } = require("./confirmation-recipients");
 const { toLocalDateOnly } = require("../utils/timezone");
 const retell = require("./retell");
 const chatLinksService = require("./chat-links");
+const chatLinksDb = require("../db/chat-links");
+const sendEventsDb = require("../db/chat-link-send-events");
 const chatLinkEmail = require("./chat-link-email");
 const chatLinkSms = require("./chat-link-sms");
 const logger = require("../utils/logger");
@@ -61,6 +63,35 @@ const { toLocalHHMM, toLocalDayOfWeek, isWithinActiveHours, getNextWindowStart,
  *                                         when false (manual UI), fire regardless.
  */
 async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag = true } = {}) {
+  // Lapse chat links whose 24h window closed without an outcome. Runs on the
+  // frequent tick rather than the daily job on purpose: with a 24h TTL, a link
+  // expiring at 10am would otherwise sit reported as live until the next
+  // morning's run. One UPDATE against a partial index, so it costs nothing when
+  // there is nothing to expire.
+  try {
+    const expired = await chatLinksDb.expireStale();
+    if (expired.length > 0) {
+      logger.info("Dispatcher: chat links expired", { expired: expired.length });
+      // A conversation can reach an outcome and then be abandoned — the customer
+      // confirms, closes the tab, end_conversation never fires. This is the last
+      // moment those links are identifiable, so the CRM comment is written now.
+      // Each is independent: one failure must not stop the others or the sweep.
+      const confirmationAgent = require("../confirmation-agent");
+      for (const link of expired) {
+        const result = await confirmationAgent
+          .postExpiredOutcomeComment({ companyId: link.company_id, jobId: link.job_id, token: link.token })
+          .catch((err) => ({ posted: false, reason: "error", error: err.message }));
+        if (result.posted) {
+          logger.info("Dispatcher: posted CRM comment for an expired chat that had an outcome", {
+            companyId: link.company_id, chatLinkId: link.id, outcomes: result.outcomes,
+          });
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn("Dispatcher: chat-link expiry sweep failed", { error: err.message });
+  }
+
   const scopeFilter = companyId ? "AND sc.company_id = $1" : "";
   const autoFilter  = respectAutoFlag
     ? `AND EXISTS (
@@ -379,6 +410,18 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         // confirmation contact (a property manager, etc.), not the customer.
         const greetingName = row.recipient_name || row.customer_name;
 
+        // Tell the CONVERSATION who it is talking to, not just the email/SMS.
+        // Deliberately narrower than greetingName: only a contacts row is a
+        // person. row.customer_name is an account ("JACK LTR", "123 California
+        // Ave") and the agent must not greet it as a human — so the name goes in
+        // only when this row is for a real contact.
+        await chatLinksDb.setRecipient(linkResult.token, {
+          name: row.recipient_contact_id != null ? row.recipient_name || null : null,
+          email: customerEmail,
+          phone: customerPhone,
+        }).catch((err) =>
+          logger.warn("Dispatcher: failed to snapshot chat link recipient", { ...ctx, error: err.message }));
+
         if (wantEmail && customerEmail) {
           try {
             await chatLinkEmail.sendConfirmationLinkEmail({
@@ -392,6 +435,13 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
           } catch (err) {
             emailError = err;
           }
+          // Logged whether it went or not: a failed leg is exactly the evidence
+          // wanted when a customer says nothing arrived.
+          await sendEventsDb.recordSafe({
+            companyId: row.company_id, token: linkResult.token, medium: "email",
+            destination: customerEmail, origin: "scheduler", scheduledCallId: row.id,
+            ok: emailSent, error: emailError?.message ?? null,
+          });
         } else if (wantEmail) {
           logger.warn("Dispatcher: chat_link_delivery_method wants email but customer has none — sending sms only", { ...ctx });
         }
@@ -409,6 +459,11 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
           } catch (err) {
             smsError = err;
           }
+          await sendEventsDb.recordSafe({
+            companyId: row.company_id, token: linkResult.token, medium: "sms",
+            destination: customerPhone, origin: "scheduler", scheduledCallId: row.id,
+            ok: smsSent, error: smsError?.message ?? null,
+          });
         } else if (wantSms) {
           logger.warn("Dispatcher: chat_link_delivery_method wants sms but customer has no phone — sending email only", { ...ctx });
         }
@@ -431,6 +486,15 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         }
 
         await scheduledCallsDb.markCompletedWithChatLink(row.id, linkResult.token);
+        // sent_at is stamped HERE, not at link creation, so "sent" means a leg
+        // actually went out rather than "a token exists". A staff member
+        // copying a link by hand therefore leaves sent_at null.
+        await chatLinksDb.markSent(linkResult.token).catch((err) =>
+          logger.warn("Dispatcher: failed to stamp chat link sent_at", { ...ctx, error: err.message }));
+        // Stamped explicitly rather than left to the column default: a link a
+        // staff member copied by hand earlier would otherwise still read
+        // 'manual' after the scheduler sent it.
+        await chatLinksDb.setOrigin(linkResult.token, { origin: "scheduler", userId: null }).catch(() => {});
         logger.info("Dispatcher: fired (web_chat)", { ...ctx, deliveryMethod, token: linkResult.token, emailSent, smsSent });
         fired++;
         continue;
@@ -454,6 +518,14 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
           jobName: row.job_name,
           token: linkResult.token,
         });
+
+        // Same snapshot as the web_chat branch — a person's name only.
+        await chatLinksDb.setRecipient(linkResult.token, {
+          name: row.recipient_contact_id != null ? row.recipient_name || null : null,
+          email: row.recipient_email || null,
+          phone: row.phone_number || null,
+        }).catch((err) =>
+          logger.warn("Dispatcher: failed to snapshot chat link recipient", { ...ctx, error: err.message }));
 
         await scheduledCallsDb.markCompletedWithChatLink(row.id, linkResult.token);
         logger.info("Dispatcher: fired (sms-link)", { ...ctx, channel: row.channel, token: linkResult.token });

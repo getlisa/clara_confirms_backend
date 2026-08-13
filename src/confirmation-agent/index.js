@@ -18,6 +18,8 @@ const db = require("../db");
 const chatLinksDb = require("../db/chat-links");
 const { postConfirmationAgentComment } = require("../services/servicetrade-comments");
 const { resolveContact } = require("./tools/confirmer-label");
+const sendEventsDb = require("../db/chat-link-send-events");
+const llmLogsDb = require("../db/llm-call-logs");
 const logger = require("../utils/logger");
 
 // Tool calls whose outcome is worth recording on the ServiceTrade job when
@@ -56,16 +58,50 @@ async function resolveJobRefs(companyId, jobId) {
  * greeting (address them by their own name) and the service-link step
  * (present known email/phone instead of asking blind).
  */
-async function resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone) {
-  if (recipientContactId) {
+async function resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone, snapshot = null, token = null) {
+  // Resolved as three independent fields rather than three whole-object
+  // branches: a link sent after migration 095 always has an address snapshotted
+  // but usually no NAME, so returning early on "the snapshot has something"
+  // would skip the very lookups that can supply the name.
+  let name = snapshot?.name ?? null;
+  let email = snapshot?.email ?? null;
+  let phone = snapshot?.phone ?? null;
+
+  // 1. The nominated contact, when the link was addressed to one.
+  if (!name && recipientContactId) {
     const contact = await resolveContact(companyId, recipientContactId);
-    return {
-      recipientName: contact?.name ?? null,
-      recipientEmail: contact?.email ?? null,
-      recipientPhone: contact?.phone ?? null,
-    };
+    name = contact?.name ?? null;
+    email = email ?? contact?.email ?? null;
+    phone = phone ?? contact?.phone ?? null;
   }
-  return { recipientName: null, recipientEmail: customerEmail, recipientPhone: customerPhone };
+
+  // 2. Fallback: work backwards from the delivery itself — token → the address
+  //    the email/SMS actually went to → the contact who owns that address. This
+  //    is what covers the ordinary case, where nobody was NOMINATED but the link
+  //    still went to a real person's inbox or phone. On live data it names 8 of
+  //    10 links that would otherwise have had no name at all.
+  if (!name && token) {
+    const sent = await sendEventsDb.resolveRecipientForToken(companyId, token)
+      .catch((err) => {
+        logger.warn("ConfirmationAgent: recipient lookup from send events failed", { error: err.message, token });
+        return null;
+      });
+    if (sent) {
+      name = sent.name ?? null;
+      email = email ?? sent.email ?? null;
+      phone = phone ?? sent.phone ?? null;
+    }
+  }
+
+  // A null name is left null. The customer record is an account, not a person —
+  // every customer on the platform has first_name/last_name NULL and a full_name
+  // like "Holiday Inn Express-NE City" — so there is no human name to fall back
+  // to here, only an organisation the agent must not greet.
+  return {
+    recipientName: name,
+    recipientEmail: email ?? customerEmail ?? null,
+    recipientPhone: phone ?? customerPhone ?? null,
+  };
 }
 
 function extractText(m) {
@@ -215,7 +251,20 @@ function describeAction(name, args, result) {
  * (result.success !== true) are skipped, same as an "unclear outcome" is
  * skipped in the voice/SMS call flow.
  */
-function summarizeOutcome(messages) {
+/**
+ * Tools whose outcome is worth a CRM comment when a chat EXPIRES rather than
+ * closing properly.
+ *
+ * Narrower than ACTIONABLE_TOOLS on purpose: `create_appointment` is excluded by
+ * product decision, so a chat that booked a visit and then lapsed posts nothing.
+ * This divergence is deliberate — do not "fix" it by reusing ACTIONABLE_TOOLS.
+ */
+const EXPIRY_OUTCOME_TOOLS = new Set([
+  "confirm_appointment", "confirm_job_appointments",
+  "reschedule_appointment", "cancel_appointment",
+]);
+
+function summarizeOutcome(messages, { tools = ACTIONABLE_TOOLS } = {}) {
   const resultByCallId = new Map();
   for (const m of messages) {
     const type = m?._getType?.() || m?.type;
@@ -228,7 +277,7 @@ function summarizeOutcome(messages) {
     const type = m?._getType?.() || m?.type;
     if (type !== "ai" || !Array.isArray(m.tool_calls)) continue;
     for (const tc of m.tool_calls) {
-      if (!ACTIONABLE_TOOLS.has(tc.name)) continue;
+      if (!tools.has(tc.name)) continue;
       const result = parseToolResult(resultByCallId.get(tc.id));
       if (!result?.success) continue;
       const line = describeAction(tc.name, tc.args, result);
@@ -271,6 +320,12 @@ async function runGraph(threadId, ctx, input, onEvent = null) {
     await chatLinksDb.setStateByToken(threadId, "chat_ended").catch((err) =>
       logger.warn("ConfirmationAgent: failed to set chat_ended state", { error: err.message, threadId })
     );
+    // The LIFECYCLE status, separate from the conversation state above. This is
+    // the moment an outcome exists, which is what "ended" means for monitoring —
+    // and it makes the row immune to the expiry sweep from here on.
+    await chatLinksDb.markEnded(threadId).catch((err) =>
+      logger.warn("ConfirmationAgent: failed to mark chat link ended", { error: err.message, threadId })
+    );
 
     const { lines: summaryLines, appointmentIds } = summarizeOutcome(after);
     await postConfirmationAgentComment({
@@ -291,9 +346,9 @@ async function runGraph(threadId, ctx, input, onEvent = null) {
  * getOrCreateSession, but there's no dead-session case to reopen: the
  * checkpointer keeps the thread alive indefinitely.
  */
-async function ensureOpened({ companyId, jobId, token, companyName, companyPhone = null, representativeName = null, recipientContactId = null, linkAppointmentId = null }) {
+async function ensureOpened({ companyId, jobId, token, companyName, companyPhone = null, representativeName = null, recipientContactId = null, linkAppointmentId = null, recipient = null }) {
   const { jobRef, customerRef, customerEmail, customerPhone } = await resolveJobRefs(companyId, jobId);
-  const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone);
+  const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone, recipient, token);
   const ctx = {
     companyId, jobId, threadId: token, jobRef, customerRef, companyName, companyPhone, representativeName, recipientContactId, linkAppointmentId,
     recipientName, recipientEmail, recipientPhone,
@@ -309,6 +364,61 @@ async function ensureOpened({ companyId, jobId, token, companyName, companyPhone
 }
 
 /**
+ * Read a conversation for STAFF, without touching it.
+ *
+ * `graph.getState` is a pure read — it starts no node, takes no lock and writes
+ * no checkpoint. Same precedent as copilot's getHistory and as ensureOpened's
+ * already-opened branch above.
+ *
+ * Deliberately NOT ensureOpened: that marks the link opened and, on a link the
+ * customer never opened, would generate the agent's opening turn — a staff
+ * member glancing at the Logs page would start the conversation.
+ *
+ * Messages come back in exactly the shape the customer's widget receives
+ * (toVisibleMessages), so one contract serves both.
+ *
+ * Timestamps are best-effort. The checkpointer stores no per-message time, so
+ * they are borrowed from confirmation_agent_llm_logs by walking that table's
+ * turns in order and matching text; anything unmatched — notably service-link
+ * cards, which are tool results the log never stores — keeps created_at null.
+ */
+async function getConversation(companyId, token) {
+  const graph = await getGraph();
+  const snapshot = await graph.getState({ configurable: { thread_id: token } });
+  const raw = snapshot.values?.messages || [];
+  const messages = toVisibleMessages(raw);
+
+  let turns = [];
+  try {
+    turns = await llmLogsDb.listTurns(companyId, token);
+  } catch (err) {
+    logger.warn("ConfirmationAgent: could not load turn timestamps", { error: err.message, threadId: token });
+  }
+
+  // Flatten the log into the same order the visible messages are in: each row
+  // contributes its human message then its AI message, both stamped with that
+  // row's time.
+  const stamped = [];
+  for (const t of turns) {
+    if (t.human_message && t.human_message !== TRIGGER_MESSAGE) {
+      stamped.push({ role: "user", content: t.human_message, at: t.created_at });
+    }
+    if (t.ai_message) stamped.push({ role: "agent", content: t.ai_message, at: t.created_at });
+  }
+
+  let cursor = 0;
+  for (const m of messages) {
+    if (m.type === "service_link") continue;   // never in the log
+    const hit = stamped.findIndex((s, i) => i >= cursor && s.role === m.role && s.content === m.content);
+    if (hit === -1) continue;
+    m.created_at = stamped[hit].at;
+    cursor = hit + 1;
+  }
+
+  return { messages, message_count: raw.length };
+}
+
+/**
  * Run one customer turn.
  *
  * @param {function|null} [onEvent] — called with `{type:"delta",chunk}` /
@@ -316,9 +426,9 @@ async function ensureOpened({ companyId, jobId, token, companyName, companyPhone
  *   await-the-whole-turn call; the returned `messages` are the same either
  *   way, so a caller that streams must NOT also render the return value.
  */
-async function sendMessage({ companyId, jobId, token, companyName, companyPhone = null, representativeName = null, content, recipientContactId = null, linkAppointmentId = null }, onEvent = null) {
+async function sendMessage({ companyId, jobId, token, companyName, companyPhone = null, representativeName = null, content, recipientContactId = null, linkAppointmentId = null, recipient = null }, onEvent = null) {
   const { jobRef, customerRef, customerEmail, customerPhone } = await resolveJobRefs(companyId, jobId);
-  const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone);
+  const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone, recipient, token);
   const ctx = {
     companyId, jobId, threadId: token, jobRef, customerRef, companyName, companyPhone, representativeName, recipientContactId, linkAppointmentId,
     recipientName, recipientEmail, recipientPhone,
@@ -327,4 +437,51 @@ async function sendMessage({ companyId, jobId, token, companyName, companyPhone 
   return { messages };
 }
 
-module.exports = { ensureOpened, sendMessage };
+/**
+ * Post the CRM comment for a chat that reached an outcome and then EXPIRED.
+ *
+ * The normal path posts from end_conversation. A customer who confirms and then
+ * abandons the chat never triggers that, so the outcome existed only in our
+ * database — observed live on link 69, whose confirmed appointment never reached
+ * ServiceTrade.
+ *
+ * Reads the checkpointer rather than querying columns, because the durable
+ * per-thread stamps are inconsistent: confirm writes confirmed_by_thread_id,
+ * cancel writes cancelled_by_agent_thread_id, and reschedule writes NOTHING
+ * identifying the thread. summarizeOutcome covers all of them uniformly and
+ * applies the same result.success check the normal path does.
+ *
+ * Best-effort and idempotent; never throws into the sweep.
+ */
+async function postExpiredOutcomeComment({ companyId, jobId, token }) {
+  try {
+    const graph = await getGraph();
+    const snapshot = await graph.getState({ configurable: { thread_id: token } });
+    const messages = snapshot.values?.messages || [];
+    if (!messages.length) return { posted: false, reason: "no_conversation" };
+
+    const { lines: summaryLines, appointmentIds } = summarizeOutcome(messages, { tools: EXPIRY_OUTCOME_TOOLS });
+    if (!summaryLines.length) return { posted: false, reason: "no_outcome" };
+
+    await postConfirmationAgentComment({
+      companyId, jobId, threadId: token,
+      summaryLines, appointmentIds, messageCount: messages.length,
+      // Marks the comment as coming from a lapsed conversation, so the office can
+      // tell it from a chat that closed properly.
+      expired: true,
+    });
+    await chatLinksDb.markOutcomeCommentPosted(token);
+    return { posted: true, outcomes: summaryLines.length };
+  } catch (err) {
+    logger.warn("ConfirmationAgent: expired-outcome comment failed", { error: err.message, threadId: token });
+    return { posted: false, reason: "error", error: err.message };
+  }
+}
+
+module.exports = {
+  ensureOpened, sendMessage, getConversation, postExpiredOutcomeComment, EXPIRY_OUTCOME_TOOLS,
+  // Exported for tests: the rule "a name only ever comes from a real contact"
+  // is the whole point of the recipient snapshot, and it is worth pinning
+  // directly rather than through a full graph run.
+  resolveRecipient,
+};

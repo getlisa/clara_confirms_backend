@@ -79,9 +79,18 @@ test("addresses the CONTACT by their own name when there is one", () => {
     "greeting a property manager by the site's name reads as a mistake");
 });
 
-test("falls back to a neutral noun when nobody is named", () => {
+test("says outright that we do not know the name, rather than naming the account", () => {
+  // Changed deliberately (migration 095). This used to read "You are texting the
+  // customer." with customerName falling back to the customer record — but on
+  // this platform that record is an ACCOUNT, never a person: every customer row
+  // has first_name/last_name NULL and a full_name like "Holiday Inn Express-NE
+  // City", and on 72 of 215 live jobs it is the same string as the location. A
+  // neutral noun was harmless; the account name was not, so the fallback is gone
+  // entirely and the model is told the name is unknown.
   const out = prompt.build(ctx({ customerName: null, upcoming: [] }), { companyName: "Clara Fire" });
-  assert.match(out, /You are texting the customer\./);
+  assert.match(out, /do not have the NAME of the person on the other end/);
+  assert.match(out, /never guess one/);
+  assert.doesNotMatch(out, /You are texting/, "there is nobody to name");
   assert.ok(!out.includes("null"));
 });
 
@@ -338,4 +347,49 @@ test("the anti-hallucination rule survives every branch", () => {
     assert.ok(out.includes("Never invent an appointment, date, technician, service, or count"));
     assert.ok(out.includes("end_conversation"), "every branch still needs a defined way to end");
   }
+});
+
+// ── Duplicate opening message ────────────────────────────────────────────────
+//
+// Observed live on thread ff7e8e44…: the agent emitted its greeting AND called
+// report_customer_intent in the same message. A tool call routes the graph
+// agent → tools → recompute_context → agent, so the agent ran a second time and
+// greeted all over again — two openings inside one turn, one trigger message,
+// nothing in the logs suggesting ensureOpened had run twice.
+//
+// Two layers guard it: the tool is withheld on the opening turn (structural),
+// and the prompt forbids re-greeting once the agent has spoken (belt and braces).
+
+const { getToolsForPhase } = require("../src/confirmation-agent/tools/registry");
+
+test("the opening turn cannot call report_customer_intent — the customer has said nothing yet", () => {
+  const opening = getToolsForPhase("confirming", { isOpeningTurn: true }).map((t) => t.name);
+  assert.ok(!opening.includes("report_customer_intent"),
+    "a tool call in the opening message sends the graph back through the agent, which then re-greets");
+  assert.ok(!opening.includes("end_conversation"),
+    "there is nothing to end before the conversation has started");
+  assert.ok(opening.includes("confirm_appointment"), "the phase's real actions are still available");
+});
+
+test("every later turn gets both tools back", () => {
+  const later = getToolsForPhase("confirming", { isOpeningTurn: false }).map((t) => t.name);
+  assert.ok(later.includes("report_customer_intent"));
+  assert.ok(later.includes("end_conversation"));
+});
+
+test("defaulting the flag keeps the full tool set — no caller is silently narrowed", () => {
+  const bare = getToolsForPhase("confirming").map((t) => t.name);
+  assert.ok(bare.includes("report_customer_intent"));
+  assert.ok(bare.includes("end_conversation"));
+});
+
+test("once the agent has spoken, the prompt forbids a second greeting", () => {
+  const c = ctx({ upcoming: [appt(11, "Thursday")] });
+  const opening = prompt.build(c, { companyName: "Clara Fire", isOpeningTurn: true });
+  const later = prompt.build(c, { companyName: "Clara Fire", isOpeningTurn: false });
+
+  assert.doesNotMatch(opening, /ALREADY INTRODUCED YOURSELF/,
+    "the first message must still be a greeting");
+  assert.match(later, /ALREADY INTRODUCED YOURSELF/);
+  assert.match(later, /Never send another opening or greeting message/);
 });

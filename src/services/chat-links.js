@@ -305,6 +305,8 @@ async function resolveChatLink(token) {
   const { messages } = await confirmationAgent.ensureOpened({
     companyId: link.company_id, jobId: link.job_id, token, companyName: company.name, companyPhone: company.phone_number || null, representativeName: company.representative_name || null,
     recipientContactId: link.recipient_contact_id, linkAppointmentId: link.appointment_id,
+    // Who the link was actually SENT to, snapshotted at dispatch (migration 095).
+    recipient: { name: link.recipient_name, email: link.recipient_email, phone: link.recipient_phone },
   });
 
   // Re-fetch state — the opening turn's tool calls (report_customer_intent
@@ -319,6 +321,7 @@ async function resolveChatLink(token) {
     customer_name: hydrated.params.customerName || null,
     messages,
     state: fresh.state,
+    status: fresh.status,
     input_hint: computeInputHint(fresh.state, {
       jobDueDate: hydrated.params.jobDate,
       remainingUnconfirmed: hydrated.context?.counts.unconfirmed ?? 0,
@@ -348,6 +351,8 @@ async function sendChatMessage(token, content, onEvent = null) {
   const { messages } = await confirmationAgent.sendMessage({
     companyId: link.company_id, jobId: link.job_id, token, companyName: company.name, companyPhone: company.phone_number || null, representativeName: company.representative_name || null, content,
     recipientContactId: link.recipient_contact_id, linkAppointmentId: link.appointment_id,
+    // Who the link was actually SENT to, snapshotted at dispatch (migration 095).
+    recipient: { name: link.recipient_name, email: link.recipient_email, phone: link.recipient_phone },
   }, onEvent);
 
   const fresh = await chatLinksDb.getByToken(token);
@@ -355,6 +360,7 @@ async function sendChatMessage(token, content, onEvent = null) {
     ok: true,
     messages,
     state: fresh.state,
+    status: fresh.status,
     input_hint: computeInputHint(fresh.state, {
       jobDueDate: hydrated.params.jobDate,
       remainingUnconfirmed: hydrated.context?.counts.unconfirmed ?? 0,

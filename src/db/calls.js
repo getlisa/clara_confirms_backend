@@ -66,7 +66,31 @@ async function upsertAnalyzed({
   );
 }
 
-async function list(companyId, { limit = 50, offset = 0, status, appointmentConfirmed, isTest = false } = {}) {
+/**
+ * Free-text search across the four fields the Logs page advertises: recipient
+ * phone, email, location name, customer name.
+ *
+ * Phone is matched DIGITS-ONLY on both sides. Stored numbers are genuinely
+ * inconsistent — `+19402324304` and `(402) 620-5042` both exist in real data —
+ * so a plain ILIKE misses whichever format the user did not type.
+ *
+ * @returns {{clause: string, values: any[]}} clause already parameterised from `startIndex`
+ */
+function searchClause(search, startIndex, { phoneExpr, textExprs }) {
+  const digits = String(search).replace(/\D/g, "");
+  const like = `%${search}%`;
+  const values = [like];
+  let i = startIndex;
+  const parts = textExprs.map((e) => `${e} ILIKE $${i}`);
+  i += 1;
+  if (digits) {
+    values.push(`%${digits}%`);
+    parts.push(`regexp_replace(COALESCE(${phoneExpr}, ''), '\\D', '', 'g') LIKE $${i}`);
+  }
+  return { clause: `(${parts.join(" OR ")})`, values };
+}
+
+async function list(companyId, { limit = 50, offset = 0, status, appointmentConfirmed, isTest = false, search = null } = {}) {
   // Prefix every column with `c.` since we now JOIN customers + scheduled_calls
   const conditions = ["c.company_id = $1", "c.is_test = $2"];
   const values = [companyId, isTest];
@@ -74,6 +98,15 @@ async function list(companyId, { limit = 50, offset = 0, status, appointmentConf
 
   if (status) { conditions.push(`c.status = $${i++}`); values.push(status); }
   if (appointmentConfirmed) { conditions.push(`c.appointment_confirmed = $${i++}`); values.push(appointmentConfirmed); }
+  if (search && String(search).trim()) {
+    const { clause, values: sv } = searchClause(String(search).trim(), i, {
+      phoneExpr: "c.to_number",
+      textExprs: ["cu.full_name", "cu.email", "l.name"],
+    });
+    conditions.push(clause);
+    values.push(...sv);
+    i += sv.length;
+  }
 
   values.push(limit, offset);
   const result = await db.query(
@@ -86,12 +119,23 @@ async function list(companyId, { limit = 50, offset = 0, status, appointmentConf
             cu.full_name   AS customer_name,
             cu.email       AS customer_email,
             cu.address_line1, cu.city, cu.state, cu.zipcode,
-            sc.call_type, sc.job_id, sc.job_name, sc.appointment_id
+            sc.call_type, sc.job_id, sc.job_name, sc.appointment_id,
+            sc.origin, sc.triggered_by_user_id, sc.triggered_by_name,
+            l.name AS location_name
      FROM calls c
      LEFT JOIN customers cu
        ON cu.company_id = c.company_id AND cu.phone = c.to_number
      LEFT JOIN scheduled_calls sc
        ON sc.retell_call_id = c.retell_call_id
+     -- scheduled_calls.job_id is VARCHAR while jobs.id is INTEGER, and it can
+     -- hold non-numeric ids (the manual/test paths use string refs). Stripping
+     -- to digits and NULLIF-ing the empty result means the cast is only ever
+     -- applied to something castable — a bare sc.job_id::int throws on the
+     -- first TEST-SO-1 row it meets.
+     LEFT JOIN jobs j
+       ON j.company_id = c.company_id
+      AND j.id = NULLIF(regexp_replace(COALESCE(sc.job_id, ''), '[^0-9]', '', 'g'), '')::int
+     LEFT JOIN locations l ON l.id = j.location_id
      WHERE ${conditions.join(" AND ")}
      ORDER BY c.created_at DESC
      LIMIT $${i++} OFFSET $${i}`,
@@ -121,6 +165,12 @@ function rowToCall(row) {
     reschedule_requested:    row.reschedule_requested,
     cancellation_requested:  row.cancellation_requested,
     transcript:              row.transcript,
+    location_name:           row.location_name ?? null,
+    // Manual vs swept, and who clicked. A manually-dialled call and a
+    // scheduler-dialled one were indistinguishable in the logs before this.
+    origin:                  row.origin ?? null,
+    triggered_by_user_id:    row.triggered_by_user_id ?? null,
+    triggered_by_name:       row.triggered_by_name ?? null,
     created_at:              row.created_at,
     updated_at:              row.updated_at,
     // Joined customer details
@@ -158,4 +208,5 @@ async function getById(id, companyId) {
   return result.rows[0] ? rowToCall(result.rows[0]) : null;
 }
 
-module.exports = { upsertStub, upsertAnalyzed, list, getById };
+module.exports = {
+  searchClause, upsertStub, upsertAnalyzed, list, getById };
