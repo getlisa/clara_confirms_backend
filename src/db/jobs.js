@@ -150,7 +150,7 @@ async function listJobs(companyId, {
     }
   }
   if (search) {
-    conditions.push(`(j.title ILIKE $${i} OR c.full_name ILIKE $${i})`);
+    conditions.push(`(j.title ILIKE $${i} OR c.full_name ILIKE $${i} OR l.name ILIKE $${i})`);
     values.push(`%${search}%`);
     i++;
   }
@@ -171,6 +171,7 @@ async function listJobs(companyId, {
             c.state           AS customer_state,
             t.first_name || ' ' || t.last_name AS technician_name,
             t.phone           AS technician_phone,
+            l.name            AS location_name,
             a.id              AS active_appointment_id,
             a.scheduled_start AS active_appointment_start,
             a.scheduled_end   AS active_appointment_end,
@@ -179,6 +180,7 @@ async function listJobs(companyId, {
             a.technician_confirmed
      FROM jobs j
      JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN locations l ON l.id = j.location_id
      LEFT JOIN technicians t ON t.id = j.technician_id
      LEFT JOIN LATERAL (
        SELECT * FROM appointments ap
@@ -206,6 +208,8 @@ async function listJobs(companyId, {
       `SELECT COUNT(*)::int AS n
          FROM jobs j
          JOIN customers c ON c.id = j.customer_id
+         LEFT JOIN locations l ON l.id = j.location_id
+         LEFT JOIN technicians t ON t.id = j.technician_id
         WHERE ${where}`,
       values
     ),
@@ -216,6 +220,7 @@ async function listJobs(companyId, {
     customer_name:             row.customer_name ?? null,
     customer_phone:            row.customer_phone ?? null,
     customer_address:          [row.customer_address, row.customer_city, row.customer_state].filter(Boolean).join(", ") || null,
+    location_name:             row.location_name ?? null,
     technician_name:           row.technician_name ?? null,
     technician_phone:          row.technician_phone ?? null,
     active_appointment: row.active_appointment_id ? {
