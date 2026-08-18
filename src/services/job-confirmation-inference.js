@@ -18,6 +18,7 @@
 const OpenAI = require("openai");
 const db = require("../db");
 const { syncJobConfirmationStatus } = require("./job-confirmation-status");
+const confirmationEventsDb = require("../db/confirmation-events");
 const logger = require("../utils/logger");
 
 // gpt-4.1-mini: chosen for latency. Inference runs once per job with an
@@ -219,7 +220,11 @@ async function inferJobConfirmations(companyId) {
       );
 
       if (assessment.confirmed === "yes" && assessment.confidence >= AUTO_CONFIRM_MIN_CONFIDENCE) {
-        await db.query(
+        // RETURNING id: this UPDATE can touch several appointments on the same
+        // job at once, and the daily report needs one ledger row per
+        // appointment actually confirmed — same convention as the chat/voice
+        // batch-confirm tools (confirm_job_appointments).
+        const { rows: touched } = await db.query(
           `UPDATE appointments
               SET customer_confirmed = true, customer_confirmed_at = NOW(),
                   additional_information = COALESCE(additional_information, '{}'::jsonb)
@@ -227,11 +232,17 @@ async function inferJobConfirmations(companyId) {
                   updated_at = NOW()
             WHERE company_id = $1 AND job_id = $2
               AND status IN ('scheduled', 'confirmed', 'rescheduled') AND scheduled_start > NOW()
-              AND COALESCE(customer_confirmed, false) = false`,
+              AND COALESCE(customer_confirmed, false) = false
+            RETURNING id`,
           [companyId, jobId]
         );
         await syncJobConfirmationStatus(companyId, jobId);
-        logger.info("inferJobConfirmations: auto-confirmed job from ServiceTrade notes", { companyId, jobId, confidence: assessment.confidence });
+        await Promise.all(touched.map((a) => confirmationEventsDb.recordSafe({
+          companyId, eventType: "confirmed", channel: "crm_sync", callType: "customer_confirmation",
+          jobId, appointmentId: a.id, actorName: null, source: "servicetrade-sync",
+          details: { confidence: assessment.confidence, reasoning: assessment.reasoning },
+        })));
+        logger.info("inferJobConfirmations: auto-confirmed job from ServiceTrade notes", { companyId, jobId, confidence: assessment.confidence, appointmentsConfirmed: touched.length });
       }
 
       assessed++;

@@ -11,6 +11,7 @@ const chatLinksDb = require("../../../db/chat-links");
 const stAppointments = require("../../../services/servicetrade-appointments");
 const todosDb = require("../../../db/todos");
 const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
+const confirmationEventsDb = require("../../../db/confirmation-events");
 const logger = require("../../../utils/logger");
 
 const schema = z.object({
@@ -20,7 +21,7 @@ const schema = z.object({
 });
 
 async function run({ appointment_id, scope, reason }, config) {
-  const { companyId, threadId } = config?.configurable?.ctx || {};
+  const { companyId, threadId, recipientName } = config?.configurable?.ctx || {};
 
   const existing = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
   if (!existing) return JSON.stringify({ success: false, error: "Appointment not found" });
@@ -65,6 +66,15 @@ async function run({ appointment_id, scope, reason }, config) {
     .catch((err) => logger.warn("Failed to raise APPOINTMENT_CANCELLED todo", { error: err.message, companyId }));
 
   if (threadId) await chatLinksDb.setStateByToken(threadId, "canceled").catch(() => {});
+
+  // See confirm-appointment.js for why call_type is hardcoded.
+  await confirmationEventsDb.recordSafe({
+    companyId, eventType: "cancelled", channel: "chat", callType: "customer_confirmation",
+    jobId: existing.job_id, appointmentId: appointment.id,
+    actorName: recipientName || null, source: threadId,
+    details: { reason, scope },
+  });
+
   logger.info("ConfirmationAgent tool: cancel_appointment", { companyId, appointment_id, scope, reason });
   return JSON.stringify({ success: true, appointment_id: appointment.id, scope, job_status: job?.status ?? null });
 }

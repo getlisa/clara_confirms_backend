@@ -21,6 +21,7 @@ const enginesDb = require("../engines/core/db");
 const webhookProcessor = require("../services/servicetrade-webhook-processor");
 const webhooksDb = require("../db/servicetrade-webhooks");
 const chatLinksDb = require("../db/chat-links");
+const { runSweep: runDailyReportSweep } = require("../services/daily-report/send");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -253,6 +254,24 @@ router.all("/servicetrade-webhooks/gc", async (req, res) => {
     return res.json({ ok: true, deleted });
   } catch (err) {
     logger.error("Admin servicetrade-webhooks/gc failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/reports/daily-sweep — evaluate every enabled report recipient
+// across every company and send whoever is due right now. Wired to a
+// 15-minute Vercel cron; `resolveDue` (services/daily-report/schedule.js) is
+// what makes repeated/late runs safe — a recipient already sent for their
+// target business date is a no-op, and a run that was down when the moment
+// passed still catches up once it recovers.
+router.all("/reports/daily-sweep", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const result = await runDailyReportSweep();
+    if (result.sent > 0 || result.errors > 0) logger.info("Admin: daily report sweep", { ...result, details: undefined });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error("Admin reports/daily-sweep failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });

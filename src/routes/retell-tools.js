@@ -15,6 +15,7 @@ const serviceLinkMessagesDb = require("../db/service-link-messages");
 const stAppointments = require("../services/servicetrade-appointments");
 const todosDb = require("../db/todos");
 const chatLinksDb = require("../db/chat-links");
+const confirmationEventsDb = require("../db/confirmation-events");
 const { toE164 } = require("../utils/phone");
 const logger = require("../utils/logger");
 const { registerToolsForCompany } = require("../services/retell-tools");
@@ -215,6 +216,16 @@ router.post("/confirm_appointment", async (req, res) => {
     // The job only becomes 'confirmed' once every upcoming appointment is.
     const jobStatus = await syncJobConfirmationStatus(companyId, appointment.job_id);
 
+    // Ledger write for the daily report — mirrors the chat handlers exactly:
+    // at the moment the DB write succeeds, not from post-call analysis (that
+    // field is the model's own read of the transcript, the same intent-vs-
+    // outcome gap the ledger exists to avoid).
+    await confirmationEventsDb.recordSafe({
+      companyId, eventType: "confirmed", channel: "voice", callType: "customer_confirmation",
+      jobId: appointment.job_id, appointmentId: appointment.id,
+      actorName: await resolveVoiceActorName(companyId, conversationId), source: conversationId,
+    });
+
     // Tell the agent what's LEFT, so it knows whether to ask the
     // "confirm the others too?" question before wrapping up.
     const after = await buildJobConfirmationContext(companyId, appointment.job_id);
@@ -313,6 +324,15 @@ router.post("/confirm_job_appointments", async (req, res) => {
       await chatLinksDb.setState(conversationId, "confirmation_accepted").catch(() => {});
       const refs = await resolveConfirmationRefs(companyId, conversationId);
       if (refs) await maybeSendServiceLinkNow(companyId, conversationId, refs);
+
+      // One ledger row PER appointment — see the chat confirm_job_appointments
+      // handler for why a batch confirm is N outcomes, not one.
+      const actorName = await resolveVoiceActorName(companyId, conversationId);
+      await Promise.all(targets.map((a) => confirmationEventsDb.recordSafe({
+        companyId, eventType: "confirmed", channel: "voice", callType: "customer_confirmation",
+        jobId: ctx.job.id, appointmentId: a.appointment_id,
+        actorName, source: conversationId,
+      })));
     }
 
     const after = await buildJobConfirmationContext(companyId, ctx.job.id);
@@ -353,6 +373,9 @@ router.post("/reschedule_appointment", async (req, res) => {
       ? localToUTC(scheduled_end, tz)
       : new Date(new Date(startUTC).getTime() + 2 * 60 * 60 * 1000).toISOString();
 
+    // Captured BEFORE the write — the ledger's "from" time.
+    const before = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
+
     const appointment = await jobsDb.updateAppointment(Number(appointment_id), companyId, {
       scheduled_start: startUTC,
       scheduled_end: endUTC,
@@ -375,6 +398,13 @@ router.post("/reschedule_appointment", async (req, res) => {
 
     // Now unconfirmed again, so a 'confirmed' job must fall back to 'scheduled'.
     await syncJobConfirmationStatus(companyId, appointment.job_id);
+
+    await confirmationEventsDb.recordSafe({
+      companyId, eventType: "rescheduled", channel: "voice", callType: "customer_confirmation",
+      jobId: appointment.job_id, appointmentId: appointment.id,
+      actorName: await resolveVoiceActorName(companyId, getConversationId(req)), source: getConversationId(req),
+      details: { from: before?.scheduled_start ?? null, to: startUTC },
+    });
 
     logger.info("Tool: reschedule_appointment", { companyId, appointment_id, scheduled_start, startUTC, tz });
     return res.json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
@@ -420,6 +450,13 @@ router.post("/create_appointment", async (req, res) => {
     await stAppointments
       .mirrorCreateAppointment(companyId, appointment, Number(job_id), { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: getConversationId(req) })
       .catch((err) => logger.error("crm-sync create_appointment mirror failed", { error: err.message, companyId }));
+
+    await confirmationEventsDb.recordSafe({
+      companyId, eventType: "created", channel: "voice", callType: "customer_confirmation",
+      jobId: Number(job_id), appointmentId: appointment.id,
+      actorName: await resolveVoiceActorName(companyId, getConversationId(req)), source: getConversationId(req),
+      details: { scheduled_start: startUTC },
+    });
 
     logger.info("Tool: create_appointment", { companyId, job_id, scheduled_start, startUTC, tz });
     return res.status(201).json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
@@ -537,6 +574,13 @@ router.post("/cancel_appointment", async (req, res) => {
 
     // Chat state tracking — harmless no-op for voice/SMS.
     await chatLinksDb.setState(retellCallId, "canceled").catch(() => {});
+
+    await confirmationEventsDb.recordSafe({
+      companyId, eventType: "cancelled", channel: "voice", callType: "customer_confirmation",
+      jobId: existing.job_id, appointmentId: appointment.id,
+      actorName: await resolveVoiceActorName(companyId, retellCallId), source: retellCallId,
+      details: { reason, scope },
+    });
 
     const tz = await getCompanyTimezone(companyId);
     logger.info("Tool: cancel_appointment", { companyId, appointment_id, scope, reason });
@@ -802,6 +846,20 @@ router.post("/schedule_callback", async (req, res) => {
 // ── Service Link: contact search + recipient recording ───────────────────────
 // Resolve the confirmation call's job → customer/location ServiceTrade ids so a
 // new contact can be linked correctly and the service link points at the job.
+/**
+ * Who to credit for a voice outcome, for the confirmation_events ledger —
+ * scheduled_calls' own recipient snapshot, same convention as the chat
+ * ledger writes (src/confirmation-agent/tools/handlers/*). Best-effort: a
+ * missing name just means the ledger row has no actor_name, never an error.
+ */
+async function resolveVoiceActorName(companyId, retellCallId) {
+  const { rows } = await db.query(
+    `SELECT recipient_name, customer_name FROM scheduled_calls WHERE retell_call_id = $1 AND company_id = $2 LIMIT 1`,
+    [retellCallId, companyId]
+  );
+  return rows[0]?.recipient_name || rows[0]?.customer_name || null;
+}
+
 async function resolveConfirmationRefs(companyId, retellCallId) {
   const { rows } = await db.query(
     `SELECT sc.id AS scheduled_call_id, sc.job_id,
