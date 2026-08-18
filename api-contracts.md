@@ -834,6 +834,29 @@ Full request/response payloads, field types, error copy, UI status rules and the
 delivery constraints they follow from live in **`servicetrade-webhooks-frontend.md`**
 — deliberately the single source of truth, so the two documents cannot drift.
 
+### Daily operations report — see `daily-report-frontend.md`
+
+Staff can nominate recipients (no platform login required) for a daily emailed
+`.xlsx` report of confirmation activity — customers reached, confirmed,
+reschedules, cancellations, what's still awaiting a response, and open action
+items. Each recipient sets their own delivery time; the report covers
+`customer_confirmation` outreach only.
+
+| | |
+|---|---|
+| `GET /reports/recipients` 🔒 | list recipients for the company |
+| `POST /reports/recipients` 🔒 | create — always starts `enabled: false` |
+| `PATCH /reports/recipients/:id` 🔒 | update, including turning it on |
+| `DELETE /reports/recipients/:id` 🔒 | remove |
+| `POST /reports/daily/preview` 🔒 | headline numbers for a date, no send |
+| `POST /reports/daily/send-now` 🔒 | **sends a real email** to one recipient, for testing |
+
+`send_at_local` must be on the hour or half-hour — the delivery sweep runs
+every 15 minutes. What a chosen time actually covers (today vs. yesterday)
+depends on the company's business-hours close; full worked examples and the
+exact UI copy to show live in **`daily-report-frontend.md`** — deliberately the
+single source of truth, so the two documents cannot drift.
+
 ---
 
 ## 9. Shared Types

@@ -10,6 +10,7 @@ const jobsDb = require("../../../db/jobs");
 const chatLinksDb = require("../../../db/chat-links");
 const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
 const { maybeSendServiceLinkNow } = require("../service-link-helpers");
+const confirmationEventsDb = require("../../../db/confirmation-events");
 const { resolveConfirmerLabel } = require("../confirmer-label");
 const logger = require("../../../utils/logger");
 
@@ -18,7 +19,7 @@ const schema = z.object({
 });
 
 async function run({ appointment_id }, config) {
-  const { companyId, threadId, recipientContactId, jobRef } = config?.configurable?.ctx || {};
+  const { companyId, threadId, recipientContactId, jobRef, recipientName } = config?.configurable?.ctx || {};
 
   // Don't blindly re-confirm — if this is already customer_confirmed=true
   // (confirmed earlier in this same conversation, or on a voice/SMS call
@@ -65,6 +66,19 @@ async function run({ appointment_id }, config) {
   // email BEFORE confirming got no link at all. sendRecordedServiceLink is
   // idempotent, so calling from both sides is safe.
   const linkSend = await maybeSendServiceLinkNow(companyId, threadId, jobRef, appointment.job_id);
+
+  // Ledger write, not the summary comment at end_conversation — that only
+  // fires if the chat is closed properly, and a customer who confirms then
+  // closes the tab must still show up in tomorrow's report.
+  // call_type is hardcoded: this graph only ever serves customer_confirmation
+  // chat links today (verified: 14/14 live rows) — ctx has no call_type field
+  // to thread through. If a technician-facing chat is ever added here, this
+  // needs to become a real value from the link instead.
+  await confirmationEventsDb.recordSafe({
+    companyId, eventType: "confirmed", channel: "chat", callType: "customer_confirmation",
+    jobId: appointment.job_id, appointmentId: appointment.id,
+    actorName: recipientName || null, source: threadId,
+  });
 
   logger.info("ConfirmationAgent tool: confirm_appointment", {
     companyId, appointment_id, jobStatus, serviceLink: linkSend?.reason || (linkSend?.sent ? "sent" : null),

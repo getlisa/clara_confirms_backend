@@ -106,12 +106,17 @@ function buildEmailTemplate({
 
 /**
  * Send a single email
- * @param {Object} opts - { to, subject, text, html }
+ * @param {Object} opts - { to, subject, text, html, attachments }
+ * @param {Array<{filename: string, content: Buffer, contentType: string}>} [opts.attachments]
+ *   Plain Buffer in, base64 out — SendGrid's API only accepts attachment
+ *   content as a base64 string, never a raw Buffer. Kept as the caller's
+ *   concern-free input shape so daily-report/send.js doesn't need to know
+ *   SendGrid's wire format, matching how `html`/`text` already hide it.
  * @returns {Promise<boolean>}
  */
-async function sendMail({ to, subject, text, html }) {
+async function sendMail({ to, subject, text, html, attachments = [] }) {
   if (!init()) {
-    logger.info("Email skipped (SendGrid not configured)", { to: to?.substring(0, 6) + "***", subject });
+    logger.info("Email skipped (SendGrid not configured)", { to: to?.substring(0, 6) + "***", subject, attachmentCount: attachments.length });
     return true;
   }
   const from = {
@@ -125,8 +130,16 @@ async function sendMail({ to, subject, text, html }) {
       subject,
       text: text || (html && html.replace(/<[^>]*>/g, "")) || "",
       html: html || undefined,
+      ...(attachments.length && {
+        attachments: attachments.map((a) => ({
+          filename: a.filename,
+          type: a.contentType,
+          content: Buffer.isBuffer(a.content) ? a.content.toString("base64") : a.content,
+          disposition: "attachment",
+        })),
+      }),
     });
-    logger.info("Email sent", { to: to?.substring(0, 6) + "***", subject });
+    logger.info("Email sent", { to: to?.substring(0, 6) + "***", subject, attachmentCount: attachments.length });
     return true;
   } catch (err) {
     logger.error("SendGrid error", { error: err.message, subject });

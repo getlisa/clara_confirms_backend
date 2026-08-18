@@ -9,6 +9,7 @@ const jobsDb = require("../../../db/jobs");
 const stAppointments = require("../../../services/servicetrade-appointments");
 const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
 const { getCompanyTimezone, localToUTC } = require("../../../utils/timezone");
+const confirmationEventsDb = require("../../../db/confirmation-events");
 const logger = require("../../../utils/logger");
 
 const schema = z.object({
@@ -17,7 +18,7 @@ const schema = z.object({
 });
 
 async function run({ scheduled_start, scheduled_end }, config) {
-  const { companyId, jobId, threadId } = config?.configurable?.ctx || {};
+  const { companyId, jobId, threadId, recipientName } = config?.configurable?.ctx || {};
   const tz = await getCompanyTimezone(companyId);
   const startUTC = localToUTC(scheduled_start, tz);
   const endUTC = scheduled_end
@@ -38,6 +39,14 @@ async function run({ scheduled_start, scheduled_end }, config) {
   await stAppointments
     .mirrorCreateAppointment(companyId, appointment, Number(jobId), { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: threadId })
     .catch((err) => logger.error("ConfirmationAgent create_appointment mirror failed", { error: err.message, companyId }));
+
+  // See confirm-appointment.js for why call_type is hardcoded.
+  await confirmationEventsDb.recordSafe({
+    companyId, eventType: "created", channel: "chat", callType: "customer_confirmation",
+    jobId: Number(jobId), appointmentId: appointment.id,
+    actorName: recipientName || null, source: threadId,
+    details: { scheduled_start: startUTC },
+  });
 
   logger.info("ConfirmationAgent tool: create_appointment", { companyId, jobId, startUTC });
   return JSON.stringify({ success: true, appointment_id: appointment.id, scheduled_start: startUTC, scheduled_end: endUTC });

@@ -6,6 +6,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const { resolveAllowedOrigins } = require("./utils/allowed-origins");
 const config = require("./config");
 const logger = require("./utils/logger");
 const db = require("./db");
@@ -35,6 +36,7 @@ const enginesRoutes = require("./routes/engines");
 const manualCallsRoutes = require("./routes/manual-calls");
 const serviceLinkMessagesRoutes = require("./routes/service-link-messages");
 const chatLinksRoutes = require("./routes/chat-links");
+const reportsRoutes = require("./routes/reports");
 const copilotRoutes = require("./routes/copilot");
 const servicetradeWebhooksRoutes = require("./routes/servicetrade-webhooks");
 const logsRoutes = require("./routes/logs");
@@ -46,26 +48,34 @@ const app = express();
 // ============================================================================
 
 // CORS — MUST be before body parsers so OPTIONS preflight gets headers (see collection_agent_backend)
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim())
-  : [
-      "http://localhost:8080",
-      "http://localhost:5173",
-      "http://127.0.0.1:8080",
-      "http://127.0.0.1:5173",
-      config.frontendUrl,
-    ].filter(Boolean);
+// `true` = reflect the caller's origin (what ALLOWED_ORIGINS=* means); otherwise
+// an explicit list. See utils/allowed-origins.js for why "*" cannot just be
+// passed through as a list entry.
+const allowedOrigins = resolveAllowedOrigins(process.env.ALLOWED_ORIGINS, [
+  "http://localhost:8080",
+  "http://localhost:5173",
+  "http://127.0.0.1:8080",
+  "http://127.0.0.1:5173",
+  "http://localhost:8083",
+  "http://127.0.0.1:8083",
+  config.frontendUrl,
+]);
+console.log("allowedOrigins:", allowedOrigins);
+
+const allowedHeaders = [
+  "Content-Type",
+  "Authorization",
+  "X-Requested-With",
+  "Accept",
+  "Access-Control-Allow-Origin"
+];
+console.log("allowedHeaders:", allowedHeaders);
 app.use(
   cors({
     origin: allowedOrigins,
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-Requested-With",
-      "Accept",
-    ],
+    allowedHeaders: allowedHeaders,
   })
 );
 
@@ -191,6 +201,7 @@ app.use("/service-link-messages", serviceLinkMessagesRoutes);
 
 // Shareable chat-widget links — generate (staff) + resolve (public, token-authed).
 app.use("/chat-links", chatLinksRoutes);
+app.use("/reports", reportsRoutes);
 
 // AI Copilot — embedded assistant. JWT for control endpoints, signed
 // query-string token for the SSE turn stream.

@@ -9,6 +9,7 @@ const jobsDb = require("../../../db/jobs");
 const stAppointments = require("../../../services/servicetrade-appointments");
 const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
 const { getCompanyTimezone, localToUTC } = require("../../../utils/timezone");
+const confirmationEventsDb = require("../../../db/confirmation-events");
 const logger = require("../../../utils/logger");
 
 const schema = z.object({
@@ -18,12 +19,16 @@ const schema = z.object({
 });
 
 async function run({ appointment_id, scheduled_start, scheduled_end }, config) {
-  const { companyId, threadId } = config?.configurable?.ctx || {};
+  const { companyId, threadId, recipientName } = config?.configurable?.ctx || {};
   const tz = await getCompanyTimezone(companyId);
   const startUTC = localToUTC(scheduled_start, tz);
   const endUTC = scheduled_end
     ? localToUTC(scheduled_end, tz)
     : new Date(new Date(startUTC).getTime() + 2 * 60 * 60 * 1000).toISOString();
+
+  // Captured BEFORE the update — the ledger's "from" time, since
+  // updateAppointment returns the row AFTER the write.
+  const before = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
 
   const appointment = await jobsDb.updateAppointment(Number(appointment_id), companyId, {
     scheduled_start: startUTC,
@@ -38,6 +43,15 @@ async function run({ appointment_id, scheduled_start, scheduled_end }, config) {
     .catch((err) => logger.error("ConfirmationAgent reschedule mirror failed", { error: err.message, companyId }));
 
   await syncJobConfirmationStatus(companyId, appointment.job_id);
+
+  // See confirm-appointment.js for why call_type is hardcoded.
+  await confirmationEventsDb.recordSafe({
+    companyId, eventType: "rescheduled", channel: "chat", callType: "customer_confirmation",
+    jobId: appointment.job_id, appointmentId: appointment.id,
+    actorName: recipientName || null, source: threadId,
+    details: { from: before?.scheduled_start ?? null, to: startUTC },
+  });
+
   logger.info("ConfirmationAgent tool: reschedule_appointment", { companyId, appointment_id, startUTC });
 
   return JSON.stringify({ success: true, appointment_id: appointment.id, scheduled_start: startUTC, scheduled_end: endUTC });

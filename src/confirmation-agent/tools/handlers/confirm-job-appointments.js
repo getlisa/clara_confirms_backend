@@ -13,6 +13,7 @@ const { buildJobConfirmationContext } = require("../../../services/job-confirmat
 const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
 const { maybeSendServiceLinkNow } = require("../service-link-helpers");
 const { resolveConfirmerLabel } = require("../confirmer-label");
+const confirmationEventsDb = require("../../../db/confirmation-events");
 const logger = require("../../../utils/logger");
 
 const schema = z.object({
@@ -21,7 +22,7 @@ const schema = z.object({
 });
 
 async function run({ confirm_all, appointment_ids }, config) {
-  const { companyId, jobId, threadId, recipientContactId, jobRef } = config?.configurable?.ctx || {};
+  const { companyId, jobId, threadId, recipientContactId, jobRef, recipientName } = config?.configurable?.ctx || {};
   const wantsAll = confirm_all === true;
   const requestedIds = wantsAll ? [] : (appointment_ids || []).map((v) => String(v).trim()).filter(Boolean);
   if (!wantsAll && requestedIds.length === 0) {
@@ -65,6 +66,16 @@ async function run({ confirm_all, appointment_ids }, config) {
   }
 
   if (targets.length && threadId) await chatLinksDb.setStateByToken(threadId, "confirmation_accepted").catch(() => {});
+
+  // One ledger row PER appointment — the daily report's Confirmed sheet is
+  // row-per-visit, and a batch confirm of 3 appointments is 3 separate outcomes,
+  // not one. See confirm-appointment.js for why call_type is hardcoded here.
+  await Promise.all(targets.map((a) => confirmationEventsDb.recordSafe({
+    companyId, eventType: "confirmed", channel: "chat", callType: "customer_confirmation",
+    jobId: ctx.job.id, appointmentId: a.appointment_id,
+    actorName: recipientName || null, source: threadId,
+  })));
+
   const jobStatus = targets.length ? await syncJobConfirmationStatus(companyId, ctx.job.id) : ctx.job.status;
 
   // Mirrors confirm_appointment and the voice path: confirming is one of the

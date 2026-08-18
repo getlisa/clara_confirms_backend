@@ -179,4 +179,41 @@ async function list(companyId, {
   return { rows, counts, total: counts.call + counts.chat };
 }
 
-module.exports = { list };
+/**
+ * Every log row (both sources) inside a UTC instant range — for the daily
+ * report, which needs a whole business day, not a page. Reuses the SAME
+ * callSelect/chatSelect the Logs page itself is built from, for one reason:
+ * the report's "who did we reach out to" must never be able to disagree with
+ * what staff see on the Logs page for the same company and day.
+ *
+ * This also closes a real gap a scheduled_calls-only query has: a MANUALLY
+ * triggered chat link (POST /chat-links/:id/send-email, /send-sms) creates NO
+ * scheduled_calls row at all (see db/chat-link-send-events.js) — so counting
+ * "outreach" from scheduled_calls silently drops every manual send. chatSelect
+ * sources from chat_links directly and has no such gap.
+ *
+ * `callType` filters BOTH halves to one call_type (e.g. 'customer_confirmation',
+ * to exclude technician calls) — call-side via the joined scheduled_calls row
+ * (a call_analyzed webhook has no call_type of its own), chat-side via
+ * chat_links.call_type directly.
+ */
+async function listForRange(companyId, { from, to, callType = null } = {}) {
+  const params = [companyId, from, to];
+  const callWhere = ["c.company_id = $1", "c.is_test = false", "c.created_at >= $2", "c.created_at < $3"];
+  const chatWhere = ["cl.company_id = $1", "cl.created_at >= $2", "cl.created_at < $3"];
+  if (callType) {
+    params.push(callType);
+    // Same placeholder referenced from both halves of the UNION — this is one
+    // combined query text executed once, so a parameter can appear in both.
+    callWhere.push(`sc.call_type = $${params.length}`);
+    chatWhere.push(`cl.call_type = $${params.length}`);
+  }
+  const union = [callSelect(callWhere.join(" AND ")), chatSelect(chatWhere.join(" AND "))].join("\n    UNION ALL\n");
+  const { rows } = await db.query(
+    `WITH merged AS (${union}) SELECT * FROM merged ORDER BY timestamp`,
+    params
+  );
+  return rows;
+}
+
+module.exports = { list, listForRange };

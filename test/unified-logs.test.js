@@ -324,3 +324,63 @@ test("a scheduler-created call defaults to scheduler with nobody attributed", as
   assert.equal(q.params[26], "scheduler");
   assert.equal(q.params[27], null, "inventing a user for a swept call would be a false audit trail");
 });
+
+// ── listForRange — the daily report's read, not a page ─────────────────────
+
+test("listForRange scopes both halves to the SAME window and company, real rows only", async () => {
+  reset();
+  await logsDb.listForRange(8, { from: "2026-08-13T00:00:00Z", to: "2026-08-14T00:00:00Z" });
+  const call = find("FROM calls c");
+  const chat = find("FROM chat_links cl");
+  assert.match(call.sql, /c\.company_id = \$1 AND c\.is_test = false AND c\.created_at >= \$2 AND c\.created_at < \$3/);
+  assert.match(chat.sql, /cl\.company_id = \$1 AND cl\.created_at >= \$2 AND cl\.created_at < \$3/);
+  assert.deepEqual(call.params, [8, "2026-08-13T00:00:00Z", "2026-08-14T00:00:00Z"]);
+});
+
+test("listForRange with a call_type filters BOTH halves using the SAME bound parameter", async () => {
+  reset();
+  await logsDb.listForRange(8, { from: "a", to: "b", callType: "customer_confirmation" });
+  const call = find("FROM calls c");
+  const chat = find("FROM chat_links cl");
+  assert.match(call.sql, /sc\.call_type = \$4/);
+  assert.match(chat.sql, /cl\.call_type = \$4/);
+  assert.deepEqual(call.params, [8, "a", "b", "customer_confirmation"]);
+});
+
+test("listForRange with no call_type adds no call_type FILTER to either half", async () => {
+  // callSelect always SELECTS call_type into its jsonb blob regardless of any
+  // filter — the thing that must be absent is a WHERE condition on it.
+  reset();
+  await logsDb.listForRange(8, { from: "a", to: "b" });
+  assert.ok(!/sc\.call_type\s*=\s*\$/.test(find("FROM calls c").sql));
+  assert.ok(!/cl\.call_type\s*=\s*\$/.test(find("FROM chat_links cl").sql));
+});
+
+test("listForRange has no OUTER LIMIT/OFFSET — it reads the whole window, not a page", async () => {
+  // chatSelect's own one-dispatch-per-link lateral pick legitimately contains
+  // "LIMIT 1" — what must be absent is pagination on the OUTER merged select.
+  reset();
+  await logsDb.listForRange(8, { from: "a", to: "b" });
+  const merged = queries.find((q) => q.sql.includes("WITH merged AS"));
+  const outer = merged.sql.slice(merged.sql.indexOf("SELECT * FROM merged"));
+  assert.ok(!/LIMIT|OFFSET/.test(outer));
+});
+
+test("listForRange orders by timestamp — oldest first, matching the business-day narrative", async () => {
+  reset();
+  await logsDb.listForRange(8, { from: "a", to: "b" });
+  const merged = queries.find((q) => q.sql.includes("WITH merged AS"));
+  assert.match(merged.sql, /ORDER BY timestamp\s*$/);
+});
+
+test("listForRange reuses the SAME callSelect/chatSelect the Logs page itself renders", async () => {
+  // Not a re-derivation: the recipient-name fallback chain, the lateral
+  // one-dispatch-per-link pick, the cast-safe job join — every trap already
+  // fixed in list() must not need fixing twice.
+  reset();
+  await logsDb.listForRange(8, { from: "a", to: "b" });
+  const chat = find("FROM chat_links cl");
+  assert.match(chat.sql, /LEFT JOIN LATERAL \(/, "one dispatch per link — the fan-out fix");
+  assert.match(chat.sql, /recipientNameFromSendsSQL|SELECT medium, destination/i.test(chat.sql) ? /./ : /COALESCE\(\s*cl\.recipient_name/,
+    "the same recipient-name fallback chain as GET /logs");
+});
