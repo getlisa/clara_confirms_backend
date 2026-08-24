@@ -15,6 +15,11 @@
  *   fetched      {entity, count}   raw-table stage finished
  *   entity_done  {entity, count}   normalize stage finished
  *
+ * By default the sync scopes its job fetch to the current calendar month.
+ * Callers can pass `scheduleDateFrom`/`scheduleDateTo` (unix seconds) for a
+ * custom window instead — a backfill of a past month, say. See buildJobParams
+ * in src/services/servicetrade-sync.js for the cursor semantics that implies.
+ *
  * The actual sync work is delegated to the CrmProvider via `syncAll`. The
  * provider receives the engine instance and calls back into engine.transition/
  * engine.emit at the right moments. If `engine` is null (cron path), the
@@ -24,19 +29,23 @@
 const { Engine } = require("../core/engine");
 const crm = require("../../services/crm");
 
-async function start({ companyId, provider = "servicetrade", full = false, range = "month", startedBy = null }) {
+async function start({
+  companyId, provider = "servicetrade", full = false, range = "month", startedBy = null,
+  scheduleDateFrom = null, scheduleDateTo = null,
+}) {
   const engine = await Engine.create({ kind: "crm_sync", companyId, startedBy });
   // Don't await — run in background so HTTP can return the runId immediately.
-  run(engine, { provider, full, range }).catch(() => { /* errors already captured by engine.fail */ });
+  run(engine, { provider, full, range, scheduleDateFrom, scheduleDateTo })
+    .catch(() => { /* errors already captured by engine.fail */ });
   return engine;
 }
 
-async function run(engine, { provider, full, range }) {
+async function run(engine, { provider, full, range, scheduleDateFrom = null, scheduleDateTo = null }) {
   await engine.wrap(async (eng) => {
     const p = crm.getProvider(provider);
     if (!p) throw new Error(`Unknown CRM provider: ${provider}`);
     await eng.transition("authenticating", { provider });
-    const result = await p.syncAll(eng.companyId, { full, range, engine: eng });
+    const result = await p.syncAll(eng.companyId, { full, range, engine: eng, scheduleDateFrom, scheduleDateTo });
     if (!result.ok) throw new Error(result.error || "sync failed");
     return result.counts;
   });
