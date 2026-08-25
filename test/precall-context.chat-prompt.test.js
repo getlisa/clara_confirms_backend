@@ -228,6 +228,57 @@ test("the greeting falls back to the job description when the appointment has no
   assert.doesNotMatch(out, /Hi Acme Property Group,/);
 });
 
+test("names the technician in the opening example when one is already assigned", () => {
+  const out = prompt.build(
+    ctx({ upcoming: [appt(11, "Thursday, May 28, 2026 at 10:00 AM", {
+      service_line: "Alarm Systems", technician: "Dana Reed", technician_summary: "Dana Reed",
+    })] }),
+    { companyName: "Clara Fire", isOpeningTurn: true }
+  );
+  assert.match(out, /with Dana Reed on the visit/);
+});
+
+// ── 4b. The opening message is a short greeting only — the rest waits ───────
+// Observed live: the opener was crammed with the raw job description AND the
+// full onsite-expectations + noise/access question, reading as one dense wall
+// of text. Fixed by making the opener explicitly minimal and moving onsite
+// expectations to fire only once the visit is actually confirmed.
+
+test("the opening message instructs a short greeting only — no description, no onsite expectations", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday, May 28, 2026 at 10:00 AM")] }),
+    { companyName: "Clara Fire", isOpeningTurn: true });
+  assert.match(out, /keep it SHORT, a simple greeting and nothing/i);
+  assert.match(out, /Do NOT include the job's[\s\S]*description\/notes, onsite expectations, or a noise\/access question here/);
+});
+
+test("the job description is flagged as background only, never for verbatim recital in the opener", () => {
+  const out = prompt.build(
+    ctx({ description: "Zone 401: Fire Sprinkler Waterflow alerts clearing back-to-back", upcoming: [appt(11, "Thursday")] }),
+    { companyName: "Clara Fire" }
+  );
+  assert.match(out, /background for you only; don't recite this verbatim to the customer, and never in the opening message/);
+});
+
+test("onsite expectations are sequenced AFTER confirming, not before — CASE A", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday, May 28, 2026 at 10:00 AM")] }), {
+    companyName: "Clara Fire",
+    serviceLineDescriptions: [{ title: "Alarm Systems", description: "Technician tests each device." }],
+  });
+  const confirmedIdx = out.indexOf("You're all set");
+  const onsiteRefIdx = out.indexOf("Deliver onsite expectations and ask the noise/access question");
+  const arrivalRefIdx = out.indexOf("Deliver the arrival window (see ARRIVAL WINDOW below)");
+  assert.ok(confirmedIdx > -1 && onsiteRefIdx > -1 && arrivalRefIdx > -1, "all three markers must be present");
+  assert.ok(confirmedIdx < onsiteRefIdx, "onsite expectations must be referenced AFTER the confirmation message, not before");
+  assert.ok(onsiteRefIdx < arrivalRefIdx, "onsite expectations must come before the arrival window");
+});
+
+test("without service line descriptions configured, no dangling onsite-expectations pointer is left anywhere", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), { companyName: "Clara Fire" });
+  assert.ok(!out.includes("Deliver onsite expectations and ask the noise/access question"),
+    "no company-specific reference data means nothing to point at");
+  assert.ok(!out.includes("ONSITE EXPECTATIONS"), "the section itself is still omitted entirely when unconfigured");
+});
+
 // ── 5. Phase branches must actually differ ───────────────────────────────────
 // This is the pre-existing bug the change fixed: agentNode never passed
 // state.phase, so all three branches collapsed into the "confirming" one.
@@ -280,7 +331,7 @@ test("service line descriptions are injected, and must be STATED rather than kep
     ],
   });
 
-  assert.match(out, /BEFORE CONFIRMING — ONSITE EXPECTATIONS \+ NOISE & ACCESS/);
+  assert.match(out, /ONSITE EXPECTATIONS \+ NOISE & ACCESS/);
   assert.ok(out.includes("Sprinkler / Fire Protection:\nA technician inspects every sprinkler head and the riser."));
   assert.ok(out.includes("Backflow:\nAnnual backflow preventer test."));
 
@@ -392,4 +443,49 @@ test("once the agent has spoken, the prompt forbids a second greeting", () => {
     "the first message must still be a greeting");
   assert.match(later, /ALREADY INTRODUCED YOURSELF/);
   assert.match(later, /Never send another opening or greeting message/);
+});
+
+// ── propose_remaining_appointments — exclusive, not additive ────────────────
+// This turn must do NOTHING else — no greeting, no confirm, no end_conversation
+// — so the gate makes it the ONLY tool bound to the model, not one more
+// option alongside the phase's usual set.
+
+test("exclusiveTool makes propose_remaining_appointments the ONLY tool offered", () => {
+  const names = getToolsForPhase("confirming", { exclusiveTool: "propose_remaining_appointments" }).map((t) => t.name);
+  assert.deepEqual(names, ["propose_remaining_appointments"]);
+});
+
+test("exclusiveTool overrides isOpeningTurn/phase — still exclusive", () => {
+  const names = getToolsForPhase("all_confirmed", { isOpeningTurn: true, exclusiveTool: "propose_remaining_appointments" }).map((t) => t.name);
+  assert.deepEqual(names, ["propose_remaining_appointments"]);
+});
+
+test("exclusiveTool works for any registered tool name — e.g. a card-driven confirm turn", () => {
+  const names = getToolsForPhase("all_confirmed", { exclusiveTool: "confirm_appointment" }).map((t) => t.name);
+  assert.deepEqual(names, ["confirm_appointment"]);
+});
+
+test("propose_remaining_appointments is never offered outside an exclusive turn for it", () => {
+  const confirming = getToolsForPhase("confirming", { isOpeningTurn: false }).map((t) => t.name);
+  const allConfirmed = getToolsForPhase("all_confirmed").map((t) => t.name);
+  assert.ok(!confirming.includes("propose_remaining_appointments"));
+  assert.ok(!allConfirmed.includes("propose_remaining_appointments"));
+});
+
+// ── The isProposeRemainingTurn prompt — a completely separate, short prompt ─
+
+test("isProposeRemainingTurn produces a short prompt naming only the still-unconfirmed appointments", () => {
+  const upcoming = [
+    appt(11, "Thursday, May 28, 2026 at 10:00 AM", { customer_confirmed: true }),
+    appt(12, "Monday, June 15, 2026 at 9:00 AM", { service_line: "Backflow" }),
+    appt(13, "Tuesday, June 16, 2026 at 9:00 AM", { service_line: "Sprinkler" }),
+  ];
+  const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire", isProposeRemainingTurn: true });
+
+  assert.match(out, /Call propose_remaining_appointments right now/);
+  assert.match(out, /Appointment #12/);
+  assert.match(out, /Appointment #13/);
+  assert.doesNotMatch(out, /Appointment #11/, "already confirmed — not part of 'the rest'");
+  assert.doesNotMatch(out, /YOUR OPENING MESSAGE/, "not the normal greeting/goal flow");
+  assert.doesNotMatch(out, /GOAL: CONFIRM THE NEXT UPCOMING APPOINTMENT/);
 });
