@@ -1,65 +1,59 @@
 /**
- * Move one appointment to a new time. Mirrors retell-tools.js's
- * POST /reschedule_appointment: resets customer_confirmed (a moved
- * appointment isn't confirmed at its new time), mirrors to ServiceTrade
- * best-effort, and recomputes the job's overall confirmation status.
+ * Move one appointment to a new time. Thin LLM-tool wrapper over
+ * actions.js's rescheduleAppointmentCore — called from free-text
+ * conversation and from a card-driven exclusive turn (POST /:token/messages
+ * with trigger: "reschedule_appointment" routes through the agent for real —
+ * see actions.js's CARD_TRIGGER_PREFIX).
+ *
+ * `scheduled_start` is OPTIONAL: when the customer declined to pick a new
+ * time, there is no time to reschedule to, so this branches internally to
+ * actions.js's raiseRescheduleRequest (a todo-only staff escalation, no
+ * appointment write) instead of rescheduleAppointmentCore. Both branches are
+ * the SAME tool/trigger — chat-cards-frontend.md §3 documents
+ * `tool_result.result` as two possible shapes depending on which ran.
+ *
+ * `ctx.cardTriggerArgs` wins over the model's args on a card-driven turn —
+ * the real values are already 100% known from the request body. UNLIKE the
+ * other four promoted handlers, this does not merge cardTriggerArgs OVER
+ * modelArgs for scheduled_start/scheduled_end — it uses cardTriggerArgs'
+ * OWN value for those two fields outright (`undefined` included) once a
+ * card trigger is in progress. The skip path relies on scheduled_start
+ * being ABSENT; the usual `{...modelArgs, ...cardTriggerArgs}` merge only
+ * overrides keys cardTriggerArgs actually sets, so a model that added a
+ * plausible-looking (hallucinated) date despite the request never asking
+ * for one would otherwise silently turn a "customer declined to pick a
+ * time" click into a real reschedule.
  */
 const { z } = require("zod");
-const jobsDb = require("../../../db/jobs");
-const stAppointments = require("../../../services/servicetrade-appointments");
-const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
-const { getCompanyTimezone, localToUTC } = require("../../../utils/timezone");
-const confirmationEventsDb = require("../../../db/confirmation-events");
-const logger = require("../../../utils/logger");
+const { rescheduleAppointmentCore, raiseRescheduleRequest } = require("../../actions");
 
 const schema = z.object({
   appointment_id: z.union([z.string(), z.number()]).describe("The appointment id to reschedule."),
-  scheduled_start: z.string().describe("New start time, format YYYY-MM-DDTHH:MM:SS, in the customer's local time."),
+  scheduled_start: z.string().nullish().describe("New start time, format YYYY-MM-DDTHH:MM:SS, in the customer's local time. Omit ONLY when the customer wants to reschedule but won't give a specific time — this raises a staff follow-up instead of moving the appointment."),
   scheduled_end: z.string().nullish().describe("New end time, same format. Defaults to 2 hours after start if omitted."),
 });
 
-async function run({ appointment_id, scheduled_start, scheduled_end }, config) {
-  const { companyId, threadId, recipientName } = config?.configurable?.ctx || {};
-  const tz = await getCompanyTimezone(companyId);
-  const startUTC = localToUTC(scheduled_start, tz);
-  const endUTC = scheduled_end
-    ? localToUTC(scheduled_end, tz)
-    : new Date(new Date(startUTC).getTime() + 2 * 60 * 60 * 1000).toISOString();
+async function run(modelArgs, config) {
+  const { companyId, jobId, threadId, recipientName, confirmedBy, cardTriggerArgs } = config?.configurable?.ctx || {};
+  const appointment_id = cardTriggerArgs ? cardTriggerArgs.appointment_id : modelArgs.appointment_id;
+  const scheduled_start = cardTriggerArgs ? cardTriggerArgs.scheduled_start : modelArgs.scheduled_start;
+  const scheduled_end = cardTriggerArgs ? cardTriggerArgs.scheduled_end : modelArgs.scheduled_end;
 
-  // Captured BEFORE the update — the ledger's "from" time, since
-  // updateAppointment returns the row AFTER the write.
-  const before = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
+  if (!scheduled_start) {
+    const result = await raiseRescheduleRequest({ companyId, jobId, appointmentId: appointment_id, threadId });
+    return JSON.stringify({ ...result, appointment_id, message: "Our team will follow up to find a time." });
+  }
 
-  const appointment = await jobsDb.updateAppointment(Number(appointment_id), companyId, {
-    scheduled_start: startUTC,
-    scheduled_end: endUTC,
-    customer_confirmed: false,
-    customer_confirmed_at: null,
+  const result = await rescheduleAppointmentCore({
+    companyId, appointmentId: appointment_id, threadId, recipientName, confirmedBy,
+    scheduledStart: scheduled_start, scheduledEnd: scheduled_end,
   });
-  if (!appointment) return JSON.stringify({ success: false, error: "Appointment not found" });
-
-  await stAppointments
-    .mirrorRescheduleAppointment(companyId, appointment, { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: threadId })
-    .catch((err) => logger.error("ConfirmationAgent reschedule mirror failed", { error: err.message, companyId }));
-
-  await syncJobConfirmationStatus(companyId, appointment.job_id);
-
-  // See confirm-appointment.js for why call_type is hardcoded.
-  await confirmationEventsDb.recordSafe({
-    companyId, eventType: "rescheduled", channel: "chat", callType: "customer_confirmation",
-    jobId: appointment.job_id, appointmentId: appointment.id,
-    actorName: recipientName || null, source: threadId,
-    details: { from: before?.scheduled_start ?? null, to: startUTC },
-  });
-
-  logger.info("ConfirmationAgent tool: reschedule_appointment", { companyId, appointment_id, startUTC });
-
-  return JSON.stringify({ success: true, appointment_id: appointment.id, scheduled_start: startUTC, scheduled_end: endUTC });
+  return JSON.stringify(result);
 }
 
 module.exports = {
   name: "reschedule_appointment",
-  description: "Move one appointment to a new date/time. Resets its confirmation — the customer is confirming a NEW time, not the old one.",
+  description: "Move one appointment to a new date/time. Resets its confirmation — the customer is confirming a NEW time, not the old one. Call with no scheduled_start if the customer wants to reschedule but won't commit to a time — this raises a staff follow-up instead, and does not change the appointment.",
   schema,
   run,
 };

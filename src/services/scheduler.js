@@ -211,11 +211,16 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
       // or confirmed elsewhere. Reading it fresh is the only way the agent opens
       // with a count that's actually true.
       //
+      // Declared outside the `if` below (not `const` inside it) so the
+      // web_chat confirmation-email branch further down — which needs the
+      // same site/service/date detail for the email, not just the voice
+      // dynamic variables — can reuse it instead of re-fetching.
+      let jobCtx = null;
       // Confirmation calls only, and only for a real numeric job id —
       // scheduled_calls.job_id also carries 'quotation:N' and
       // 'service_opportunity:N-N', which aren't jobs.
       if (row.call_type === "customer_confirmation" && /^\d+$/.test(String(row.job_id || ""))) {
-        const jobCtx = await buildJobConfirmationContext(row.company_id, row.job_id, { tz: callTz });
+        jobCtx = await buildJobConfirmationContext(row.company_id, row.job_id, { tz: callTz });
         if (jobCtx.ok) {
           Object.assign(dynVars, toDynamicVariables(jobCtx));
 
@@ -422,13 +427,28 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
         }).catch((err) =>
           logger.warn("Dispatcher: failed to snapshot chat link recipient", { ...ctx, error: err.message }));
 
+        // Shared richer detail for both legs below — one job_confirmation
+        // context already computed earlier in this function, not re-fetched
+        // per leg.
+        const next = jobCtx?.ok ? jobCtx.appointments.next : null;
+        const siteName = jobCtx?.ok ? jobCtx.job.location_name : null;
+        // Only a genuine contact record counts as a real person to greet by
+        // name — recipient_name with no recipient_contact_id is a stale/
+        // unrelated snapshot field, not a person (see chat-links.js's
+        // resolveForAction for the identical rule).
+        const recipientName = row.recipient_contact_id != null ? (row.recipient_name || null) : null;
+
         if (wantEmail && customerEmail) {
           try {
             await chatLinkEmail.sendConfirmationLinkEmail({
               email: customerEmail,
-              customerName: greetingName,
+              recipientName,
+              siteName,
+              customerName: row.customer_name || null,
               companyName: co.company_name || "our company",
               jobName: row.job_name,
+              serviceSummary: next?.service_summary || null,
+              scheduledLabel: next?.scheduled_start_spoken || null,
               token: linkResult.token,
             });
             emailSent = true;
@@ -450,9 +470,12 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
           try {
             await chatLinkSms.sendConfirmationLinkSms({
               phone: customerPhone,
+              recipientName,
+              siteName,
               customerName: greetingName,
               companyName: co.company_name || "our company",
               jobName: row.job_name,
+              serviceSummary: next?.service_summary || null,
               token: linkResult.token,
             });
             smsSent = true;
@@ -513,9 +536,14 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
 
         await chatLinkSms.sendConfirmationLinkSms({
           phone: row.phone_number,
-          customerName: row.recipient_name || row.customer_name,
+          // Only a genuine contact record counts as a real person to greet
+          // by name — same rule as the web_chat branch above.
+          recipientName: row.recipient_contact_id != null ? (row.recipient_name || null) : null,
+          siteName: jobCtx?.ok ? jobCtx.job.location_name : null,
+          customerName: row.customer_name || null,
           companyName: co.company_name || "our company",
           jobName: row.job_name,
+          serviceSummary: jobCtx?.ok ? (jobCtx.appointments.next?.service_summary || null) : null,
           token: linkResult.token,
         });
 

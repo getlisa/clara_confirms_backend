@@ -1,5 +1,5 @@
 /**
- * The confirmation chat streams real model tokens.
+ * The confirmation chat streams real model tokens AND tool-call visibility.
  *
  * Before this, POST /chat-links/:token/messages awaited the ENTIRE turn — LLM
  * round-trips plus every tool call — and only then sliced the finished text
@@ -7,9 +7,10 @@
  * streaming; the customer stared at a typing dot for the whole turn and then
  * watched a fake typewriter replay text that had already existed for seconds.
  *
- * Now the deltas come from `graph.streamEvents` as the model generates them.
- * The wire protocol is deliberately IDENTICAL (typing → message_delta* →
- * message_complete → done) so the frontend needs no change.
+ * The deltas come from `graph.streamEvents` as the model generates them.
+ * `typing` is now `thinking`, and every tool call (not just get_service_link)
+ * streams `tool_call`/`tool_result` — previously the customer saw nothing at
+ * all while, say, a reschedule was in flight.
  *
  * Two failure modes are worth more than the feature itself and are pinned
  * hardest:
@@ -171,7 +172,7 @@ test("text alongside tool calls still streams — the replay will show it", asyn
 
 // ── Service links keep their structured shape, in order ─────────────────────
 
-test("a successful get_service_link streams as a service_link message in place", async () => {
+test("a successful get_service_link streams as a tool_result carrying its url/job_name", async () => {
   reset([
     aiChunk("One sec."), aiEnd("One sec.", [{ name: "get_service_link", id: "t1", args: {} }]),
     toolEnd("get_service_link", { success: true, url: "https://app.servicetrade.com/x", job_name: "Quarterly PM" }),
@@ -180,42 +181,74 @@ test("a successful get_service_link streams as a service_link message in place",
   const { events, onEvent } = collect();
   await confirmationAgent.sendMessage({ ...OPTS, content: "email it" }, onEvent);
 
+  // The two replies stream as plain messages; the link itself is no longer
+  // smuggled into the message stream as a special type — it's the generic
+  // tool-visibility event every tool now gets.
   const messages = events.filter((e) => e.type === "message").map((e) => e.message);
-  assert.equal(messages.length, 3);
-  assert.equal(messages[1].type, "service_link", "the link must land between the two replies, not after both");
-  assert.equal(messages[1].url, "https://app.servicetrade.com/x");
-  assert.equal(messages[1].job_name, "Quarterly PM");
+  assert.deepEqual(messages.map((m) => m.content), ["One sec.", "Sent!"]);
+
+  const toolResults = events.filter((e) => e.type === "tool_result");
+  assert.equal(toolResults.length, 1);
+  assert.equal(toolResults[0].tool, "get_service_link");
+  assert.equal(toolResults[0].result.url, "https://app.servicetrade.com/x");
+  assert.equal(toolResults[0].result.job_name, "Quarterly PM");
 });
 
-test("a failed get_service_link streams no link", async () => {
+test("a failed get_service_link still streams a tool_result — just an unsuccessful one", async () => {
   reset([toolEnd("get_service_link", { success: false, error: "no contact" }), aiEnd("I could not send it.")]);
   const { events, onEvent } = collect();
   await confirmationAgent.sendMessage({ ...OPTS, content: "email it" }, onEvent);
-  assert.equal(events.filter((e) => e.message?.type === "service_link").length, 0);
+  const toolResults = events.filter((e) => e.type === "tool_result");
+  assert.equal(toolResults.length, 1);
+  assert.equal(toolResults[0].result.success, false,
+    "the frontend needs to see the failure too, not just silence where a link would have been");
 });
 
-test("other tools stream nothing of their own", async () => {
+test("every tool now streams its own tool_result — visibility was the whole point", async () => {
   reset([toolEnd("confirm_appointment", { success: true, appointment_id: 12 }), aiEnd("Confirmed.")]);
   const { events, onEvent } = collect();
   await confirmationAgent.sendMessage({ ...OPTS, content: "yes" }, onEvent);
-  assert.deepEqual(events.map((e) => e.type), ["message"],
-    "raw tool plumbing must stay out of the customer's transcript");
+  assert.deepEqual(events.map((e) => e.type), ["tool_result", "message"],
+    "previously only get_service_link surfaced anything — the customer saw nothing while confirm/reschedule/cancel ran");
+  assert.equal(events[0].tool, "confirm_appointment");
+  assert.deepEqual(events[0].result, { success: true, appointment_id: 12 });
 });
 
-test("unparseable tool output does not break the stream", async () => {
+test("a tool call itself streams as tool_call, with its args, before the result", async () => {
+  reset([
+    { event: "on_tool_start", name: "cancel_appointment", data: { input: { appointment_id: 12, scope: "appointment_only", reason: "no longer needed" } } },
+    toolEnd("cancel_appointment", { success: true, appointment_id: 12 }),
+    aiEnd("Done."),
+  ]);
+  const { events, onEvent } = collect();
+  await confirmationAgent.sendMessage({ ...OPTS, content: "cancel it" }, onEvent);
+  assert.deepEqual(events.map((e) => e.type), ["tool_call", "tool_result", "message"]);
+  assert.equal(events[0].tool, "cancel_appointment");
+  assert.deepEqual(events[0].args, { appointment_id: 12, scope: "appointment_only", reason: "no longer needed" });
+});
+
+test("unparseable tool output streams a null result rather than breaking the turn", async () => {
   reset([
     { event: "on_tool_end", name: "get_service_link", data: { output: { content: "<html>502</html>" } } },
     aiEnd("Sorry about that."),
   ]);
   const { events, onEvent } = collect();
   await confirmationAgent.sendMessage({ ...OPTS, content: "email it" }, onEvent);
-  assert.equal(events.length, 1);
-  assert.equal(events[0].message.content, "Sorry about that.");
+  assert.deepEqual(events.map((e) => e.type), ["tool_result", "message"]);
+  assert.equal(events[0].result, null);
+  assert.equal(events[1].message.content, "Sorry about that.");
 });
 
 // ── The live stream and the persisted transcript agree ──────────────────────
 
-test("streamed messages match what the transcript replay will show", async () => {
+test("streamed TEXT messages match what the transcript replay will show", async () => {
+  // The live stream and the stored replay are allowed to differ on ONE thing
+  // now: get_service_link's card. toVisibleMessages (the persisted-transcript
+  // replay) still embeds it as a message with type:"service_link" — that
+  // hasn't changed. The LIVE stream surfaces the same data through the
+  // generic tool_result event instead, alongside every other tool's own
+  // visibility, so a frontend built for one contract can't reuse the other's
+  // shape by accident. Plain text messages, though, must still match exactly.
   const persisted = [
     { type: "human", content: "email it" },
     { type: "ai", content: "One sec.", tool_calls: [{ name: "get_service_link", id: "t1", args: {} }] },
@@ -232,13 +265,13 @@ test("streamed messages match what the transcript replay will show", async () =>
   await confirmationAgent.sendMessage({ ...OPTS, content: "email it" }, onEvent);
 
   const streamed = events.filter((e) => e.type === "message").map((e) => e.message);
-  assert.deepEqual(
-    streamed.map((m) => (m.type === "service_link" ? `link:${m.url}` : m.content)),
-    ["One sec.", "link:https://app.servicetrade.com/x", "Sent!"],
-    "same messages, same order, as toVisibleMessages produces from the checkpoint"
-  );
+  assert.deepEqual(streamed.map((m) => m.content), ["One sec.", "Sent!"]);
   assert.ok(streamed.every((m) => m.role === "agent"),
     "the customer's own message must never be echoed back — the frontend already rendered it");
+
+  const linkResult = events.find((e) => e.type === "tool_result" && e.tool === "get_service_link");
+  assert.equal(linkResult.result.url, "https://app.servicetrade.com/x",
+    "the same data the persisted transcript embeds as a service_link message is still available live, just via tool_result");
 });
 
 // ── The route: exactly one copy of each reply ───────────────────────────────
@@ -281,13 +314,68 @@ test("the SSE route sends each reply exactly once", async () => {
     const body = await res.text();
 
     const names = body.split("\n\n").filter((b) => b.startsWith("event:")).map((b) => b.match(/^event: (\w+)/)[1]);
-    assert.deepEqual(names, ["typing", "message_delta", "message_delta", "message_complete", "done"]);
+    assert.deepEqual(names, ["thinking", "message_delta", "message_delta", "message_complete", "done"]);
     assert.equal((body.match(/event: message_complete/g) || []).length, 1,
       "the returned messages must not be rendered on top of the streamed ones");
     assert.match(body, /"chunk":"Hi "/);
     assert.match(body, /"state":"chat_ended"/);
     assert.match(res.headers.get("content-type"), /text\/event-stream/);
     assert.equal(res.headers.get("x-accel-buffering"), "no", "or a proxy holds every delta to the end");
+  } finally {
+    server.close();
+  }
+});
+
+// ── Named triggers (e.g. propose_remaining) — never a raw hardcoded string ──
+// The frontend must never hardcode the internal PROPOSE_REMAINING_TRIGGER
+// text itself; `trigger: "propose_remaining"` is the public, stable contract.
+
+test("trigger: propose_remaining_appointments resolves to the real internal marker, not a literal the frontend typed", async () => {
+  const { PROPOSE_REMAINING_TRIGGER } = require("../src/confirmation-agent/actions");
+  let receivedContent = null;
+  routeImpl = async (_token, content) => {
+    receivedContent = content;
+    return { ok: true, messages: [], state: "open", input_hint: null };
+  };
+  const server = await startRouteServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/chat-links/tok-1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trigger: "propose_remaining_appointments" }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(receivedContent, PROPOSE_REMAINING_TRIGGER);
+  } finally {
+    server.close();
+  }
+});
+
+test("an unknown trigger name 400s rather than silently falling through", async () => {
+  const server = await startRouteServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/chat-links/tok-1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trigger: "not_a_real_trigger" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error, /Unknown trigger/);
+  } finally {
+    server.close();
+  }
+});
+
+test("neither content nor trigger still 400s exactly as before", async () => {
+  const server = await startRouteServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/chat-links/tok-1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(res.status, 400);
   } finally {
     server.close();
   }

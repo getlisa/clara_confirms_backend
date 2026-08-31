@@ -174,7 +174,7 @@ No auth header — fetched from an anonymous customer's browser.
     { "role": "agent", "content": "Hi JACK LTR, this is Clara with Testing Enterprise. I'm reaching out about your Construction Job #44399940 — you have 3 upcoming appointments on it, and the next one is on Thursday, July 23, 2026 at 09:30 AM for a Sprinkler / Fire Protection inspection. Is now a good time to chat?", "created_at": 1784819388725 }
   ],
   "state": "chat_started",
-  "input_hint": { "type": "quick_replies", "options": ["Yes", "Reschedule", "Cancel"] }
+  "input_hint": { "type": "quick_replies", "options": ["Confirm", "Request Reschedule", "Cancel"] }
 }
 ```
 The greeting adapts to how many appointments are upcoming: with **one** it names
@@ -214,7 +214,7 @@ shape from a normal resume — treat it the same way, just render the returned
 ### `input_hint` reference — what to render for the next input
 | `type` | Fields | Render |
 |---|---|---|
-| `quick_replies` | `options: string[]` | Buttons instead of a text box — send the clicked label as `content`. **State-dependent**: `["Yes","Reschedule","Cancel"]` at `chat_started`; `["Yes, confirm the rest","No, just this one"]` at `confirmation_accepted` when the job still has other unconfirmed upcoming appointments |
+| `quick_replies` | `options: string[]` | Buttons instead of a text box — send the clicked label as `content`. Only ever fires at `chat_started`, with `["Confirm","Request Reschedule","Cancel"]` — **updated**, was `["Yes","Reschedule","Cancel"]`. `confirmation_accepted` is `free_text` now (see below) — every appointment on the job is already visible as its own card (chat-cards-frontend.md §2), so there's no separate "confirm the rest?" quick-reply moment to represent here anymore |
 | `date_picker` | `min`, `max` (YYYY-MM-DD) | Calendar/time picker constrained to before the job's due date. Rescheduling moves **one** appointment — the job's other appointments are untouched — send the picked value as a plain formatted string through the same `content` field (e.g. `"August 5th at 2pm"`) — the flow already parses natural-language dates, no special payload needed |
 | `email_form` | — | Single email field |
 | `ended` | — **new** | Conversation is over — see §6. No further input expected |

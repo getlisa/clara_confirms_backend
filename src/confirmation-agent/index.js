@@ -17,9 +17,11 @@ const { getGraph } = require("./graph/build");
 const db = require("../db");
 const chatLinksDb = require("../db/chat-links");
 const { postConfirmationAgentComment } = require("../services/servicetrade-comments");
-const { resolveContact } = require("./tools/confirmer-label");
+const { resolveContact, labelFromConfirmedBy } = require("./tools/confirmer-label");
+const confirmerIdentitiesDb = require("../db/confirmer-identities");
 const sendEventsDb = require("../db/chat-link-send-events");
 const llmLogsDb = require("../db/llm-call-logs");
+const { PROPOSE_REMAINING_TRIGGER, parseCardTrigger } = require("./actions");
 const logger = require("../utils/logger");
 
 // Tool calls whose outcome is worth recording on the ServiceTrade job when
@@ -104,6 +106,21 @@ async function resolveRecipient(companyId, recipientContactId, customerEmail, cu
   };
 }
 
+/**
+ * The identity captured for THIS session, if any (capture_confirmer_identity
+ * — see actions.js's captureConfirmerIdentityCore) — resolved fresh from the
+ * DB every turn, same "cheap, always up to date" shape as resolveRecipient
+ * above, so ctx.confirmedBy never goes stale across a multi-turn
+ * conversation. Returns null until captured; every tool handler and
+ * graph/prompt.js already treat null as "not yet known."
+ */
+async function resolveConfirmedBy(token) {
+  return confirmerIdentitiesDb.getByToken(token).catch((err) => {
+    logger.warn("ConfirmationAgent: confirmer identity lookup failed", { error: err.message, token });
+    return null;
+  });
+}
+
 function extractText(m) {
   if (typeof m.content === "string") return m.content;
   if (Array.isArray(m.content)) return m.content.filter((p) => p?.type === "text").map((p) => p.text).join("");
@@ -111,10 +128,23 @@ function extractText(m) {
 }
 
 /**
- * Keep only real chat turns — strip the synthetic trigger and raw tool
- * plumbing — but surface a successful get_service_link call as a structured
- * `type: "service_link"` entry, same contract chat-links.js's
- * filterVisibleMessages already promises the frontend.
+ * Keep only real chat turns — strip synthetic triggers and raw tool plumbing
+ * — but surface certain tool calls as structured entries:
+ *   - get_service_link → `type: "service_link"` (existing contract,
+ *     unchanged shape, chat-cards-frontend.md §1).
+ *   - propose_remaining_appointments → `type: "propose_remaining"`, content
+ *     is the agent's OWN composed message (from the tool call's args, not a
+ *     canned description — this tool call IS the agent's entire turn, so
+ *     there is no separate narration text to fall back to).
+ *   - every other actionable tool (confirm/reschedule/cancel/bulk-confirm/
+ *     decline_remaining_appointments, whether a real LLM call or a
+ *     card-driven turn) → `role: "system", type: "action"`, generic text
+ *     from describeAction. Previously these were silently dropped whenever
+ *     the triggering AI message had no narration text of its own — which is
+ *     EVERY card-driven turn (empty content by construction) — so a
+ *     card-driven confirm/reschedule/cancel was completely invisible in this
+ *     transcript even though summarizeOutcome (CRM comment) already saw it
+ *     fine.
  *
  * `includeUser` controls whether the customer's own messages are included:
  * true for a full-history replay (GET /chat-links/:token, which needs the
@@ -125,25 +155,52 @@ function extractText(m) {
  * message was appearing as a role:"user" message_delta/message_complete).
  */
 function toVisibleMessages(messages, { includeUser = true } = {}) {
+  // Args live on the AI message, results on the following ToolMessage — one
+  // pre-scan so the tool-message branch below can describe an action from
+  // both without needing a second pass. Same idea as summarizeOutcome's
+  // resultByCallId, just keyed the other direction too.
+  const callById = new Map();
+  for (const m of messages) {
+    const type = m?._getType?.() || m?.type;
+    if (type === "ai" && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) callById.set(tc.id, { name: tc.name, args: tc.args || {} });
+    }
+  }
+
   const out = [];
   for (const m of messages) {
     const type = m?._getType?.() || m?.type;
     if (type === "human") {
       if (!includeUser) continue;
       const text = extractText(m);
-      if (text && text !== TRIGGER_MESSAGE) out.push({ role: "user", content: text, created_at: null });
+      if (text && text !== TRIGGER_MESSAGE && text !== PROPOSE_REMAINING_TRIGGER && !parseCardTrigger(text)) {
+        out.push({ role: "user", content: text, created_at: null });
+      }
     } else if (type === "ai") {
+      // Unchanged from before: real narration text always renders as its own
+      // bubble, regardless of whether the same message also calls a tool
+      // (get_service_link's card, for instance, renders ADDITIONALLY below
+      // when its ToolMessage is reached — never instead of this).
       const text = extractText(m);
       if (text) out.push({ role: "agent", content: text, created_at: null });
-    } else if (type === "tool" && m.name === "get_service_link") {
-      let parsed;
-      try {
-        parsed = JSON.parse(m.content);
-      } catch {
-        parsed = null;
-      }
-      if (parsed?.success && parsed?.url) {
-        out.push({ role: "agent", type: "service_link", url: parsed.url, job_name: parsed.job_name ?? null, created_at: null });
+    } else if (type === "tool") {
+      const call = callById.get(m.tool_call_id);
+      const name = m.name || call?.name;
+      const result = parseToolResult(m.content);
+      if (name === "get_service_link") {
+        if (result?.success && result?.url) {
+          out.push({ role: "agent", type: "service_link", url: result.url, job_name: result.job_name ?? null, created_at: null });
+        }
+      } else if (name === "propose_remaining_appointments") {
+        if (result?.success && call?.args?.message) {
+          out.push({
+            role: "agent", type: "propose_remaining", content: call.args.message,
+            appointments: result.appointments || [], created_at: null,
+          });
+        }
+      } else if (result?.success) {
+        const label = describeAction(name, call?.args || {}, result);
+        if (label) out.push({ role: "system", type: "action", content: label, created_at: null });
       }
     }
   }
@@ -202,16 +259,19 @@ async function pumpTurn(graph, input, config, onEvent) {
         if (text) await onEvent({ type: "message", message: { role: "agent", content: text, created_at: null } });
         break;
       }
+      // Tool-call visibility — previously silent for every tool but
+      // get_service_link, which left the customer staring at a spinner for
+      // however long a confirm/reschedule/cancel took with no idea what was
+      // happening. `ev.data.input` is the tool's raw call args, straight from
+      // LangGraph's own callback — not re-derived.
+      case "on_tool_start": {
+        await onEvent({ type: "tool_call", tool: ev.name, args: ev.data?.input ?? {} });
+        break;
+      }
       case "on_tool_end": {
-        if (ev.name !== "get_service_link") break;
         const output = ev.data?.output;
         const parsed = parseToolResult(typeof output === "string" ? output : output?.content);
-        if (parsed?.success && parsed?.url) {
-          await onEvent({
-            type: "message",
-            message: { role: "agent", type: "service_link", url: parsed.url, job_name: parsed.job_name ?? null, created_at: null },
-          });
-        }
+        await onEvent({ type: "tool_result", tool: ev.name, result: parsed });
         break;
       }
       default:
@@ -238,6 +298,18 @@ function describeAction(name, args, result) {
         : `Customer cancelled appointment #${result.appointment_id ?? args.appointment_id} (reason: ${args.reason || "not specified"}).`;
     case "create_appointment":
       return `Customer booked a new appointment for ${result.scheduled_start ?? args.scheduled_start}.`;
+    // Not CRM-comment-worthy (ACTIONABLE_TOOLS/EXPIRY_OUTCOME_TOOLS deliberately
+    // don't include either name, so summarizeOutcome never reaches this case) —
+    // these two exist here only so toVisibleMessages' generic transcript
+    // rendering (below) has real text to show, reusing this one function for
+    // both concerns rather than duplicating the strings.
+    case "propose_remaining_appointments":
+      // The agent's own message IS the customer-facing text — rendered
+      // directly from the tool call's args by toVisibleMessages, not from
+      // this generic description.
+      return null;
+    case "decline_remaining_appointments":
+      return "Customer chose not to confirm the remaining appointments right now.";
     default:
       return null;
   }
@@ -292,6 +364,38 @@ function summarizeOutcome(messages, { tools = ACTIONABLE_TOOLS } = {}) {
   return { lines, appointmentIds: [...appointmentIds] };
 }
 
+/**
+ * State finalization + CRM comment for a conversation that has genuinely
+ * concluded — shared by TWO callers: runGraph below (when the model itself
+ * called end_conversation) and the deterministic `POST /:token/end` route
+ * (chat-links.js), fired once the "confirm the rest?" step resolves either
+ * way, with no LLM call involved. summarizeOutcome just scans the
+ * checkpoint, so either caller works identically — every card action is now
+ * a real, forced tool call using the same tool names this function's
+ * ACTIONABLE_TOOLS already recognizes, so no special-casing is needed here.
+ */
+async function finalizeConversation(threadId, ctx) {
+  await chatLinksDb.setStateByToken(threadId, "chat_ended").catch((err) =>
+    logger.warn("ConfirmationAgent: failed to set chat_ended state", { error: err.message, threadId })
+  );
+  await chatLinksDb.markEnded(threadId).catch((err) =>
+    logger.warn("ConfirmationAgent: failed to mark chat link ended", { error: err.message, threadId })
+  );
+
+  const graph = await getGraph();
+  const snapshot = await graph.getState({ configurable: { thread_id: threadId } });
+  const messages = snapshot.values?.messages || [];
+  const { lines: summaryLines, appointmentIds } = summarizeOutcome(messages);
+  // Prefer a name the customer actually gave us this session over the link's
+  // addressed-to recipient — see capture-confirmer-identity.js.
+  const confirmedBy = ctx.confirmedBy || (await resolveConfirmedBy(threadId));
+  await postConfirmationAgentComment({
+    companyId: ctx.companyId, jobId: ctx.jobId, threadId,
+    summaryLines, appointmentIds, messageCount: messages.length,
+    recipientName: labelFromConfirmedBy(confirmedBy) || ctx.recipientName || null,
+  }).catch((err) => logger.warn("ConfirmationAgent: outcome comment post failed", { error: err.message, threadId }));
+}
+
 async function runGraph(threadId, ctx, input, onEvent = null) {
   const graph = await getGraph();
   const config = { recursionLimit: 25, configurable: { thread_id: threadId, ctx } };
@@ -308,34 +412,10 @@ async function runGraph(threadId, ctx, input, onEvent = null) {
     const type = m?._getType?.() || m?.type;
     return type === "ai" && Array.isArray(m.tool_calls) && m.tool_calls.some((tc) => tc.name === "end_conversation");
   });
-  if (endedNow) {
-    // Without this, chat_links.state stayed at whatever it last was
-    // (e.g. "service_link_sent") forever — the frontend had no way to tell
-    // the conversation had actually concluded, so the input box never went
-    // away. chat_ended already existed in the state CHECK constraint
-    // (previously only ever meant "session timed out from inactivity" — a
-    // scenario that no longer applies now that the checkpointer keeps
-    // threads alive indefinitely); it now also covers "the agent explicitly
-    // wrapped up," which is the far more common way a conversation ends.
-    await chatLinksDb.setStateByToken(threadId, "chat_ended").catch((err) =>
-      logger.warn("ConfirmationAgent: failed to set chat_ended state", { error: err.message, threadId })
-    );
-    // The LIFECYCLE status, separate from the conversation state above. This is
-    // the moment an outcome exists, which is what "ended" means for monitoring —
-    // and it makes the row immune to the expiry sweep from here on.
-    await chatLinksDb.markEnded(threadId).catch((err) =>
-      logger.warn("ConfirmationAgent: failed to mark chat link ended", { error: err.message, threadId })
-    );
-
-    const { lines: summaryLines, appointmentIds } = summarizeOutcome(after);
-    await postConfirmationAgentComment({
-      companyId: ctx.companyId, jobId: ctx.jobId, threadId,
-      summaryLines, appointmentIds, messageCount: after.length,
-      // Who we were actually talking to — a nominated contact when the link was
-      // sent to one, otherwise the customer record.
-      recipientName: ctx.recipientName || null,
-    }).catch((err) => logger.warn("ConfirmationAgent: outcome comment post failed", { error: err.message, threadId }));
-  }
+  // Without this, chat_links.state stayed at whatever it last was (e.g.
+  // "service_link_sent") forever — the frontend had no way to tell the
+  // conversation had actually concluded, so the input box never went away.
+  if (endedNow) await finalizeConversation(threadId, ctx);
 
   return toVisibleMessages(newMessages, { includeUser: false });
 }
@@ -349,18 +429,19 @@ async function runGraph(threadId, ctx, input, onEvent = null) {
 async function ensureOpened({ companyId, jobId, token, companyName, companyPhone = null, representativeName = null, recipientContactId = null, linkAppointmentId = null, recipient = null }) {
   const { jobRef, customerRef, customerEmail, customerPhone } = await resolveJobRefs(companyId, jobId);
   const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone, recipient, token);
+  const confirmedBy = await resolveConfirmedBy(token);
   const ctx = {
     companyId, jobId, threadId: token, jobRef, customerRef, companyName, companyPhone, representativeName, recipientContactId, linkAppointmentId,
-    recipientName, recipientEmail, recipientPhone,
+    recipientName, recipientEmail, recipientPhone, confirmedBy,
   };
 
   const graph = await getGraph();
   const snapshot = await graph.getState({ configurable: { thread_id: token } });
   const already = (snapshot.values?.messages || []).length > 0;
-  if (already) return { messages: toVisibleMessages(snapshot.values.messages) };
+  if (already) return { messages: toVisibleMessages(snapshot.values.messages), recipientName, recipientEmail, recipientPhone };
 
   const messages = await runGraph(token, ctx, { messages: [new HumanMessage(TRIGGER_MESSAGE)] });
-  return { messages };
+  return { messages, recipientName, recipientEmail, recipientPhone };
 }
 
 /**
@@ -400,7 +481,7 @@ async function getConversation(companyId, token) {
   // row's time.
   const stamped = [];
   for (const t of turns) {
-    if (t.human_message && t.human_message !== TRIGGER_MESSAGE) {
+    if (t.human_message && t.human_message !== TRIGGER_MESSAGE && t.human_message !== PROPOSE_REMAINING_TRIGGER && !parseCardTrigger(t.human_message)) {
       stamped.push({ role: "user", content: t.human_message, at: t.created_at });
     }
     if (t.ai_message) stamped.push({ role: "agent", content: t.ai_message, at: t.created_at });
@@ -425,13 +506,20 @@ async function getConversation(companyId, token) {
  *   `{type:"message",message}` as the turn unfolds. Omit it for a plain
  *   await-the-whole-turn call; the returned `messages` are the same either
  *   way, so a caller that streams must NOT also render the return value.
+ * @param {object|null} [cardTriggerArgs] — set only when `content` is a
+ *   card-trigger marker (actions.js's buildCardTrigger) — the real,
+ *   request-known argument values (appointment_id, scheduled_start, reason,
+ *   etc.) for the forced tool call, threaded onto `ctx.cardTriggerArgs` so
+ *   the promoted tool handlers can use them instead of trusting whatever the
+ *   model relays. Ignored/harmless for a normal customer message.
  */
-async function sendMessage({ companyId, jobId, token, companyName, companyPhone = null, representativeName = null, content, recipientContactId = null, linkAppointmentId = null, recipient = null }, onEvent = null) {
+async function sendMessage({ companyId, jobId, token, companyName, companyPhone = null, representativeName = null, content, recipientContactId = null, linkAppointmentId = null, recipient = null }, onEvent = null, cardTriggerArgs = null) {
   const { jobRef, customerRef, customerEmail, customerPhone } = await resolveJobRefs(companyId, jobId);
   const { recipientName, recipientEmail, recipientPhone } = await resolveRecipient(companyId, recipientContactId, customerEmail, customerPhone, recipient, token);
+  const confirmedBy = await resolveConfirmedBy(token);
   const ctx = {
     companyId, jobId, threadId: token, jobRef, customerRef, companyName, companyPhone, representativeName, recipientContactId, linkAppointmentId,
-    recipientName, recipientEmail, recipientPhone,
+    recipientName, recipientEmail, recipientPhone, confirmedBy, cardTriggerArgs,
   };
   const messages = await runGraph(token, ctx, { messages: [new HumanMessage(content)] }, onEvent);
   return { messages };
@@ -480,8 +568,14 @@ async function postExpiredOutcomeComment({ companyId, jobId, token }) {
 
 module.exports = {
   ensureOpened, sendMessage, getConversation, postExpiredOutcomeComment, EXPIRY_OUTCOME_TOOLS,
+  // Shared with the deterministic card routes (routes/chat-links.js) — see
+  // finalizeConversation's own comment for why one implementation serves both.
+  finalizeConversation,
   // Exported for tests: the rule "a name only ever comes from a real contact"
   // is the whole point of the recipient snapshot, and it is worth pinning
   // directly rather than through a full graph run.
   resolveRecipient,
+  // Exported for routes/chat-links.js's resolveForAction, which needs the
+  // same captured-identity lookup for its own finalizeConversation call.
+  resolveConfirmedBy,
 };

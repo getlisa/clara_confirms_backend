@@ -36,19 +36,22 @@ function escapeHtml(str) {
 
 /**
  * Build a branded HTML email with greeting and content in a box
- * @param {Object} opts - { userName, companyName?, title, bodyHtml, buttonText?, buttonUrl?, footerText? }
+ * @param {Object} opts - { userName, companyName?, greetingWord?, title, bodyHtml, buttonText?, buttonUrl?, footerText? }
+ * @param {string} [opts.greetingWord] - defaults to "Hey"; pass e.g. "Hi" for a
+ *   more formal greeting without changing every other caller of this template.
  * @returns {string} HTML
  */
 function buildEmailTemplate({
   userName,
   companyName = COMPANY_NAME,
+  greetingWord = "Hey",
   title,
   bodyHtml,
   buttonText,
   buttonUrl,
   footerText,
 }) {
-  const greeting = userName ? `Hey ${escapeHtml(userName)}!` : "Hey!";
+  const greeting = userName ? `${greetingWord} ${escapeHtml(userName)}!` : `${greetingWord}!`;
   const safeTitle = escapeHtml(title);
   const safeCompany = escapeHtml(companyName);
 

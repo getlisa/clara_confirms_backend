@@ -52,9 +52,16 @@ function enabledProviders() {
  * non-primary provider answers) via ctx.emit so the UI can show which model
  * responded.
  *
+ * @param {string|null} [toolChoice] — when given, forces the model to call
+ *   exactly this tool (an API-level guarantee on both configured providers,
+ *   OpenAI-compatible `tool_choice` shape) rather than relying on binding a
+ *   single tool + prompt instructions and hoping the model actually calls it
+ *   — a model bound to one tool can still just reply with text instead,
+ *   which for an appointment action would silently swallow it. Additive/
+ *   optional: existing callers that never pass it are unaffected.
  * @returns {Promise<AIMessage>} the model's response message
  */
-async function invokeWithFailover(tools, messages, runnableConfig, ctx) {
+async function invokeWithFailover(tools, messages, runnableConfig, ctx, toolChoice = null) {
   const providers = enabledProviders();
   if (providers.length === 0) {
     throw new Error("No LLM providers configured — set OPENAI_API_KEY and/or GROQ_API_KEY");
@@ -64,7 +71,12 @@ async function invokeWithFailover(tools, messages, runnableConfig, ctx) {
   for (let i = 0; i < providers.length; i++) {
     const provider = providers[i];
     try {
-      const model = provider.make().bindTools(tools);
+      const model = toolChoice
+        ? provider.make().bindTools(tools, {
+            tool_choice: { type: "function", function: { name: toolChoice } },
+            parallel_tool_calls: false,
+          })
+        : provider.make().bindTools(tools);
       const message = await model.invoke(messages, runnableConfig);
       if (ctx?.emit) {
         if (i === 0) await ctx.emit("provider", { provider: provider.id });

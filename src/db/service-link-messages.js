@@ -60,10 +60,15 @@ async function getByRetellCallId(companyId, retellCallId) {
   return rows[0] || null;
 }
 
-async function markSent(id, servicetradeMessageId) {
+/**
+ * @param {string|null} [url] — the customer-facing link minted for this send
+ *   (mintServiceLinkUrl, contactId-based), persisted so the appointment card
+ *   can show/link to it without re-minting on every fetch.
+ */
+async function markSent(id, servicetradeMessageId, url = null) {
   await db.query(
-    `UPDATE service_link_messages SET status='sent', servicetrade_message_id=$2, error=NULL, updated_at=now() WHERE id=$1`,
-    [id, servicetradeMessageId != null ? String(servicetradeMessageId) : null]
+    `UPDATE service_link_messages SET status='sent', servicetrade_message_id=$2, url=$3, error=NULL, updated_at=now() WHERE id=$1`,
+    [id, servicetradeMessageId != null ? String(servicetradeMessageId) : null, url]
   );
 }
 

@@ -26,10 +26,28 @@ async function resolveContact(companyId, contactId) {
   };
 }
 
-async function resolveConfirmerLabel(companyId, recipientContactId) {
+/**
+ * A plain "First Last" label from a captured confirmer identity
+ * (confirmer-identities.js — see capture-confirmer-identity.js), or null if
+ * none has been captured for this session yet.
+ */
+function labelFromConfirmedBy(confirmedBy) {
+  if (!confirmedBy?.firstName) return null;
+  return [confirmedBy.firstName, confirmedBy.lastName].filter(Boolean).join(" ") || null;
+}
+
+/**
+ * @param {object|null} [confirmedBy] — this session's captured identity
+ *   (ctx.confirmedBy), when one exists. Takes priority over the platform
+ *   contact lookup — it's a real name the customer gave us directly this
+ *   conversation, not an inference from who the link was addressed to.
+ */
+async function resolveConfirmerLabel(companyId, recipientContactId, confirmedBy = null) {
+  const fromConfirmedBy = labelFromConfirmedBy(confirmedBy);
+  if (fromConfirmedBy) return fromConfirmedBy;
   if (!recipientContactId) return "the customer";
   const contact = await resolveContact(companyId, recipientContactId);
   return contact?.name || "the customer";
 }
 
-module.exports = { resolveConfirmerLabel, resolveContact };
+module.exports = { resolveConfirmerLabel, resolveContact, labelFromConfirmedBy };

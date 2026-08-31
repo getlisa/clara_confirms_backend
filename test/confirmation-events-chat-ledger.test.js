@@ -21,16 +21,38 @@ const { stub, silentLogger } = require("./helpers/stub-modules");
 const logger = silentLogger();
 stub("utils/logger", logger);
 stub("db", { query: async () => ({ rows: [], rowCount: 0 }) });
-stub("db/chat-links", { setStateByToken: async () => {} });
+const chatLinksCalls = { markRemainingAddressed: [] };
+stub("db/chat-links", {
+  setStateByToken: async () => {},
+  markRemainingAddressed: async (token) => { chatLinksCalls.markRemainingAddressed.push(token); },
+});
 stub("services/job-confirmation-status", { syncJobConfirmationStatus: async () => "confirmed" });
 stub("confirmation-agent/tools/service-link-helpers", { maybeSendServiceLinkNow: async () => ({ sent: false, reason: "no_recipient" }) });
-stub("confirmation-agent/tools/confirmer-label", { resolveConfirmerLabel: async () => null });
+stub("confirmation-agent/tools/confirmer-label", {
+  resolveConfirmerLabel: async () => null,
+  labelFromConfirmedBy: (confirmedBy) => (confirmedBy?.firstName ? [confirmedBy.firstName, confirmedBy.lastName].filter(Boolean).join(" ") : null),
+});
 stub("services/servicetrade-appointments", {
   mirrorRescheduleAppointment: async () => {}, mirrorCancelAppointment: async () => {},
   mirrorCancelJob: async () => {}, mirrorCreateAppointment: async () => {},
 });
 stub("db/todos", { create: async () => {}, TODO_TYPES: { APPOINTMENT_CANCELLED: "APPOINTMENT_CANCELLED" } });
 stub("utils/timezone", { getCompanyTimezone: async () => "America/Chicago", localToUTC: (s) => new Date(s + "Z").toISOString() });
+// Every handler now funnels through actions.js, whose OWN top-level requires
+// resolve once, at whichever handler is required FIRST below — so every stub
+// a core function's dependencies need must be registered before that first
+// require, not interleaved between handler requires the way each handler's
+// own direct requires used to allow.
+stub("services/job-confirmation-context", {
+  buildJobConfirmationContext: async () => ({
+    ok: true,
+    job: { id: 900, status: "scheduled" },
+    appointments: { upcoming: [
+      { appointment_id: 501, customer_confirmed: false },
+      { appointment_id: 502, customer_confirmed: false },
+    ] },
+  }),
+});
 
 const events = [];
 let recordImpl = async (args) => { events.push(args); return 1; };
@@ -51,12 +73,14 @@ stub("db/jobs", {
   },
   bulkConfirmAppointments: async () => {},
   createAppointment: async (companyId, jobId) => ({ id: 777, job_id: jobId }),
+  updateJob: async (jobId, companyId, fields) => ({ id: jobId, ...fields }),
 });
 
 function reset() {
   events.length = 0;
   jobsDbCalls.updateAppointment.length = 0;
   jobsDbCalls.getAppointmentById.length = 0;
+  chatLinksCalls.markRemainingAddressed.length = 0;
   apptRow = { id: 501, job_id: 900, customer_confirmed: false, scheduled_start: "2026-08-10T14:00:00.000Z" };
   recordImpl = async (args) => { events.push(args); return 1; };
   logger.reset();
@@ -99,16 +123,6 @@ test("confirm_appointment: a ledger failure does not fail the confirmation", asy
 
 // ── confirm_job_appointments ─────────────────────────────────────────────────
 
-stub("services/job-confirmation-context", {
-  buildJobConfirmationContext: async () => ({
-    ok: true,
-    job: { id: 900, status: "scheduled" },
-    appointments: { upcoming: [
-      { appointment_id: 501, customer_confirmed: false },
-      { appointment_id: 502, customer_confirmed: false },
-    ] },
-  }),
-});
 const confirmJobAppointments = require("../src/confirmation-agent/tools/handlers/confirm-job-appointments");
 
 test("confirm_job_appointments logs ONE event per appointment, not one for the batch", async () => {
@@ -125,6 +139,12 @@ test("confirm_job_appointments logs nothing when there is nothing left to confir
   const out = JSON.parse(await confirmJobAppointments.run({ appointment_ids: [999] }, CTX()));
   assert.equal(out.confirmed.length, 0);
   assert.equal(events.length, 0);
+});
+
+test("confirm_job_appointments ALWAYS stamps remaining_addressed_at — even confirming nothing IS the customer's answer to 'confirm the rest?'", async () => {
+  reset();
+  await confirmJobAppointments.run({ appointment_ids: [999] }, CTX());
+  assert.deepEqual(chatLinksCalls.markRemainingAddressed, ["tok-abc"]);
 });
 
 // ── reschedule_appointment ───────────────────────────────────────────────────
@@ -161,6 +181,18 @@ test("cancel_appointment logs the reason and scope", async () => {
   assert.equal(events.length, 1);
   assert.equal(events[0].eventType, "cancelled");
   assert.deepEqual(events[0].details, { reason: "no longer needed", scope: "appointment_only" });
+});
+
+test("cancel_appointment (entire_job) stamps remaining_addressed_at — the whole job is closed out, nothing left to ask", async () => {
+  reset();
+  await cancelAppointment.run({ appointment_id: 501, scope: "entire_job", reason: "x" }, CTX());
+  assert.deepEqual(chatLinksCalls.markRemainingAddressed, ["tok-abc"]);
+});
+
+test("cancel_appointment (appointment_only) does NOT stamp remaining_addressed_at — other appointments on the job are untouched, still need asking about", async () => {
+  reset();
+  await cancelAppointment.run({ appointment_id: 501, scope: "appointment_only", reason: "x" }, CTX());
+  assert.deepEqual(chatLinksCalls.markRemainingAddressed, []);
 });
 
 // ── create_appointment ───────────────────────────────────────────────────────

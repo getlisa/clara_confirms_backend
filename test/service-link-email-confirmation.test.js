@@ -150,8 +150,13 @@ test("when the recipient IS the account holder, that note is omitted", () => {
 });
 
 test("the agent is told not to volunteer the contact details", () => {
+  // "Never read them out unprompted" became "never volunteer them at any
+  // other point" once the identity check (WHO YOU'RE TALKING TO) started
+  // legitimately reading these back — the ban on volunteering them
+  // elsewhere is unchanged, just no longer an absolute ban on reading them
+  // back at all.
   const out = chatPrompt({ recipientEmail: "dana@acme.test", recipientPhone: "+15551234567" });
-  assert.match(out, /Never read them out unprompted/i);
+  assert.match(out, /never volunteer them at any other point/i);
 });
 
 // ── The chat prompt states the gate ──────────────────────────────────────────

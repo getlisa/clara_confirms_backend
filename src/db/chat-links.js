@@ -452,6 +452,22 @@ async function setStateByToken(token, state) {
 }
 
 /**
+ * Stamp that the "confirm the rest?" step has been asked AND answered —
+ * bulk-confirm (any outcome), an explicit decline, or a cancel (which closes
+ * the chat on its own and has nothing left to ask). POST /:token/end reads
+ * this to refuse closing a conversation that still has other unconfirmed
+ * appointments nobody has actually been asked about yet. Idempotent —
+ * `COALESCE` so a second stamp (e.g. confirm-then-decline in one odd
+ * sequence) doesn't move the timestamp.
+ */
+async function markRemainingAddressed(token) {
+  await db.query(
+    `UPDATE chat_links SET remaining_addressed_at = COALESCE(remaining_addressed_at, NOW()) WHERE token = $1`,
+    [token]
+  );
+}
+
+/**
  * Atomically swap in a fresh chat_id for a link whose previous Retell session
  * can no longer accept new turns (ended/errored), resetting state back to
  * chat_started for the new session. Compare-and-swap on the OLD chat_id, same
@@ -479,5 +495,5 @@ module.exports = {
   listForMonitoring,
   findByAppointment, findByJob, create, getByToken, getByTokenRaw, markOpened,
   getByRetellChatId, claimRetellChatId, setState, setStateByToken, reopen, setRecipient,
-  generateShortCode, claimShortCode, setShortUrl, getByShortCode,
+  generateShortCode, claimShortCode, setShortUrl, getByShortCode, markRemainingAddressed,
 };

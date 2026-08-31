@@ -22,25 +22,42 @@ const chatLinkEmail = require("./chat-link-email");
 const chatLinkSms = require("./chat-link-sms");
 const { toE164 } = require("../utils/phone");
 const { buildJobConfirmationContext } = require("./job-confirmation-context");
+const { buildAppointmentCards } = require("../confirmation-agent/appointment-card");
+const onsiteInstructionsDb = require("../db/onsite-instructions");
+const serviceLinkMessagesDb = require("../db/service-link-messages");
+
+/**
+ * The job's service-link status/url for THIS conversation (service_link_messages
+ * is keyed by retell_call_id, which is this token) — shape appointment-card.js's
+ * builders expect. Never throws: a lookup failure just means no badge, not a
+ * broken card.
+ */
+async function loadServiceLinkForCard(companyId, token) {
+  const row = await serviceLinkMessagesDb.getByRetellCallId(companyId, token).catch(() => null);
+  return { sent: row?.status === "sent", url: row?.url ?? null };
+}
 
 /**
  * What control the frontend should render for the *next* customer input,
  * derived from the link's current state. Kept as a pure function of
  * (state, context) — no I/O — so it's trivially testable.
  */
-function computeInputHint(state, { jobDueDate, remainingUnconfirmed = 0 } = {}) {
+function computeInputHint(state, { jobDueDate } = {}) {
   switch (state) {
     case "chat_started":
       // "No" is dropped deliberately: on a job with several appointments it's
       // ambiguous (no to which one?), and Cancel already covers refusal.
-      return { type: "quick_replies", options: ["Yes", "Reschedule", "Cancel"] };
+      // Labels match the ServiceTrade workflow's required opening options
+      // (confirmation-agent/workflows/servicetrade.js) — not a bare "Yes",
+      // which reads oddly as a standalone button with no question attached.
+      return { type: "quick_replies", options: ["Confirm", "Request Reschedule", "Cancel"] };
     case "confirmation_accepted":
-      // At least one appointment is confirmed. If the job still has other
-      // unconfirmed upcoming appointments, the agent is required to ask whether
-      // to confirm those too — offer that answer as buttons.
-      return remainingUnconfirmed > 0
-        ? { type: "quick_replies", options: ["Yes, confirm the rest", "No, just this one"] }
-        : { type: "free_text" };
+      // At least one appointment is confirmed. Every upcoming appointment on
+      // the job — confirmed or not — is already visible to the customer as
+      // its own card, so there is no separate "confirm the rest?" quick-reply
+      // step to offer here anymore; free text (or another card click) either
+      // way.
+      return { type: "free_text" };
     case "reschedule_needed":
       return {
         type: "date_picker",
@@ -200,11 +217,25 @@ async function sendConfirmationEmail(link, overrideEmail = null) {
     };
   }
 
+  // The job_confirmation hydrator's own buildJobConfirmationContext result —
+  // no second fetch. Absent for other call types' hydrators (they have no
+  // `context` key at all), so every read below is defensively guarded.
+  const jobCtx = hydrated.context?.ok ? hydrated.context : null;
+  const next = jobCtx?.appointments.next || null;
+
   const sent = await chatLinkEmail.sendConfirmationLinkEmail({
     email,
+    // Only a genuine contact record counts as a real person to greet by
+    // name — recipient_name with no recipient_contact_id is a stale/
+    // unrelated snapshot field, not a person (same rule scheduler.js
+    // already applies to its own dynamic variables).
+    recipientName: link.recipient_contact_id != null ? (link.recipient_name || null) : null,
+    siteName: jobCtx?.job.location_name || null,
     customerName: hydrated.params.customerName || null,
-    companyName: company.name, companyPhone: company.phone_number || null, representativeName: company.representative_name || null,
+    companyName: company.name,
     jobName: hydrated.params.jobName || null,
+    serviceSummary: next?.service_summary || null,
+    scheduledLabel: next?.scheduled_start_spoken || null,
     token: link.token,
   });
 
@@ -259,11 +290,19 @@ async function sendConfirmationSms(link, overridePhone = null) {
     };
   }
 
+  // Same job_confirmation hydrator context sendConfirmationEmail already
+  // reuses — no second fetch.
+  const jobCtx = hydrated.context?.ok ? hydrated.context : null;
+  const next = jobCtx?.appointments.next || null;
+
   const sent = await chatLinkSms.sendConfirmationLinkSms({
     phone,
+    recipientName: link.recipient_contact_id != null ? (link.recipient_name || null) : null,
+    siteName: jobCtx?.job.location_name || null,
     customerName: hydrated.params.customerName || null,
-    companyName: company.name, companyPhone: company.phone_number || null, representativeName: company.representative_name || null,
+    companyName: company.name,
     jobName: hydrated.params.jobName || null,
+    serviceSummary: next?.service_summary || null,
     token: link.token,
   });
 
@@ -302,7 +341,7 @@ async function resolveChatLink(token) {
 
   await chatLinksDb.markOpened(link.id);
 
-  const { messages } = await confirmationAgent.ensureOpened({
+  const { messages, recipientName, recipientEmail, recipientPhone } = await confirmationAgent.ensureOpened({
     companyId: link.company_id, jobId: link.job_id, token, companyName: company.name, companyPhone: company.phone_number || null, representativeName: company.representative_name || null,
     recipientContactId: link.recipient_contact_id, linkAppointmentId: link.appointment_id,
     // Who the link was actually SENT to, snapshotted at dispatch (migration 095).
@@ -314,18 +353,38 @@ async function resolveChatLink(token) {
   // since `link` was loaded.
   const fresh = await chatLinksDb.getByToken(token);
 
+  // Fresh, not hydrated.context — the opening turn above can itself change
+  // confirmation state (a tool call on the first message), so the card must
+  // reflect right now, not the context captured before ensureOpened ran.
+  const freshCtx = await buildJobConfirmationContext(link.company_id, link.job_id);
+  const serviceLink = await loadServiceLinkForCard(link.company_id, token);
+  const onsiteInstructionsAll = await onsiteInstructionsDb.listByCompany(link.company_id);
+
   return {
     ok: true,
     company_name: company.name,
     job_name: hydrated.params.jobName || null,
     customer_name: hydrated.params.customerName || null,
+    // Same resolution the prompt itself uses (recipient snapshot → nominated
+    // contact → send-events fallback → customer record) — so the widget can
+    // pre-fill the service-link email step (chat-cards-frontend.md §5) with a
+    // real default instead of asking blind, while still letting the customer
+    // edit it before anything is sent.
+    contact_name: recipientName || null,
+    contact_email: recipientEmail || null,
+    contact_phone: recipientPhone || null,
     messages,
     state: fresh.state,
     status: fresh.status,
     input_hint: computeInputHint(fresh.state, {
       jobDueDate: hydrated.params.jobDate,
-      remainingUnconfirmed: hydrated.context?.counts.unconfirmed ?? 0,
     }),
+    // Full job list, same as every other card-returning call (trigger `done`
+    // events already send it all) — the "one card at a time" rule is a
+    // FRONTEND rendering choice, not a backend payload-size guarantee. This
+    // lets the widget resolve appointment ids referenced in transcript lines
+    // from an earlier session, not just the current one's `done` events.
+    appointments: buildAppointmentCards(freshCtx, serviceLink, onsiteInstructionsAll),
   };
 }
 
@@ -339,8 +398,11 @@ async function resolveChatLink(token) {
  *   stream the reply as it is generated. When supplied, the returned
  *   `messages` have ALREADY been delivered through onEvent — render one or
  *   the other, never both.
+ * @param {object|null} [cardTriggerArgs] — set only when `content` is a
+ *   card-trigger marker (actions.js's buildCardTrigger) — see
+ *   confirmationAgent.sendMessage's own doc for what this does.
  */
-async function sendChatMessage(token, content, onEvent = null) {
+async function sendChatMessage(token, content, onEvent = null, cardTriggerArgs = null) {
   const link = await chatLinksDb.getByToken(token);
   if (!link) return { ok: false, status: 404, error: "Chat link not found or expired" };
 
@@ -353,9 +415,18 @@ async function sendChatMessage(token, content, onEvent = null) {
     recipientContactId: link.recipient_contact_id, linkAppointmentId: link.appointment_id,
     // Who the link was actually SENT to, snapshotted at dispatch (migration 095).
     recipient: { name: link.recipient_name, email: link.recipient_email, phone: link.recipient_phone },
-  }, onEvent);
+  }, onEvent, cardTriggerArgs);
 
-  const fresh = await chatLinksDb.getByToken(token);
+  // Fresh cards after this turn — a chat-driven action (the customer typed
+  // instead of clicking) still refreshes the widget's cards without a
+  // separate fetch. See appointment-card.js. None of these three depend on
+  // each other's result, so they run concurrently rather than one at a time.
+  const [fresh, freshCtx, serviceLink, onsiteInstructionsAll] = await Promise.all([
+    chatLinksDb.getByToken(token),
+    buildJobConfirmationContext(link.company_id, link.job_id),
+    loadServiceLinkForCard(link.company_id, token),
+    onsiteInstructionsDb.listByCompany(link.company_id),
+  ]);
   return {
     ok: true,
     messages,
@@ -363,8 +434,14 @@ async function sendChatMessage(token, content, onEvent = null) {
     status: fresh.status,
     input_hint: computeInputHint(fresh.state, {
       jobDueDate: hydrated.params.jobDate,
-      remainingUnconfirmed: hydrated.context?.counts.unconfirmed ?? 0,
     }),
+    appointments: buildAppointmentCards(freshCtx, serviceLink, onsiteInstructionsAll),
+    // Exposed so a card-trigger route (routes/chat-links.js's
+    // handleCardTriggerMessage) can build its `done` payload straight from
+    // THIS already-computed freshCtx instead of paying for a second,
+    // identical buildJobConfirmationContext call via its own freshCards().
+    remaining_unconfirmed: freshCtx.ok ? freshCtx.counts.unconfirmed : null,
+    all_confirmed: freshCtx.ok ? freshCtx.counts.all_confirmed : null,
   };
 }
 

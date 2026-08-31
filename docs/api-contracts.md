@@ -867,6 +867,33 @@ single source of truth, so the two documents cannot drift.
 
 ---
 
+### Chat cards & tool visibility — see `chat-cards-frontend.md`
+
+The confirmation chat widget's SSE stream (`POST /chat-links/:token/messages`)
+renamed `typing` → `thinking` and added `tool_call`/`tool_result` events, and
+the widget gained six new deterministic action routes — confirm/reschedule/
+cancel/bulk-confirm/service-link/end — that write directly, with **no LLM
+call involved**. Free-text chat still works exactly as before, alongside the
+cards.
+
+| | |
+|---|---|
+| `GET /chat-links/:token` | **+ `appointments: [...]`** — the card array (unchanged otherwise) |
+| `POST /:token/appointments/:id/confirm` | confirm one appointment |
+| `POST /:token/appointments/:id/reschedule` | move it, or (no date/time given) raise a staff follow-up instead |
+| `POST /:token/appointments/:id/cancel` | cancel it — `reason` required |
+| `POST /:token/appointments/bulk-confirm` | confirm several/all remaining at once |
+| `POST /:token/service-link` | send the job's tracking link to a given (already-confirmed-by-the-UI) email |
+| `POST /:token/end` | close out the conversation — same effect as the agent calling `end_conversation` |
+
+The full appointment card shape (including `arrival_window_label`, rendered
+in italic), every route's request/response, and the exact UI sequence for
+confirm / reschedule / cancel / the "confirm the rest?" follow-up live in
+**`chat-cards-frontend.md`** — deliberately the single source of truth, so the
+two documents cannot drift.
+
+---
+
 ## 9. Shared Types
 
 ### TypeScript interfaces

@@ -201,7 +201,8 @@ test("targets the earliest UNCONFIRMED appointment, not simply the earliest one"
   ];
   const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire", isOpeningTurn: true });
 
-  assert.match(out, /confirm appointment #12 — the earliest one still marked "not yet confirmed."/);
+  assert.match(out, /Call confirm_appointment with appointment_id = 12\./,
+    "CASE A's confirm branch must target the unconfirmed appointment's id, not the earlier confirmed one");
   assert.match(out, /- Next appointment: ID 12 \| Monday, June 15, 2026 at 9:00 AM/,
     "the header must name the unconfirmed one, not the earlier confirmed one");
 });
@@ -218,6 +219,28 @@ test("the opening greeting names the specific service request when there is one"
   assert.doesNotMatch(out, /Hi Acme Property Group,/);
 });
 
+test("the opening example greets a known contact by name", () => {
+  const upcoming = [appt(11, "Thursday, May 28, 2026 at 10:00 AM", { service_line: "Sprinkler / Fire Protection" })];
+  const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire", isOpeningTurn: true, recipientName: "Jordan Blake" });
+
+  assert.match(out, /"Hi Jordan Blake, this is Clara with Clara Fire/,
+    "a known real contact is greeted by name in the opening example");
+});
+
+test("with no known contact, the opening example greets generically — no invented name", () => {
+  const upcoming = [appt(11, "Thursday, May 28, 2026 at 10:00 AM", { service_line: "Sprinkler / Fire Protection" })];
+  const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire", isOpeningTurn: true });
+
+  assert.match(out, /"Hi, this is Clara with Clara Fire/);
+  assert.doesNotMatch(out, /"Hi Acme Property Group,/, "the account/location name must never fill in for an unknown contact");
+});
+
+test("the instruction tells the model to greet by name when known, without inventing one", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), { companyName: "Clara Fire", isOpeningTurn: true });
+  assert.match(out, /Greet[\s\S]*them by name if you know it/i);
+  assert.match(out, /never invent[\s\S]*one/i);
+});
+
 test("the greeting falls back to the job description when the appointment has no service detail", () => {
   const out = prompt.build(
     ctx({ description: "Yearly sprinkler inspection", upcoming: [appt(11, "Thursday, May 28, 2026 at 10:00 AM")] }),
@@ -226,6 +249,57 @@ test("the greeting falls back to the job description when the appointment has no
 
   assert.match(out, /I'm reaching out about the/);
   assert.doesNotMatch(out, /Hi Acme Property Group,/);
+});
+
+test("names the technician in the opening example when one is already assigned", () => {
+  const out = prompt.build(
+    ctx({ upcoming: [appt(11, "Thursday, May 28, 2026 at 10:00 AM", {
+      service_line: "Alarm Systems", technician: "Dana Reed", technician_summary: "Dana Reed",
+    })] }),
+    { companyName: "Clara Fire", isOpeningTurn: true }
+  );
+  assert.match(out, /with Dana Reed on the visit/);
+});
+
+// ── 4b. The opening message is a short greeting only — the rest waits ───────
+// Observed live: the opener was crammed with the raw job description AND the
+// full onsite-expectations + noise/access question, reading as one dense wall
+// of text. Fixed by making the opener explicitly minimal and moving onsite
+// expectations to fire only once the visit is actually confirmed.
+
+test("the opening message instructs a short greeting only — no description, no onsite expectations", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday, May 28, 2026 at 10:00 AM")] }),
+    { companyName: "Clara Fire", isOpeningTurn: true });
+  assert.match(out, /keep it SHORT/i);
+  assert.match(out, /Do NOT include the[\s\S]*job's[\s\S]*description\/notes,[\s\S]*onsite expectations, or a noise\/access question[\s\S]*here/);
+});
+
+test("the job description is flagged as background only, never for verbatim recital in the opener", () => {
+  const out = prompt.build(
+    ctx({ description: "Zone 401: Fire Sprinkler Waterflow alerts clearing back-to-back", upcoming: [appt(11, "Thursday")] }),
+    { companyName: "Clara Fire" }
+  );
+  assert.match(out, /background for you only; don't recite this verbatim to the customer, and never in the opening message/);
+});
+
+test("onsite expectations are sequenced AFTER confirming, not before — CASE A", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday, May 28, 2026 at 10:00 AM")] }), {
+    companyName: "Clara Fire",
+    serviceLineDescriptions: [{ title: "Alarm Systems", description: "Technician tests each device." }],
+  });
+  const confirmedIdx = out.indexOf("You're all set");
+  const onsiteRefIdx = out.indexOf("Deliver onsite expectations and ask the noise/access question");
+  const arrivalRefIdx = out.indexOf("Deliver the arrival window (see ARRIVAL WINDOW below)");
+  assert.ok(confirmedIdx > -1 && onsiteRefIdx > -1 && arrivalRefIdx > -1, "all three markers must be present");
+  assert.ok(confirmedIdx < onsiteRefIdx, "onsite expectations must be referenced AFTER the confirmation message, not before");
+  assert.ok(onsiteRefIdx < arrivalRefIdx, "onsite expectations must come before the arrival window");
+});
+
+test("without service line descriptions configured, no dangling onsite-expectations pointer is left anywhere", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), { companyName: "Clara Fire" });
+  assert.ok(!out.includes("Deliver onsite expectations and ask the noise/access question"),
+    "no company-specific reference data means nothing to point at");
+  assert.ok(!out.includes("ONSITE EXPECTATIONS"), "the section itself is still omitted entirely when unconfigured");
 });
 
 // ── 5. Phase branches must actually differ ───────────────────────────────────
@@ -238,12 +312,12 @@ test("each phase produces a distinct goal block", () => {
   const allConfirmed = prompt.build(ctx({ upcoming: withAppt, phase: "all_confirmed" }), { companyName: "C" });
   const none = prompt.build(ctx({ upcoming: [], phase: "no_appointment" }), { companyName: "C" });
 
-  assert.match(confirming, /Your primary goal is to confirm appointment #11/);
+  assert.match(confirming, /Every upcoming appointment on this job is already visible to the customer/);
   assert.match(allConfirmed, /Everything upcoming is already confirmed — go straight to CASE B/);
   assert.match(none, /There are no upcoming appointments — go straight to CASE C/);
 
-  assert.doesNotMatch(allConfirmed, /Your primary goal is to confirm appointment/);
-  assert.doesNotMatch(none, /Your primary goal is to confirm appointment/);
+  assert.doesNotMatch(allConfirmed, /Every upcoming appointment on this job is already visible to the customer/);
+  assert.doesNotMatch(none, /Every upcoming appointment on this job is already visible to the customer/);
   assert.equal(new Set([confirming, allConfirmed, none]).size, 3);
 });
 
@@ -280,7 +354,7 @@ test("service line descriptions are injected, and must be STATED rather than kep
     ],
   });
 
-  assert.match(out, /BEFORE CONFIRMING — ONSITE EXPECTATIONS \+ NOISE & ACCESS/);
+  assert.match(out, /ONSITE EXPECTATIONS \+ NOISE & ACCESS/);
   assert.ok(out.includes("Sprinkler / Fire Protection:\nA technician inspects every sprinkler head and the riser."));
   assert.ok(out.includes("Backflow:\nAnnual backflow preventer test."));
 
@@ -392,4 +466,161 @@ test("once the agent has spoken, the prompt forbids a second greeting", () => {
     "the first message must still be a greeting");
   assert.match(later, /ALREADY INTRODUCED YOURSELF/);
   assert.match(later, /Never send another opening or greeting message/);
+});
+
+// ── propose_remaining_appointments — exclusive, not additive ────────────────
+// This turn must do NOTHING else — no greeting, no confirm, no end_conversation
+// — so the gate makes it the ONLY tool bound to the model, not one more
+// option alongside the phase's usual set.
+
+test("exclusiveTool makes propose_remaining_appointments the ONLY tool offered", () => {
+  const names = getToolsForPhase("confirming", { exclusiveTool: "propose_remaining_appointments" }).map((t) => t.name);
+  assert.deepEqual(names, ["propose_remaining_appointments"]);
+});
+
+test("exclusiveTool overrides isOpeningTurn/phase — still exclusive", () => {
+  const names = getToolsForPhase("all_confirmed", { isOpeningTurn: true, exclusiveTool: "propose_remaining_appointments" }).map((t) => t.name);
+  assert.deepEqual(names, ["propose_remaining_appointments"]);
+});
+
+test("exclusiveTool works for any registered tool name — e.g. a card-driven confirm turn", () => {
+  const names = getToolsForPhase("all_confirmed", { exclusiveTool: "confirm_appointment" }).map((t) => t.name);
+  assert.deepEqual(names, ["confirm_appointment"]);
+});
+
+test("propose_remaining_appointments is never offered outside an exclusive turn for it", () => {
+  const confirming = getToolsForPhase("confirming", { isOpeningTurn: false }).map((t) => t.name);
+  const allConfirmed = getToolsForPhase("all_confirmed").map((t) => t.name);
+  assert.ok(!confirming.includes("propose_remaining_appointments"));
+  assert.ok(!allConfirmed.includes("propose_remaining_appointments"));
+});
+
+// ── The isProposeRemainingTurn prompt — a completely separate, short prompt ─
+
+test("isProposeRemainingTurn produces a short prompt naming only the still-unconfirmed appointments", () => {
+  const upcoming = [
+    appt(11, "Thursday, May 28, 2026 at 10:00 AM", { customer_confirmed: true }),
+    appt(12, "Monday, June 15, 2026 at 9:00 AM", { service_line: "Backflow" }),
+    appt(13, "Tuesday, June 16, 2026 at 9:00 AM", { service_line: "Sprinkler" }),
+  ];
+  const out = prompt.build(ctx({ upcoming }), { companyName: "Clara Fire", isProposeRemainingTurn: true });
+
+  assert.match(out, /Call propose_remaining_appointments right now/);
+  assert.match(out, /Appointment #12/);
+  assert.match(out, /Appointment #13/);
+  assert.doesNotMatch(out, /Appointment #11/, "already confirmed — not part of 'the rest'");
+  assert.doesNotMatch(out, /YOUR OPENING MESSAGE/, "not the normal greeting/goal flow");
+  assert.doesNotMatch(out, /GOAL: CONFIRM THE NEXT UPCOMING APPOINTMENT/);
+});
+
+// ── WHO YOU'RE TALKING TO — read back known details, never interrogate ─────
+// Live bug: the agent asked "Could you please provide your first and last
+// name, your role at the property, and a phone number?" blind, despite
+// already holding the name and phone. Fixed by reading back what's known
+// and asking only for what's genuinely missing (role is never on file).
+
+const { getWorkflow } = require("../src/confirmation-agent/workflows");
+const servicetradeWorkflow = getWorkflow("servicetrade");
+
+test("identity check reads back a known name and phone instead of asking blind", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), {
+    companyName: "Clara Fire", recipientName: "Jordan Blake", recipientPhone: "+15551234567",
+  });
+  assert.match(out, /You have a name on file: "Jordan Blake\."/);
+  assert.match(out, /I have you down as Jordan Blake, is that right/);
+  assert.match(out, /You have a phone number on file: \+15551234567/);
+  assert.doesNotMatch(out, /No name on file/);
+  assert.doesNotMatch(out, /No phone number on file/);
+});
+
+test("identity check asks for a name when none is on file, but still reads back a known phone", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), {
+    companyName: "Clara Fire", recipientName: null, recipientPhone: "+15551234567",
+  });
+  assert.match(out, /No name on file — ask for their first and last name/);
+  assert.match(out, /You have a phone number on file: \+15551234567/);
+});
+
+test("identity check asks for a phone when none is on file, and flags it as required", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), {
+    companyName: "Clara Fire", recipientName: "Jordan Blake", recipientPhone: null,
+  });
+  assert.match(out, /No phone number on file — ask for one\. This is required/);
+});
+
+test("role is always asked — nothing on this platform ever tracks it", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), {
+    companyName: "Clara Fire", recipientName: "Jordan Blake", recipientPhone: "+15551234567",
+  });
+  assert.match(out, /Role is never on file — always ask/);
+});
+
+test("the agent must capture identity even when everything read back was already correct", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), { companyName: "Clara Fire" });
+  assert.match(out, /call capture_confirmer_identity with the final values — do this even if everything you read back was already correct/);
+});
+
+test("once captured this session, the agent does not ask again", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), {
+    companyName: "Clara Fire",
+    confirmedBy: { firstName: "Jordan", lastName: "Blake", role: "on_site" },
+  });
+  assert.match(out, /Jordan Blake \(on site\) has already told you who they are this session — do not ask again/);
+  assert.doesNotMatch(out, /READING BACK what you already have/);
+});
+
+test("CONTACT & JOB DATA no longer forbids reading contact details back — it points at the identity check instead", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), { companyName: "Clara Fire" });
+  assert.doesNotMatch(out, /Never read them out unprompted/, "the old blanket ban must be gone — it contradicted the identity read-back");
+  assert.match(out, /You may also read them back during the identity check \(see WHO YOU'RE TALKING TO below\)/);
+});
+
+// ── SERVICE LINK is now an offer, not an announced step ─────────────────────
+
+test("service link is framed as an explicit ask, not an automatic step", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), { companyName: "Clara Fire" });
+  assert.match(out, /Would you like me to email you a link to follow this job/);
+  assert.match(out, /this is an OFFER, not an automatic step/);
+  assert.doesNotMatch(out, /This is a step, not an offer/, "the old always-send framing must be gone");
+});
+
+// ── The ServiceTrade workflow's REQUIRED SEQUENCE checklist ─────────────────
+
+test("the ServiceTrade workflow's checklist renders as its own section", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), { companyName: "Clara Fire", workflow: servicetradeWorkflow });
+  assert.match(out, /REQUIRED SEQUENCE/);
+  assert.match(out, /confirm, request a\s+reschedule, or cancel/);
+  assert.match(out, /ASK whether they'd like the service link/);
+});
+
+test("no workflow (or one with no checklist) renders no REQUIRED SEQUENCE section — opt-in, not assumed", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), { companyName: "Clara Fire" });
+  assert.doesNotMatch(out, /REQUIRED SEQUENCE/);
+});
+
+// ── A workflow without service-link capability never dangles a reference to
+// a section that doesn't exist in the prompt ─────────────────────────────────
+
+test("a non-serviceLink workflow omits the SERVICE LINK section entirely, with no dangling references to it", () => {
+  const noLinkWorkflow = { slug: "other-crm", capabilities: { serviceLink: false } };
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), {
+    companyName: "Clara Fire", recipientName: "Jordan Blake", recipientPhone: "+15551234567", workflow: noLinkWorkflow,
+  });
+  assert.doesNotMatch(out, /SERVICE LINK/, "no heading, and no other section may reference it by name");
+  assert.doesNotMatch(out, /resolve_service_link_contact/);
+  assert.doesNotMatch(out, /get_service_link/);
+  assert.match(out, /Go to ENDING THE CONVERSATION\./);
+});
+
+test("a serviceLink-capable workflow (the default) still gets the SERVICE LINK section", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), {
+    companyName: "Clara Fire", workflow: servicetradeWorkflow,
+  });
+  assert.match(out, /SERVICE LINK/);
+  assert.match(out, /Go to SERVICE LINK\./);
+});
+
+test("omitting workflow entirely defaults to serviceLink enabled — an existing caller that never passes one keeps today's behavior", () => {
+  const out = prompt.build(ctx({ upcoming: [appt(11, "Thursday")] }), { companyName: "Clara Fire" });
+  assert.match(out, /SERVICE LINK/);
 });
