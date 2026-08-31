@@ -272,6 +272,50 @@ test("a missing job name drops the clause rather than leaving a dangling 'for'",
   assert.match(smsSent[0].body, /appointment with Total Fire & Security/);
 });
 
+// ── Greeting priority: real contact > site > account, mirroring the email ──
+// (chat-appointment-lookup-backend-request.md's sibling fix for
+// chat-link-email.js — same bug, same fix, applied here too.)
+
+test("a real contact name takes priority over the site and the account", async () => {
+  reset();
+  await send({ recipientName: "Dana Reed", siteName: "Columbus Park Apartments", customerName: "VareCo" });
+  assert.match(smsSent[0].body, /^Hi Dana Reed, please confirm/);
+});
+
+test("falls back to the site name when no real contact is known", async () => {
+  reset();
+  await send({ recipientName: null, siteName: "Columbus Park Apartments", customerName: "VareCo" });
+  assert.match(smsSent[0].body, /^Hi Columbus Park Apartments, please confirm/);
+});
+
+test("falls back to the account name only once the site is also unknown", async () => {
+  reset();
+  await send({ recipientName: null, siteName: null, customerName: "VareCo" });
+  assert.match(smsSent[0].body, /^Hi VareCo, please confirm/);
+});
+
+test("with nothing at all known, greets generically — never a blank name", async () => {
+  reset();
+  await send({ recipientName: null, siteName: null, customerName: null });
+  assert.match(smsSent[0].body, /^Hi, please confirm/);
+});
+
+// ── Naming the actual visit, not a bare job title ───────────────────────────
+
+test("a known service summary replaces the bare job title", async () => {
+  reset();
+  await send({ serviceSummary: "Fire Alarm Inspection", jobName: "Inspection Job #49707603" });
+  assert.match(smsSent[0].body, /please confirm your Fire Alarm Inspection visit with/);
+  assert.ok(!smsSent[0].body.includes("Inspection Job #49707603"),
+    "the bare job title must not show once the real visit is known");
+});
+
+test("with no service summary, falls back to the job-title phrasing exactly as before", async () => {
+  reset();
+  await send({ serviceSummary: null, jobName: "Inspection Job #49707603" });
+  assert.match(smsSent[0].body, /please confirm your upcoming appointment for Inspection Job #49707603 with/);
+});
+
 // ── The trailing-slash trap ──────────────────────────────────────────────────
 
 test("a trailing slash on FRONTEND_URL does not produce a double slash", () => {

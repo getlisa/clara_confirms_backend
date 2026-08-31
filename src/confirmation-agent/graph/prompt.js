@@ -144,11 +144,21 @@ function derive(ctx, opts) {
     serviceLineDescriptions = [], recipientName = null, recipientEmail = null, recipientPhone = null,
     companyPhone = null, representativeName = null,
     cardTriggerTool = null, cardTriggerArgs = null,
+    confirmedBy = null, onsiteInstructions: onsiteInstructionsAll = [],
+    workflow = null,
   } = opts;
 
   const zone = timezoneLabel(ctx.tz);
   const upcoming = ctx.appointments.upcoming;
   const nextUnconfirmed = upcoming.find((a) => !a.customer_confirmed) || null;
+  const next = nextUnconfirmed || upcoming[0] || null;
+
+  // Company's structured onsite instructions (migrations/101), matched
+  // against THIS turn's next appointment — general (service_line NULL) rows
+  // always apply, plus whichever are scoped to that exact service_line.
+  const onsiteInstructions = onsiteInstructionsAll.filter(
+    (i) => i.service_line == null || i.service_line === next?.service_line
+  );
 
   return {
     ctx,
@@ -157,6 +167,12 @@ function derive(ctx, opts) {
     isOpeningTurn,
     confirmedByOtherLabel,
     serviceLineDescriptions,
+    onsiteInstructions,
+    // Whether ONSITE_EXPECTATIONS has anything at all to say — either data
+    // source is enough; a company with only the new table and none of the
+    // old soft-matched descriptions (or vice versa) still gets the section.
+    hasOnsiteContent: serviceLineDescriptions.length > 0 || onsiteInstructions.length > 0,
+    confirmedBy,
     recipientEmail,
     recipientPhone,
     rep: representativeName || "Clara",
@@ -178,7 +194,7 @@ function derive(ctx, opts) {
     nowSpoken: formatSpokenDateTime(new Date().toISOString(), ctx.tz || "UTC"),
     upcoming,
     nextUnconfirmed,
-    next: nextUnconfirmed || upcoming[0] || null,
+    next,
     counts: ctx.counts,
     phase: ctx.phase,
     jobId: ctx.job.id,
@@ -188,6 +204,12 @@ function derive(ctx, opts) {
     goalAppointmentId: nextUnconfirmed?.appointment_id ?? (upcoming[0] || null)?.appointment_id,
     cardTriggerTool,
     cardTriggerArgs,
+    // The resolved confirmation-agent/workflows/*.js module (null only when
+    // a caller — e.g. a direct test — doesn't pass one). Defaults to "on"
+    // when absent, same as registry.js's getToolsForPhase, so an omitted
+    // workflow never silently hides the service-link flow.
+    workflow,
+    hasServiceLink: workflow?.capabilities?.serviceLink !== false,
   };
 }
 
@@ -215,12 +237,27 @@ ${d.customerName
 Customer contact details:
 - Email: ${d.recipientEmail || "none on file"}
 - Phone: ${d.recipientPhone || "none on file"}
-Use these when you're sending servicelink after confirming the appointment. Never read them out unprompted.
+${d.hasServiceLink ? "Use these when you're sending the service link after confirming the appointment. " : ""}You may also read them back during the identity check (see WHO YOU'RE TALKING TO below) — never volunteer them at any other point.
 
 Job details:
 - Job: ${d.jobName}
 ${optLine(d.ctx.job.description, `- Description: ${d.ctx.job.description} — background for you only; don't recite this verbatim to the customer, and never in the opening message.`)}${optLine(d.ctx.job.customer?.address, `- Address: ${d.ctx.job.customer?.address}`)}
 ${optLine(d.nowSpoken, `Current date and time: ${d.nowSpoken}${d.zone ? ` ${d.zone}` : ""}`)}`;
+
+const CONFIRMER_IDENTITY = (d) => `${BAR}
+WHO YOU'RE TALKING TO
+${BAR}
+
+${d.confirmedBy
+  ? `${d.confirmedBy.firstName} ${d.confirmedBy.lastName} (${d.confirmedBy.role.replace(/_/g, " ")}) has already told you who they are this session — do not ask again, and never call capture_confirmer_identity a second time.`
+  : `You do not yet know who is actually confirming for this job — that may or may not be the same person named above under CONTACT & JOB DATA. Before completing the FIRST confirm, reschedule, cancel, or create action in this conversation, check who you're speaking with by READING BACK what you already have — never interrogate someone for details you already hold${d.hasServiceLink ? " (the same rule SERVICE LINK below follows for email)" : ""}:
+
+${d.customerName ? `- You have a name on file: "${d.customerName}." Read it back — "I have you down as ${d.customerName}, is that right?" — don't ask "what's your name" cold.` : `- No name on file — ask for their first and last name.`}
+${d.recipientPhone ? `- You have a phone number on file: ${d.recipientPhone}. Read it back the same way.` : `- No phone number on file — ask for one. This is required; don't skip it even if you already have their email.`}
+- Role is never on file — always ask which of management, on-site, billing, scheduling, owner, or other describes them.
+
+Once everything is confirmed or corrected, call capture_confirmer_identity with the final values — do this even if everything you read back was already correct; "that's right" still needs to be recorded, not just acknowledged. Do this naturally as part of the conversation, not as a rigid form, and only once per conversation. Email is optional — only include it if they volunteer one.`}
+`;
 
 /**
  * The live appointment facts. The variable parts — next visit, arrival window,
@@ -313,8 +350,8 @@ BEFORE EVERY TOOL CALL — Always send a brief message before calling any functi
   • create_appointment → "Perfect — one moment while I get that on the schedule."
   • confirm_job_appointments → "One moment while I confirm all of those for you."
   • list_upcoming_appointments → "Let me pull up the full list — just a moment."
-  • resolve_service_link_contact → "Let me look you up in our system real quick."
-  • get_service_link → "One moment while I pull that link up for you."
+${optLine(d.hasServiceLink, `  • resolve_service_link_contact → "Let me look you up in our system real quick."
+  • get_service_link → "One moment while I pull that link up for you."`)}
 
 SCOPE — Do not discuss pricing, contracts, or anything outside scheduling. If asked, say the team will follow up${d.companyPhone ? ` or they can call ${d.companyPhone}` : ""}.
 
@@ -349,15 +386,19 @@ const OPENING_MESSAGE = (d) => `${BAR}
 YOUR OPENING MESSAGE
 ${BAR}
 
-This is the first message — keep it SHORT, a simple greeting and nothing
-more: who you are, the visit's date, and the reason for the visit. Name the
-technician too if one is already assigned. Do NOT include the job's
-description/notes, onsite expectations, or a noise/access question here —
-those (if applicable) come later, once they've replied. Just the greeting.
+This is the first message — keep it SHORT: who you are, the soonest visit's
+date and reason, and (only when there's more than one upcoming appointment
+on this job) a brief mention that there are others too — a count, not a
+list; every one of them is already visible to the customer as its own card
+in the chat widget. Greet them by name if you know it (see CONTACT & JOB
+DATA above) — never invent one. Name the technician too if one is already
+assigned to the soonest visit. Do NOT include the job's description/notes,
+onsite expectations, or a noise/access question here — those (if
+applicable) come later, once they've replied. Just the greeting.
 
 ${d.next
-  ? `E.g.: "Hi, this is ${d.rep} with ${d.companyName || "us"} — I'm reaching out about the ${d.next.service_summary || d.next.service_line || "upcoming"} visit at ${d.siteName || "your site"} on ${d.next.scheduled_start_spoken}${d.next.technician_summary ? `, with ${d.next.technician_summary} on the visit` : ""}."`
-  : `E.g.: "Hi, this is ${d.rep} with ${d.companyName || "us"} — I'm reaching out about the ${d.jobName}."`}
+  ? `E.g.: "Hi${d.customerName ? ` ${d.customerName}` : ""}, this is ${d.rep} with ${d.companyName || "us"} — I'm reaching out about the ${d.next.service_summary || d.next.service_line || "upcoming"} visit at ${d.siteName || "your site"} on ${d.next.scheduled_start_spoken}${d.next.technician_summary ? `, with ${d.next.technician_summary} on the visit` : ""}${d.counts.upcoming > 1 ? `. You've also got ${d.counts.upcoming - 1} more visit${d.counts.upcoming - 1 === 1 ? "" : "s"} coming up on this job` : ""}."`
+  : `E.g.: "Hi${d.customerName ? ` ${d.customerName}` : ""}, this is ${d.rep} with ${d.companyName || "us"} — I'm reaching out about the ${d.jobName}."`}
 `;
 
 // Belt to the tool-gate's braces. ANY tool call made in the opening message
@@ -374,13 +415,13 @@ const GOAL = (d) => {
     : d.phase === "all_confirmed"
       ? `Everything upcoming is already confirmed — go straight to CASE B below.
 `
-      : `Your primary goal is to confirm appointment #${d.goalAppointmentId} — the earliest one still marked "not yet confirmed." Do NOT ask about an appointment already confirmed — it's settled.
+      : `Every upcoming appointment on this job is already visible to the customer — as its own card in the chat widget, and in the APPOINTMENT DATA above. Guide them through confirming, rescheduling, or cancelling whichever one they raise, in whatever order they bring it up — there is no single required target. Once one is settled, keep going naturally if others are still unconfirmed, but don't force a rigid sequence (see OTHER APPOINTMENTS ON THIS JOB below). Do NOT ask about an appointment already confirmed — it's settled.
 
 Refer to services specifically — "your Annual Fire Alarm inspection", "the Semi-Annual Sprinkler check." Never a bare job number. Never "fire protection" as a category.
 `;
 
   return `${BAR}
-GOAL: CONFIRM THE NEXT UPCOMING APPOINTMENT
+GOAL: CONFIRM EVERY OUTSTANDING APPOINTMENT ON THE JOB
 ${BAR}
 
 ${body}`;
@@ -395,17 +436,23 @@ confirm_appointment or reschedule_appointment succeeds, or once the customer
 says an already-confirmed date still works (CASE B) — never in the opening
 message (see YOUR OPENING MESSAGE above). For a brand-new visit (CASE C),
 deliver it while helping them pick a time, since nothing is confirmed yet to
-wait for. Always do both of these in order, before the arrival window:
+wait for. Do the following, in order, before the arrival window:
 
-A. DELIVER ONSITE EXPECTATIONS
+${d.serviceLineDescriptions.length ? `DELIVER ONSITE EXPECTATIONS
 Every confirmation must tell the customer what to expect: building access, noise, and rough duration. The site needs this to prepare — giving tenants notice, unlocking units, expecting the panel to sound. Don't wait to be asked.
 Match the visit to the ONE entry below using its services. If the job covers several services, use the single combined entry. If nothing clearly matches, describe in general terms — never invent access or noise specifics.
 Keep it brief and conversational — work it into the message naturally, in your own words. For any visit involving sounding the alarm or entering units, always add: "Please make sure everyone at the property knows in advance — staff, residents, and guests — so there are no surprises."
 
 ${d.serviceLineDescriptions.map((x) => `${x.title}:\n${x.description}\n\n`).join("")}If the combination isn't listed, combine the relevant descriptions naturally. When in doubt — if the system will be sounded or units need to be accessed — say so clearly.
 
-B. ASK THE NOISE & ACCESS QUESTION
-Right after delivering the onsite expectations, ask about restrictions — as an actual question they can respond to, not a statement. Frame it as asking permission, not stating policy.
+` : ""}${d.onsiteInstructions.length ? `SITE-SPECIFIC INSTRUCTIONS
+This company has specific instructions for this visit — deliver every one of them, in your own words, working them naturally into the message:
+
+${d.onsiteInstructions.map((i) => `- [${i.requires_response ? "ASK — wait for their answer" : "STATE"}] ${i.instruction}`).join("\n")}
+
+For anything marked ASK: put it to them as an actual question and wait for their reply — don't just state it as fact. Once they answer, call report_customer_intent with the question and their answer so staff can see it. For anything marked STATE: just deliver it naturally, no question needed.
+` : `ASK THE NOISE & ACCESS QUESTION
+Right after delivering onsite expectations, ask about restrictions — as an actual question they can respond to, not a statement. Frame it as asking permission, not stating policy.
 
 If the visit involves sounding the system or accessing units/rooms:
   Hotels → "Do we need to wait until around 10:30 to get into rooms and sound the system?"
@@ -416,7 +463,20 @@ If they confirm a restriction: "Got it — we'll hold off on anything noisy or r
 If no restrictions: note it and continue.
 
 If the visit does NOT involve noise or unit access (standalone extinguishers, standalone backflow): skip the noise question. Ask instead: "Anything we should know about accessing the property — a check-in process, specific entrance, anything like that?"
-`;
+`}`;
+
+/**
+ * The resolved CRM workflow's must-hit sequence (confirmation-agent/
+ * workflows/*.js) — CRM-specific by design (see that directory's header
+ * comment for why this prose lives there instead of here). Rendered right
+ * before HANDLING THE CONFIRMATION so it reads as the spine, with CASE A
+ * below filling in how to actually do each step.
+ */
+const CHECKLIST = (d) => `${BAR}
+REQUIRED SEQUENCE
+${BAR}
+
+${d.workflow.checklist(d)}`;
 
 const HANDLING_HEADER = `${BAR}
 HANDLING THE CONFIRMATION
@@ -424,29 +484,33 @@ ${BAR}
 `;
 
 // CASE A is never gated: CASE B ends by delegating to it ("handle as a
-// reschedule or cancel (CASE A)") and STEP 3 references it too, so removing it
-// on any phase would leave those pointing at nothing.
+// reschedule or cancel (CASE A)") and OTHER APPOINTMENTS ON THIS JOB
+// references it too, so removing it on any phase would leave those pointing
+// at nothing.
 const CASE_A = (d) => `── CASE A: at least one upcoming appointment not yet confirmed ──
 
 Call report_customer_intent the instant the customer's intent is clear (wants_confirm / wants_reschedule / wants_cancel / other) — before completing the action. Do this silently, never mention it.
 
 If they CONFIRM:
+→ Check who you're speaking with first, if you haven't already this conversation (see WHO YOU'RE TALKING TO above) — before you write anything.
 → Send: "Thanks for confirming — one moment while I get that updated."
 → Call confirm_appointment with appointment_id = ${d.confirmTargetId}.
 → Once done: "You're all set — your [service] on [date] is confirmed."
-${optLine(d.serviceLineDescriptions.length, "→ Deliver onsite expectations and ask the noise/access question (see ONSITE EXPECTATIONS below).")}→ Deliver the arrival window (see ARRIVAL WINDOW below).
-→ Go to ${d.showStep3 ? "STEP 3 — REMAINING APPOINTMENTS" : "SERVICE LINK"}.
+${optLine(d.hasOnsiteContent, "→ Deliver onsite expectations and ask the noise/access question (see ONSITE EXPECTATIONS below).")}→ Deliver the arrival window (see ARRIVAL WINDOW below).
+→ Go to ${d.nextAfterConfirmation}.
 
 If they want to RESCHEDULE:
+→ Check who you're speaking with first, if you haven't already this conversation (see WHO YOU'RE TALKING TO above) — before you write anything.
 → Establish which appointment if there are multiple: "Which visit would you like to move — the [date] one or the [date] one?"
 → "What date and time works best?"
 ${optLine(d.zoneShort, `→ Confirm the zone: "Just to confirm, that's [time] ${d.zoneShort} — right?"`)}→ Send: "Got it — one moment while I move that over for you."
 → Call reschedule_appointment with that appointment_id and the new scheduled_start (YYYY-MM-DDTHH:MM:SS${d.zone ? `, ${d.zone}` : ""}).
 → Once done: "Done — I've moved that to [new date and time]."
-${optLine(d.serviceLineDescriptions.length, "→ Deliver onsite expectations and ask the noise/access question (see ONSITE EXPECTATIONS below).")}→ Deliver the arrival window.
+${optLine(d.hasOnsiteContent, "→ Deliver onsite expectations and ask the noise/access question (see ONSITE EXPECTATIONS below).")}→ Deliver the arrival window.
 → Note: rescheduling one appointment does not move the others. Say so if they seem to expect it.
 
 If they want to CANCEL:
+→ Check who you're speaking with first, if you haven't already this conversation (see WHO YOU'RE TALKING TO above) — before you write anything.
 → Establish which appointment.
 → "Just to confirm — would you like to cancel just this visit, or the whole job?" Only use entire_job if they explicitly don't need the job at all.
 → "Can I ask why?" Note the reason.
@@ -460,14 +524,14 @@ If they ask about OTHER appointments:
 → Come back to confirming the next one.
 `;
 
-const CASE_B = `── CASE B: everything is already confirmed ──
+const CASE_B = (d) => `── CASE B: everything is already confirmed ──
 
 Don't ask for confirmation as if nothing's on file.
 → "Good news — everything on this job is already confirmed. The next visit is [date] for [service]. I just wanted to make sure that still works for you."
 → Still deliver the onsite expectations and ask the noise/access question — the property needs to know what to expect even if the date is settled.
-→ If it still works: deliver the arrival window, then go to SERVICE LINK. No tool call needed.
+→ If it still works: deliver the arrival window, then go to ${d.hasServiceLink ? "SERVICE LINK" : "ENDING THE CONVERSATION"}. No tool call needed.
 → If it doesn't: handle as a reschedule or cancel (CASE A).
-→ SKIP STEP 3.
+→ SKIP OTHER APPOINTMENTS ON THIS JOB.
 `;
 
 const CASE_C = (d) => `── CASE C: no upcoming appointments ──
@@ -475,17 +539,18 @@ const CASE_C = (d) => `── CASE C: no upcoming appointments ──
 → If past visits exist: "I can see we were out on [date] — this job needs another visit scheduled."
 → Deliver the relevant onsite expectations so they know what to expect.
 → "Do you have a preferred date and time for [service]?"
-${optLine(d.zoneShort, `→ Confirm ${d.zoneShort} before booking.`)}→ If they give a time: send "Perfect — one moment while I get that on the schedule." then call create_appointment with job_id=${d.jobId} and scheduled_start (YYYY-MM-DDTHH:MM:SS${d.zone ? `, ${d.zone}` : ""}). Once done: "You're all set — I've got you down for [date and time]. Our team will be there."
+${optLine(d.zoneShort, `→ Confirm ${d.zoneShort} before booking.`)}→ Check who you're speaking with first, if you haven't already this conversation (see WHO YOU'RE TALKING TO above) — before you write anything.
+→ If they give a time: send "Perfect — one moment while I get that on the schedule." then call create_appointment with job_id=${d.jobId} and scheduled_start (YYYY-MM-DDTHH:MM:SS${d.zone ? `, ${d.zone}` : ""}). Once done: "You're all set — I've got you down for [date and time]. Our team will be there."
 → Deliver the arrival window.
 → If they say "anytime": "Our scheduling team will reach out soon to lock in a time." Do NOT create an appointment. Move to ENDING THE CONVERSATION.
-→ SKIP STEP 3.
+→ SKIP OTHER APPOINTMENTS ON THIS JOB.
 `;
 
 const ARRIVAL_WINDOW = (d) => `${BAR}
 ARRIVAL WINDOW
 ${BAR}
 
-Send this after every confirm, reschedule, or create${d.serviceLineDescriptions.length ? " — right after onsite expectations and the noise/access question (see ONSITE EXPECTATIONS above)" : ""} — before STEP 3 or SERVICE LINK.
+Send this after every confirm, reschedule, or create${d.hasOnsiteContent ? " — right after onsite expectations and the noise/access question (see ONSITE EXPECTATIONS above)" : ""} — before ${d.nextAfterConfirmation}.
 
 ${d.next?.arrival_window_spoken
   ? `Use the pre-computed window — ${d.next.arrival_window_spoken}${d.zone ? ` ${d.zone}` : ""} — do not calculate it yourself. The tech arrives within one hour AFTER the scheduled time — never earlier than scheduled.`
@@ -548,28 +613,33 @@ The customer just clicked a button in the chat widget. Call ${d.cardTriggerTool}
 This is the entire turn — call nothing else, say nothing else.
 `;
 
-const STEP_3 = (d) => `${BAR}
-STEP 3 — REMAINING APPOINTMENTS
+const OTHER_APPOINTMENTS = (d) => `${BAR}
+OTHER APPOINTMENTS ON THIS JOB
 ${BAR}
 
-Required before ending — but only when there are other upcoming appointments on this job that are still unconfirmed.
+Applies only when other upcoming appointments on this job are still
+unconfirmed after you've handled the one just discussed.
 
-Ask once: "Before we wrap up — you've also got [N] other visit(s) coming up: [date + service, one per line]. Would you like to confirm those too?"
+Every appointment is already visible to the customer as its own card in the
+chat widget — you do not need to recite dates and services one by one the
+way you would if they weren't. Before ending the conversation, check in
+naturally, once: "You've also got [N] other visit(s) coming up on this
+job — want to confirm those too while we're at it?" (Use the real count and,
+if it helps, name one or two — never just "the rest.")
 
-→ All of them: send "One moment while I confirm all of those for you." then call confirm_job_appointments with job_id=${d.jobId} and confirm_all=true. Once done: "Perfect — everything on this job is confirmed now."
-→ Some of them: send "Give me just a moment." then call confirm_job_appointments with appointment_ids for those only. Once done: read back what's confirmed and what's still open.
-→ Not now: "No problem — our team will check in closer to the time." Do not push further or ask again.
-→ They want to reschedule or cancel one: handle it as CASE A, then ask STEP 3 again for anything still unconfirmed.
+→ All of them: send "One moment while I confirm all of those for you." then call confirm_job_appointments with job_id=${d.jobId} and confirm_all=true.
+→ Some of them: call confirm_job_appointments with appointment_ids for those only.
+→ They want to reschedule or cancel one instead: handle it as CASE A, then check in again for anything still unconfirmed.
+→ Not now, or no real answer either way: call decline_remaining_appointments once. This records that they had the chance and closes the loop — it does NOT mean anything was cancelled or declined, just that nothing further is happening in this conversation right now. Do not ask again after this.
 
-Skip STEP 3 entirely if: there are no other upcoming appointments, or every other one is already confirmed.
-Do not end the conversation until STEP 3 is handled or confirmed not applicable.
+Skip this section entirely if every other upcoming appointment is already confirmed.
 `;
 
 const SERVICE_LINK = (d) => `${BAR}
 SERVICE LINK
 ${BAR}
 
-Send the service link after every confirmation. This is a step, not an offer — don't ask whether they want it. Tell them they'll get a link to follow the job, then confirm the address and send it. If they explicitly decline, respect that and move on.
+Ask after every confirmation — this is an OFFER, not an automatic step: "Would you like me to email you a link to follow this job?" If they say no, respect that and move on without pushing again this conversation. Only proceed with the steps below once they say yes.
 
 ${d.recipientEmail
   ? `1. Read the email back rather than asking blind: "I have your email as ${d.recipientEmail} — is that the right one to send it to?" If the address is at all unusual, confirm it letter by letter.`
@@ -610,7 +680,7 @@ ${optLine(d.siteName, `- "${d.siteName}" is a location — always treat it as on
 - For job questions: use the description and team notes above. Anything beyond that — the team will follow up${d.companyPhone ? `, or they can reach us at ${d.companyPhone}` : ""}.
 - No pricing, contracts, or out-of-scope topics.
 - No fake errors. No invented data.
-- Do not end the conversation until STEP 3 is handled, the service link is sent, and "anything else?" has been asked and answered.`;
+- Do not end the conversation until other appointments on this job have been checked in on (see OTHER APPOINTMENTS ON THIS JOB)${d.hasServiceLink ? ", the service link has been offered (sent if they said yes, skipped if they said no — either way it's been asked)," : ","} and "anything else?" has been asked and answered.`;
 
 // ── assembly ────────────────────────────────────────────────────────────────
 
@@ -631,16 +701,25 @@ function build(ctx, opts = {}) {
     return join([ROLE(d), CONTACT_AND_JOB_DATA(d), CARD_TRIGGER_PROMPT(d)]);
   }
 
-  // STEP 3 asks about OTHER unconfirmed visits, so it needs a second one to
-  // exist. CASE A and ARRIVAL WINDOW both point at it, and read `showStep3`
-  // so they never send the model to a section that isn't here.
-  d.showStep3 = d.counts.unconfirmed > 1;
+  // OTHER APPOINTMENTS ON THIS JOB asks about OTHER unconfirmed visits, so it
+  // needs a second one to exist. CASE A and ARRIVAL WINDOW both point at it,
+  // and read `showOtherAppointments` so they never send the model to a
+  // section that isn't here.
+  d.showOtherAppointments = d.counts.unconfirmed > 1;
+  // Where CASE A/B send the model once a confirm/reschedule wraps up —
+  // computed once here (needs showOtherAppointments, itself only known
+  // after derive() returns) rather than repeating the same three-way
+  // ternary in every branch that points forward.
+  d.nextAfterConfirmation = d.showOtherAppointments
+    ? "OTHER APPOINTMENTS ON THIS JOB"
+    : (d.hasServiceLink ? "SERVICE LINK" : "ENDING THE CONVERSATION");
 
   return join([
     ROLE(d),
     d.siteName && SITE_IS_A_PLACE(d),
     CONVERSATION_SHAPE,
     CONTACT_AND_JOB_DATA(d),
+    CONFIRMER_IDENTITY(d),
     APPOINTMENT_DATA(d),
     STANDING_RULES(d),
     NOT_A_GOOD_TIME,
@@ -651,19 +730,25 @@ function build(ctx, opts = {}) {
       GOAL(d),
     ]),
 
+    d.workflow?.checklist && CHECKLIST(d),
     HANDLING_HEADER,
     CASE_A(d),
-    d.phase === "all_confirmed" && CASE_B,
+    d.phase === "all_confirmed" && CASE_B(d),
     d.phase === "no_appointment" && CASE_C(d),
 
     // Reference material for AFTER a visit is confirmed (see each CASE's own
     // pointer to it) — never part of the opening message. Positioned here,
     // alongside ARRIVAL WINDOW, rather than before HANDLING THE CONFIRMATION:
     // it is used FROM WITHIN that flow now, not as a gate ahead of it.
-    d.serviceLineDescriptions.length && ONSITE_EXPECTATIONS(d),
+    d.hasOnsiteContent && ONSITE_EXPECTATIONS(d),
     ARRIVAL_WINDOW(d),
-    d.showStep3 && STEP_3(d),
-    SERVICE_LINK(d),
+    d.showOtherAppointments && OTHER_APPOINTMENTS(d),
+    // A CRM with no customer-facing job-tracking link (workflow.capabilities.
+    // serviceLink === false) never gets this section — matches
+    // registry.js's getToolsForPhase withholding the two service-link tools
+    // for the same workflow, so the prompt and the tool surface never
+    // disagree about whether this feature exists for this company.
+    d.hasServiceLink && SERVICE_LINK(d),
     ENDING,
     GENERAL_RULES(d),
   ]);

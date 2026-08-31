@@ -646,7 +646,9 @@ const TECHNICIAN_JOB_TYPES = [
  * calendar month — e.g. today = Aug 3 → only jobs scheduled through Aug 31,
  * NOT a rolling 30-day window that would spill into September. Callers can
  * override with an explicit `scheduleDateFrom`/`scheduleDateTo` (unix
- * seconds) for a custom window instead (e.g. backfilling a past month).
+ * seconds) for a custom window instead (e.g. backfilling a past month) — a
+ * custom window is a *windowed full* pull: runSync drops the updatedAfter
+ * cursor for it and freezes the cursor afterwards (see runSync).
  * `type` (technician-site-visit job types — see TECHNICIAN_JOB_TYPES) and
  * `status=scheduled` always apply, full sync or not — only the date window
  * is omitted when `full` is true, same convention as buildServiceRequestParams.
@@ -690,6 +692,10 @@ async function runSync(companyId, options = {}) {
   // sync nothing, never silently fall through to the whole month window, which
   // is what a webhook drain that resolved no job ids would otherwise trigger.
   const targeted = Array.isArray(options.jobIds);
+  // An explicit scheduleDateFrom/To replaces the default current-calendar-month
+  // window. That makes the run a *windowed full* pull rather than an
+  // incremental one — see the cursor handling at the end of this function.
+  const customWindow = !targeted && (options.scheduleDateFrom != null || options.scheduleDateTo != null);
   // Kept as STRINGS. ServiceTrade ids are ~2.3e15 — Number() is exact there
   // today but only just, and a silently rounded id would fetch the wrong job.
   // The id is only ever interpolated into a URL path, so nothing needs it
@@ -717,7 +723,10 @@ async function runSync(companyId, options = {}) {
   // their own anymore — they're derived from the jobs/appointments fetches.
   const complete = { jobs: true, appointments: true, serviceRequests: true };
 
-  logger.info("ServiceTrade sync starting", { companyId, mode: full ? "full" : "incremental", range });
+  logger.info("ServiceTrade sync starting", {
+    companyId, mode: full ? "full" : "incremental", range, customWindow,
+    ...(customWindow ? { scheduleDateFrom: options.scheduleDateFrom, scheduleDateTo: options.scheduleDateTo } : {}),
+  });
 
   try {
     // --- Jobs: ids (/job) → full detail per job (/job/{id}) ----------------
@@ -738,6 +747,11 @@ async function runSync(companyId, options = {}) {
     // window instead. A full sync still fetches every scheduled job
     // regardless of date, same convention as /servicerequest.
     //
+    // A custom window deliberately drops the updatedAfter cursor: a backfill
+    // asking for July AND "updated since yesterday" returns nearly nothing,
+    // which is the opposite of what the caller asked for. The window itself is
+    // the scope, so the whole window is re-pulled.
+    //
     // options.jobIds skips this list call entirely and syncs exactly those job
     // ids — the webhook path, where ServiceTrade has already told us WHICH job
     // changed. Everything downstream is untouched: the whole graph around a job
@@ -755,7 +769,7 @@ async function runSync(companyId, options = {}) {
       logger.info("ServiceTrade sync: fetching jobs", { companyId });
       ({ rows: jobStubs, complete: jobListComplete } = await fetchAllPages(companyId, "/job", "jobs", credentials, {
         ...buildJobParams({ full, scheduleDateFrom: options.scheduleDateFrom, scheduleDateTo: options.scheduleDateTo }),
-        ...(full ? {} : cursorParams(state?.last_jobs_updated_at)),
+        ...(full || customWindow ? {} : cursorParams(state?.last_jobs_updated_at)),
       }));
     }
     complete.jobs = jobListComplete;
@@ -1237,13 +1251,22 @@ async function runSync(companyId, options = {}) {
       return { success: true, counts, incomplete, targeted: true };
     }
 
+    // A custom-window run touches NO cursor and NO last_sync_at, for the same
+    // reason a targeted run doesn't: it covered one date window, not
+    // "everything up to now". Advancing last_jobs_updated_at after a July-only
+    // backfill would tell the next incremental run that every change up to this
+    // moment is handled, silently dropping every job OUTSIDE the window that
+    // changed since the last real sync. last_sync_at is likewise the UI's
+    // "everything is up to date as of then", which a backfill did not earn.
+    // The status/error fields ARE written — the run genuinely succeeded or
+    // failed and that's worth surfacing.
     await syncDb.updateSyncState(companyId, {
-      last_sync_at:                  now,
-      last_full_sync_at:             full ? now : (state?.last_full_sync_at ?? null),
+      last_sync_at:                  customWindow ? undefined : now,
+      last_full_sync_at:             customWindow ? undefined : (full ? now : (state?.last_full_sync_at ?? null)),
       last_sync_status:              incomplete.length ? "partial" : "success",
       last_sync_error:               incomplete.length ? `Incomplete entities (cursor not advanced): ${incomplete.join(", ")}` : null,
-      last_jobs_updated_at:          complete.jobs          ? now : undefined,
-      last_appointments_updated_at:  complete.appointments  ? now : undefined,
+      last_jobs_updated_at:          (customWindow || !complete.jobs)         ? undefined : now,
+      last_appointments_updated_at:  (customWindow || !complete.appointments) ? undefined : now,
       // Deliberately NOT advanced while the /servicerequest fetch is disabled
       // above: bumping a cursor for an entity we never fetched would mean a
       // future re-enable resumes past everything that changed in the
@@ -1257,9 +1280,9 @@ async function runSync(companyId, options = {}) {
     if (incomplete.length) {
       logger.warn("ServiceTrade sync partially incomplete — will retry these entities next run", { companyId, incomplete, counts });
     } else {
-      logger.info("ServiceTrade sync done", { companyId, counts, mode: full ? "full" : "incremental" });
+      logger.info("ServiceTrade sync done", { companyId, counts, mode: full ? "full" : "incremental", customWindow });
     }
-    return { success: true, counts, incomplete };
+    return { success: true, counts, incomplete, ...(customWindow ? { customWindow: true } : {}) };
   } catch (err) {
     logger.error("ServiceTrade sync error", { companyId, error: err.message });
     await syncDb.updateSyncState(companyId, {

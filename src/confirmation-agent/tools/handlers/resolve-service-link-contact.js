@@ -1,22 +1,21 @@
 /**
- * Resolve who a ServiceTrade "service link" should be sent to — mirrors
- * retell-tools.js's POST /resolve_service_link_contact exactly: ALWAYS
- * searches by email first (never trusts the model to self-sequence "search,
- * then only ask if not found"), and only creates a new ServiceTrade contact
- * when no match exists and the model has supplied a name.
+ * Resolve who a ServiceTrade "service link" should be sent to. Thin LLM-tool
+ * wrapper over actions.js's sendServiceLinkCore, with the email-confirmation
+ * gate kept HERE (not in the core function) — the core function has no
+ * `emailConfirmed` parameter at all, since the deterministic card-driven path
+ * (POST /:token/messages, trigger: "send_service_link") only ever forces
+ * `email_confirmed: true` via `ctx.cardTriggerArgs`, because the frontend's
+ * own UI-level Yes/No step already happened before that call was ever made —
+ * reaching this tool at all, on that path, IS the confirmation. The LLM path
+ * still needs the gate, because free text is exactly the unreliable input
+ * this whole feature exists to route around.
  *
- * `threadId` (the chat_links token) plays the same role `retellCallId` plays
- * in the original tool — an opaque per-conversation key for
- * service_link_messages, unrelated to Retell.
+ * `ctx.cardTriggerArgs` wins over the model's args on a card-driven turn —
+ * the real values are already 100% known from the request body.
  */
 const { z } = require("zod");
-const db = require("../../../db");
-const serviceLink = require("../../../services/servicetrade-service-link");
-const serviceLinkMessagesDb = require("../../../db/service-link-messages");
-const chatLinksDb = require("../../../db/chat-links");
-const { toE164 } = require("../../../utils/phone");
+const { sendServiceLinkCore } = require("../../actions");
 const logger = require("../../../utils/logger");
-const { maybeSendServiceLinkNow } = require("../service-link-helpers");
 
 const schema = z.object({
   email: z.string().describe("The email address to send the service link to."),
@@ -29,18 +28,16 @@ const schema = z.object({
   phone: z.string().nullish(),
 });
 
-async function run({ email, email_confirmed, first_name, last_name, role, phone }, config) {
-  const { companyId, jobId, threadId, jobRef, customerRef } = config?.configurable?.ctx || {};
+async function run(modelArgs, config) {
+  const { companyId, jobId, threadId, jobRef, customerRef, cardTriggerArgs } = config?.configurable?.ctx || {};
+  const { email, email_confirmed, first_name, last_name, role, phone } = { ...modelArgs, ...(cardTriggerArgs || {}) };
 
   // Hard gate, deliberately ahead of the CRM search. An unconfirmed address is
   // not just a bad send target — this tool CREATES a ServiceTrade contact when
   // nothing matches, so acting on a guess writes a junk contact into the
-  // customer's CRM and mails a job link to whoever owns that address. The
-  // prompt also asks for confirmation, but a prompt is advisory; this is not.
+  // customer's CRM and mails a job link to whoever owns that address.
   if (email_confirmed !== true) {
-    logger.info("resolve_service_link_contact: refused, email not confirmed by the customer", {
-      companyId, jobId, threadId,
-    });
+    logger.info("resolve_service_link_contact: refused, email not confirmed by the customer", { companyId, jobId, threadId });
     return JSON.stringify({
       status: "needs_email_confirmation",
       email,
@@ -51,49 +48,21 @@ async function run({ email, email_confirmed, first_name, last_name, role, phone 
     });
   }
 
-  const candidates = await serviceLink.searchContacts(companyId, email);
-  const exactMatch = candidates.find((c) => c.email && c.email.toLowerCase() === email.toLowerCase());
-  const match = exactMatch || (candidates.length === 1 ? candidates[0] : null);
-
-  let contactId, contactName, status, contactPhone;
-  if (match) {
-    contactId = match.id;
-    contactName = [match.firstName, match.lastName].filter(Boolean).join(" ") || null;
-    contactPhone = match.phone || null;
-    status = "found";
-  } else if (first_name || last_name) {
-    const companyIds = /^\d+$/.test(String(customerRef)) ? [Number(customerRef)] : [];
-    const locRaw = jobRef
-      ? (await db.query(
-          `SELECT payload->'location'->>'id' AS loc FROM servicetrade_jobs WHERE company_id = $1 AND servicetrade_id = $2 LIMIT 1`,
-          [companyId, jobRef]
-        )).rows[0]?.loc
-      : null;
-    const locationIds = locRaw && /^\d+$/.test(String(locRaw)) ? [Number(locRaw)] : [];
-    const created = await serviceLink.createContact(companyId, {
-      firstName: first_name, lastName: last_name, email, phone, role, companyIds, locationIds,
-    });
-    if (!created) return JSON.stringify({ success: false, error: "Failed to create contact in ServiceTrade" });
-    contactId = created.id;
-    contactName = [created.firstName, created.lastName].filter(Boolean).join(" ") || null;
-    contactPhone = phone || null;
-    status = "created";
-  } else {
-    if (threadId) await chatLinksDb.setStateByToken(threadId, "collecting_contact_info").catch(() => {});
-    logger.info("ConfirmationAgent tool: resolve_service_link_contact — no match, more info needed", { companyId, email });
-    return JSON.stringify({ success: true, status: "need_more_info", email });
-  }
-
-  const normalizedPhone = toE164(phone) || toE164(contactPhone);
-  await serviceLinkMessagesDb.setRecipient({
-    companyId, scheduledCallId: null, retellCallId: threadId,
-    jobExternalRef: jobRef || null, contactId: String(contactId), email, phone: normalizedPhone,
+  const result = await sendServiceLinkCore({
+    companyId, jobId, threadId, jobRef, customerRef, email,
+    firstName: first_name, lastName: last_name, role, phone,
   });
-
-  const sendResult = await maybeSendServiceLinkNow(companyId, threadId, jobRef, jobId);
-  logger.info("ConfirmationAgent tool: resolve_service_link_contact", { companyId, status, contactId: String(contactId), linkSent: sendResult?.sent });
-
-  return JSON.stringify({ success: true, status, contact_id: String(contactId), name: contactName, email, link_sent: !!sendResult?.sent });
+  // The core function's need_more_info shape has no `success` key parity issue
+  // for the LLM path specifically — the ORIGINAL tool returned success:true
+  // there (it isn't a failure, just an intermediate step), unlike the old
+  // REST route which treated it as ok:false. Preserve the LLM-facing shape,
+  // but pass `fields_needed` through too (harmless additive field for the
+  // free-text path, and needed by the card-driven path so the frontend knows
+  // which follow-up fields to collect without hardcoding them).
+  if (result.status === "need_more_info") {
+    return JSON.stringify({ success: true, status: "need_more_info", email, fields_needed: result.fields_needed });
+  }
+  return JSON.stringify(result);
 }
 
 module.exports = {

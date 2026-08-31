@@ -34,7 +34,11 @@ const { getToolsForPhase, byName } = require("../tools/registry");
 const { buildJobConfirmationContext } = require("../../services/job-confirmation-context");
 const { logCall } = require("../../db/llm-call-logs");
 const serviceLineDescriptionsDb = require("../../db/service-line-descriptions");
+const onsiteInstructionsDb = require("../../db/onsite-instructions");
+const { resolveSlugForCompany } = require("../../services/crm");
+const { getWorkflow } = require("../workflows");
 const db = require("../../db");
+const { PROPOSE_REMAINING_TRIGGER, parseCardTrigger } = require("../actions");
 const logger = require("../../utils/logger");
 
 const ConfirmationState = Annotation.Root({
@@ -50,6 +54,16 @@ const ConfirmationState = Annotation.Root({
   // actually involves (see migrations/084) — small, static-ish company data,
   // cheap to refresh alongside jobCtx every turn.
   serviceLineDescriptions: Annotation({ reducer: (_prev, next) => next ?? _prev, default: () => [] }),
+  // Company's structured onsite instructions (migrations/101) — general +
+  // per-service-line, unfiltered; prompt.js's derive() matches them against
+  // the current appointment's own service_line. Same refresh cadence as
+  // serviceLineDescriptions above.
+  onsiteInstructions: Annotation({ reducer: (_prev, next) => next ?? _prev, default: () => [] }),
+  // Which CRM this company uses (services/crm's <slug>_integration
+  // resolution) — resolves which confirmation-agent/workflows/*.js module
+  // shapes this turn's prompt/tool surface. Refreshed alongside jobCtx
+  // (cheap, and a company could in principle switch CRMs mid-conversation).
+  workflowSlug: Annotation({ reducer: (_prev, next) => next ?? _prev, default: () => "servicetrade" }),
 });
 
 function phaseFromContext(ctx) {
@@ -97,10 +111,16 @@ async function getGraph() {
 async function buildGraph() {
   async function loadContext(_state, config) {
     const { companyId, jobId, threadId, linkAppointmentId } = config?.configurable?.ctx || {};
-    const ctx = await buildJobConfirmationContext(companyId, jobId);
-    const confirmedByOtherLabel = await resolveConfirmedByOther(companyId, linkAppointmentId, threadId);
-    const serviceLineDescriptions = await serviceLineDescriptionsDb.listByCompany(companyId);
-    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions };
+    // None of these three depend on each other's result — run concurrently
+    // rather than paying for three sequential round trips on every turn.
+    const [ctx, confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug] = await Promise.all([
+      buildJobConfirmationContext(companyId, jobId),
+      resolveConfirmedByOther(companyId, linkAppointmentId, threadId),
+      serviceLineDescriptionsDb.listByCompany(companyId),
+      onsiteInstructionsDb.listByCompany(companyId),
+      resolveSlugForCompany(companyId),
+    ]);
+    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug };
   }
 
   async function agentNode(state, config) {
@@ -111,7 +131,37 @@ async function buildGraph() {
     // trigger message, so the opening-greeting instruction never resurfaces
     // mid-conversation.
     const isOpeningTurn = !state.messages.some((m) => (m._getType?.() || m.type) === "ai");
-    const tools = getToolsForPhase(state.phase, { isOpeningTurn });
+
+    // True only on the ONE turn triggered right after a card-driven
+    // confirm/reschedule leaves other appointments unconfirmed — same
+    // "check the last message" structural pattern as isOpeningTurn above.
+    const lastMessage = state.messages[state.messages.length - 1];
+    const lastMessageType = lastMessage?._getType?.() || lastMessage?.type;
+    const lastMessageContent = lastMessageType === "human" && typeof lastMessage.content === "string" ? lastMessage.content : "";
+    const isProposeRemainingTurn = lastMessageContent === PROPOSE_REMAINING_TRIGGER;
+
+    // A card button (confirm/reschedule/cancel/bulk-confirm/decline-remaining)
+    // routed through the agent for real — see actions.js's CARD_TRIGGER_PREFIX.
+    // The tool name travels in the marker; its real argument values travel
+    // separately via ctx.cardTriggerArgs (never trust the model to relay
+    // them faithfully — see the promoted tool handlers).
+    const cardTriggerTool = parseCardTrigger(lastMessageContent);
+
+    // Whichever of the two applies (never both — each is its own distinct
+    // trigger message) becomes the ONE tool bound to the model this turn,
+    // both for what's OFFERED (registry.js) and, critically, for what the
+    // API is told to FORCE (model.js's tool_choice) — binding alone doesn't
+    // guarantee the model actually calls it; forcing does.
+    const exclusiveTool = isProposeRemainingTurn ? "propose_remaining_appointments" : cardTriggerTool;
+
+    // Which CRM's chat workflow shapes this turn — resolved once in
+    // load_context/recompute_context (a real DB check), read here every
+    // turn. Falls back to ServiceTrade if somehow unset (getWorkflow's own
+    // fallback), never to an error — a workflow lookup must never be able
+    // to break a live turn.
+    const workflow = getWorkflow(state.workflowSlug);
+
+    const tools = getToolsForPhase(state.phase, { isOpeningTurn, exclusiveTool, workflow });
     // state.jobCtx (buildJobConfirmationContext's raw result) has no `phase`
     // field of its own — phase is a separate Annotation this graph computes
     // alongside it (phaseFromContext) — so it must be merged in explicitly;
@@ -121,20 +171,30 @@ async function buildGraph() {
       companyPhone: ctx.companyPhone,
       representativeName: ctx.representativeName,
       isOpeningTurn,
+      isProposeRemainingTurn,
+      cardTriggerTool,
+      cardTriggerArgs: ctx.cardTriggerArgs || null,
       confirmedByOtherLabel: state.confirmedByOtherLabel,
       serviceLineDescriptions: state.serviceLineDescriptions,
+      onsiteInstructions: state.onsiteInstructions,
       recipientName: ctx.recipientName,
       recipientEmail: ctx.recipientEmail,
       recipientPhone: ctx.recipientPhone,
+      confirmedBy: ctx.confirmedBy || null,
+      workflow,
     }));
-    const message = await invokeWithFailover(tools, [sys, ...state.messages], config, ctx);
+    const message = await invokeWithFailover(tools, [sys, ...state.messages], config, ctx, exclusiveTool);
 
     // The human message that triggered THIS call — only present when this is
     // the first LLM call of a turn; a tool-loop re-invocation's last prior
     // message is a ToolMessage instead, so humanMessage stays null there.
     const lastPrior = state.messages[state.messages.length - 1];
     const lastPriorType = lastPrior?._getType?.() || lastPrior?.type;
-    await logCall({
+    // Fire-and-forget — pure telemetry that nothing downstream this turn
+    // reads, same precedent as actions.js's CRM mirror calls. Awaiting this
+    // put a DB insert directly in the customer-visible response path for no
+    // benefit; a failure here already only warns, never fails the turn.
+    logCall({
       companyId: ctx.companyId,
       jobId: ctx.jobId,
       threadId: ctx.threadId,
@@ -163,13 +223,32 @@ async function buildGraph() {
 
   // After tools run, check whether the AI message that triggered them called
   // end_conversation — if so, stop here instead of looping back to agent.
+  // propose_remaining_appointments stops the same way unconditionally: it's
+  // bound EXCLUSIVELY (registry.js), so it's never called any other way.
+  //
+  // The card-trigger tools (confirm_appointment/reschedule_appointment/
+  // cancel_appointment/confirm_job_appointments/decline_remaining_appointments/
+  // capture_confirmer_identity) are DIFFERENT: the same names are also real
+  // free-text tools, called during a normal conversation where looping back
+  // is required (deliver the arrival window, offer the service link, check
+  // in on other appointments on the job...). Stopping unconditionally on
+  // those names would break that flow. So this checks the
+  // message that actually STARTED this agent turn — a card-trigger marker
+  // means it was single-shot; a normal customer message or a mid-loop
+  // ToolMessage means it wasn't.
   function afterTools(state) {
     const messages = state.messages;
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       const isAiWithCalls = (m?._getType?.() === "ai" || m?.type === "ai") && Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
       if (isAiWithCalls) {
-        return m.tool_calls.some((tc) => tc.name === "end_conversation") ? END : "recompute_context";
+        const names = m.tool_calls.map((tc) => tc.name);
+        if (names.includes("end_conversation") || names.includes("propose_remaining_appointments")) return END;
+
+        const prior = messages[i - 1];
+        const priorType = prior?._getType?.() || prior?.type;
+        const priorContent = priorType === "human" && typeof prior.content === "string" ? prior.content : "";
+        return parseCardTrigger(priorContent) ? END : "recompute_context";
       }
     }
     return "recompute_context";
@@ -186,10 +265,14 @@ async function buildGraph() {
 
   async function recomputeContext(_state, config) {
     const { companyId, jobId, threadId, linkAppointmentId } = config?.configurable?.ctx || {};
-    const ctx = await buildJobConfirmationContext(companyId, jobId);
-    const confirmedByOtherLabel = await resolveConfirmedByOther(companyId, linkAppointmentId, threadId);
-    const serviceLineDescriptions = await serviceLineDescriptionsDb.listByCompany(companyId);
-    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions };
+    const [ctx, confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug] = await Promise.all([
+      buildJobConfirmationContext(companyId, jobId),
+      resolveConfirmedByOther(companyId, linkAppointmentId, threadId),
+      serviceLineDescriptionsDb.listByCompany(companyId),
+      onsiteInstructionsDb.listByCompany(companyId),
+      resolveSlugForCompany(companyId),
+    ]);
+    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug };
   }
 
   const checkpointer = await getCheckpointer();

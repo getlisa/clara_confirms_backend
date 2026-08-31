@@ -71,7 +71,7 @@ router.get("/", async (req, res) => {
        FROM scheduled_calls sc
        LEFT JOIN jobs j ON j.id::text = sc.job_id AND j.company_id = sc.company_id
        WHERE ${conditions.join(" AND ")}
-       ORDER BY sc.scheduled_at ASC, sc.created_at DESC
+       ORDER BY sc.scheduled_at DESC, sc.created_at DESC
        LIMIT $${i++} OFFSET $${i}`,
       values
     );

@@ -16,6 +16,7 @@ const syncDb = require("../db/servicetrade-sync");
 const { syncAccountTimezone } = require("../services/servicetrade-account");
 const webhookRegistration = require("../services/servicetrade-webhook-registration");
 const webhookProcessor = require("../services/servicetrade-webhook-processor");
+const { getCompanyTimezone, localToUTC } = require("../utils/timezone");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -209,9 +210,80 @@ router.delete("/session", async (req, res) => {
 });
 
 /**
+ * Longest custom sync window we accept, in inclusive days. 31 so that any
+ * single calendar month is always a valid range (2026-07-01..2026-07-31), while
+ * a wider pull still has to go through full=true.
+ */
+const MAX_SYNC_RANGE_DAYS = 31;
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** True only for a real calendar date — rejects 2026-02-30, 2026-13-01, etc. */
+function isCalendarDate(str) {
+  if (!DATE_RE.test(str)) return false;
+  const [y, m, d] = str.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+/**
+ * Resolve ?startDate/?endDate (YYYY-MM-DD, meant in the COMPANY's timezone)
+ * into the unix-second scheduleDateFrom/scheduleDateTo that ServiceTrade's
+ * /job filter takes. The range is inclusive of both days: startDate 00:00:00
+ * local through endDate 23:59:59 local.
+ *
+ * Returns { error } on bad input (caller turns it into a 400), {} when neither
+ * param was given (the default current-calendar-month window stays in effect),
+ * or { scheduleDateFrom, scheduleDateTo }.
+ *
+ * Unlike the `range` param above, bad input is rejected rather than silently
+ * defaulted — a backfill that quietly syncs the wrong month is worse than one
+ * that fails loudly.
+ */
+async function resolveSyncRange(companyId, { startDate, endDate, full }) {
+  if (!startDate && !endDate) return {};
+  if (!startDate || !endDate) {
+    return { error: "startDate and endDate must be provided together" };
+  }
+  if (!isCalendarDate(startDate) || !isCalendarDate(endDate)) {
+    return { error: "Invalid date: expected YYYY-MM-DD" };
+  }
+  if (endDate < startDate) {
+    return { error: "endDate must be on or after startDate" };
+  }
+  // Day span is counted on the plain date strings, in UTC — a DST transition
+  // shifts wall-clock hours, never the number of calendar days between two
+  // dates, so this must NOT be derived from the converted epochs below.
+  const spanDays =
+    (Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86_400_000 + 1;
+  if (spanDays > MAX_SYNC_RANGE_DAYS) {
+    return { error: `Date range cannot exceed ${MAX_SYNC_RANGE_DAYS} days` };
+  }
+  // full=true makes buildJobParams drop the date window entirely (it pulls every
+  // scheduled job regardless of date), so the two together are contradictory.
+  if (full) {
+    return { error: "full=true cannot be combined with a custom date range" };
+  }
+
+  const tz = await getCompanyTimezone(companyId);
+  return {
+    scheduleDateFrom: Math.floor(new Date(localToUTC(`${startDate}T00:00:00`, tz)).getTime() / 1000),
+    scheduleDateTo:   Math.floor(new Date(localToUTC(`${endDate}T23:59:59`, tz)).getTime() / 1000),
+  };
+}
+
+/**
  * POST /integrations/servicetrade/sync?full=true&range=week|month|3month
+ *      &startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
  * Run full or incremental sync. full=true forces full sync and resets last_sync_at.
  * range controls the /servicerequest fetch window (default month).
+ *
+ * startDate/endDate (both or neither, company-local dates, inclusive, at most
+ * 31 days apart) replace the default current-calendar-month job window — e.g.
+ * backfilling a past month. A custom window re-pulls that whole window rather
+ * than only what changed since the last sync, and deliberately leaves the
+ * incremental cursors and last_sync_at untouched (see runSync). Mutually
+ * exclusive with full=true.
  */
 router.post("/sync", async (req, res) => {
   const companyId = req.user.companyId;
@@ -220,8 +292,16 @@ router.post("/sync", async (req, res) => {
   const range = ["week", "month", "3month"].includes(req.query.range) ? req.query.range : "month";
 
   try {
+    const { error: rangeError, scheduleDateFrom, scheduleDateTo } = await resolveSyncRange(companyId, {
+      startDate: req.query.startDate ? String(req.query.startDate) : null,
+      endDate:   req.query.endDate   ? String(req.query.endDate)   : null,
+      full,
+    });
+    if (rangeError) return res.status(400).json({ error: rangeError });
+
     const engine = await crmSyncEngine.start({
       companyId, provider: "servicetrade", full, range, startedBy: req.user.id,
+      scheduleDateFrom, scheduleDateTo,
     });
 
     // Streaming mode: return runId + token immediately so the FE can subscribe

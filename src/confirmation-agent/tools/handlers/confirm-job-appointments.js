@@ -1,104 +1,29 @@
 /**
- * Batch-confirm several (or all) upcoming appointments on the current job —
- * mirrors retell-tools.js's POST /confirm_job_appointments. Kept as ONE tool
- * (not a client-side loop over confirm_appointment) for the same reason the
- * original has: one job-status recompute, and models drop writes across long
- * sequential tool chains.
+ * Batch-confirm several (or all) upcoming appointments on the current job.
+ * Thin LLM-tool wrapper over actions.js's bulkConfirmCore — called from
+ * free-text conversation and from a card-driven exclusive turn (POST
+ * /:token/messages with trigger: "confirm_job_appointments" routes through
+ * the agent for real — see actions.js's CARD_TRIGGER_PREFIX).
+ *
+ * `ctx.cardTriggerArgs` wins over the model's args on a card-driven turn —
+ * the real values are already 100% known from the request body.
  */
 const { z } = require("zod");
-const db = require("../../../db");
-const jobsDb = require("../../../db/jobs");
-const chatLinksDb = require("../../../db/chat-links");
-const { buildJobConfirmationContext } = require("../../../services/job-confirmation-context");
-const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
-const { maybeSendServiceLinkNow } = require("../service-link-helpers");
-const { resolveConfirmerLabel } = require("../confirmer-label");
-const confirmationEventsDb = require("../../../db/confirmation-events");
-const logger = require("../../../utils/logger");
+const { bulkConfirmCore } = require("../../actions");
 
 const schema = z.object({
   confirm_all: z.boolean().nullish().describe("true to confirm every remaining unconfirmed upcoming appointment on this job."),
   appointment_ids: z.array(z.union([z.string(), z.number()])).nullish().describe("Specific appointment ids to confirm, if not confirming all."),
 });
 
-async function run({ confirm_all, appointment_ids }, config) {
-  const { companyId, jobId, threadId, recipientContactId, jobRef, recipientName } = config?.configurable?.ctx || {};
-  const wantsAll = confirm_all === true;
-  const requestedIds = wantsAll ? [] : (appointment_ids || []).map((v) => String(v).trim()).filter(Boolean);
-  if (!wantsAll && requestedIds.length === 0) {
-    return JSON.stringify({ success: false, error: "Pass confirm_all=true or a non-empty appointment_ids list" });
-  }
-
-  const ctx = await buildJobConfirmationContext(companyId, jobId);
-  if (!ctx.ok) return JSON.stringify({ success: false, error: ctx.error });
-
-  const upcomingById = new Map(ctx.appointments.upcoming.map((a) => [String(a.appointment_id), a]));
-  const targets = [];
-  const skipped = [];
-
-  if (wantsAll) {
-    targets.push(...ctx.appointments.upcoming.filter((a) => !a.customer_confirmed));
-  } else {
-    for (const id of requestedIds) {
-      const appt = upcomingById.get(id);
-      if (!appt) skipped.push({ appointment_id: id, reason: "not_an_upcoming_appointment_on_this_job" });
-      else if (appt.customer_confirmed) skipped.push({ appointment_id: id, reason: "already_confirmed" });
-      else targets.push(appt);
-    }
-  }
-
-  if (targets.length) {
-    const ids = targets.map((a) => a.appointment_id);
-    await jobsDb.bulkConfirmAppointments(companyId, ids);
-
-    // Same jsonb-merge convention as confirm-appointment.js — record which
-    // conversation/recipient confirmed these, without clobbering existing
-    // additional_information (ServiceTrade sync metadata etc.).
-    const confirmedByLabel = await resolveConfirmerLabel(companyId, recipientContactId);
-    await db.query(
-      `UPDATE appointments
-          SET additional_information = COALESCE(additional_information, '{}'::jsonb)
-                || jsonb_build_object('confirmed_by_thread_id', $1::text, 'confirmed_by_label', $2::text),
-              updated_at = NOW()
-        WHERE company_id = $3 AND id = ANY($4::int[])`,
-      [threadId, confirmedByLabel, companyId, ids]
-    );
-  }
-
-  if (targets.length && threadId) await chatLinksDb.setStateByToken(threadId, "confirmation_accepted").catch(() => {});
-
-  // One ledger row PER appointment — the daily report's Confirmed sheet is
-  // row-per-visit, and a batch confirm of 3 appointments is 3 separate outcomes,
-  // not one. See confirm-appointment.js for why call_type is hardcoded here.
-  await Promise.all(targets.map((a) => confirmationEventsDb.recordSafe({
-    companyId, eventType: "confirmed", channel: "chat", callType: "customer_confirmation",
-    jobId: ctx.job.id, appointmentId: a.appointment_id,
-    actorName: recipientName || null, source: threadId,
-  })));
-
-  const jobStatus = targets.length ? await syncJobConfirmationStatus(companyId, ctx.job.id) : ctx.job.status;
-
-  // Mirrors confirm_appointment and the voice path: confirming is one of the
-  // two preconditions for the service link, so the send has to be attempted
-  // here too. Idempotent, and a no-op when no recipient has been captured yet.
-  const linkSend = targets.length
-    ? await maybeSendServiceLinkNow(companyId, threadId, jobRef, ctx.job.id)
-    : null;
-
-  logger.info("ConfirmationAgent tool: confirm_job_appointments", {
-    companyId, jobId, confirmAll: wantsAll, confirmed: targets.length, skipped: skipped.length, jobStatus,
-    serviceLink: linkSend?.reason || (linkSend?.sent ? "sent" : null),
+async function run(modelArgs, config) {
+  const { companyId, jobId, threadId, recipientContactId, jobRef, recipientName, confirmedBy, cardTriggerArgs } = config?.configurable?.ctx || {};
+  const { confirm_all, appointment_ids } = { ...modelArgs, ...(cardTriggerArgs || {}) };
+  const result = await bulkConfirmCore({
+    companyId, jobId, threadId, recipientContactId, jobRef, recipientName, confirmedBy,
+    confirmAll: confirm_all === true, appointmentIds: appointment_ids || [],
   });
-
-  return JSON.stringify({
-    success: true,
-    confirmed: targets.map((a) => a.appointment_id),
-    skipped,
-    job_status: jobStatus,
-    service_link_sent: linkSend?.sent === true,
-    service_link_pending_reason: linkSend?.sent ? null : (linkSend?.reason ?? null),
-    ...(targets.length === 0 && { message: "Nothing left to confirm — those appointments were already confirmed." }),
-  });
+  return JSON.stringify(result);
 }
 
 module.exports = {

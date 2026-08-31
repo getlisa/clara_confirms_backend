@@ -141,24 +141,33 @@ async function sendServiceLink(companyId, { contactId, jobExternalRef }) {
 
 /**
  * Mint the customer-facing ServiceTrade job-summary URL for a job — the same
- * link ServiceTrade's own emailed "Service Link" template points to. Used
- * both by the get_service_link tool (to display/paste the URL in a chat) and
- * here, to text it via Twilio as the sms leg of sendRecordedServiceLink.
- * Real captured values (per plan): token = GET /token?jobId=&userId=,
- * link = https://app.servicetrade.com/customer/jobsummary?id=<token>.
+ * link ServiceTrade's own emailed "Service Link" template points to. Used by
+ * the get_service_link tool (to display/paste the URL in a chat), the sms leg
+ * of sendRecordedServiceLink below, and the appointment card's service-link
+ * badge.
+ *
+ * `contactExternalRef` — the ServiceTrade contact id of whoever this
+ * conversation is actually with — is the real, captured parameter
+ * (`GET /token?jobId=&contactId=`). Falls back to the older company-level
+ * `servicetrade_user_id` (`userId=`) only when no contact is resolvable (e.g.
+ * nobody's been captured yet for this conversation), so a caller without a
+ * contact on hand doesn't hard-fail.
  */
-async function mintServiceLinkUrl(companyId, jobExternalRef) {
-  const { rows: credRows } = await db.query(
-    `SELECT metadata->>'servicetrade_user_id' AS user_id FROM servicetrade_integration WHERE company_id = $1`,
-    [companyId]
-  );
-  const stUserId = credRows[0]?.user_id;
-  if (!stUserId) return { ok: false, error: "ServiceTrade user id not on file for this company" };
+async function mintServiceLinkUrl(companyId, jobExternalRef, contactExternalRef = null) {
+  let query;
+  if (contactExternalRef) {
+    query = `jobId=${encodeURIComponent(jobExternalRef)}&contactId=${encodeURIComponent(contactExternalRef)}`;
+  } else {
+    const { rows: credRows } = await db.query(
+      `SELECT metadata->>'servicetrade_user_id' AS user_id FROM servicetrade_integration WHERE company_id = $1`,
+      [companyId]
+    );
+    const stUserId = credRows[0]?.user_id;
+    if (!stUserId) return { ok: false, error: "No contact or ServiceTrade user id available to mint a service-link token" };
+    query = `jobId=${encodeURIComponent(jobExternalRef)}&userId=${encodeURIComponent(stUserId)}`;
+  }
 
-  const tokenRes = await stLoggedRequest(
-    companyId, "GET", `/token?jobId=${encodeURIComponent(jobExternalRef)}&userId=${encodeURIComponent(stUserId)}`,
-    { context: "serviceLink.token" }
-  );
+  const tokenRes = await stLoggedRequest(companyId, "GET", `/token?${query}`, { context: "serviceLink.token" });
   const token = tokenRes.data?.token || tokenRes.data?.id || (typeof tokenRes.data === "string" ? tokenRes.data : null);
   if (!tokenRes.ok || !token) {
     return { ok: false, error: "Failed to mint a service-link token", status: tokenRes.status };
@@ -233,30 +242,38 @@ async function sendRecordedServiceLink({ companyId, retellCallId, scheduledCallI
     return { sent: false, reason: "no_job_ref" };
   }
 
+  // Mint the customer-facing URL once, up front — `row.contact_id` is already
+  // ServiceTrade's own contact id (set by sendServiceLinkCore's contact
+  // search/create, not a platform id), so no extra lookup is needed. Reused
+  // for the SMS leg below AND persisted alongside the email send so the
+  // appointment card can show/link to the same URL without re-minting on
+  // every card fetch.
+  const minted = await mintServiceLinkUrl(companyId, row.job_external_ref, row.contact_id).catch((err) => {
+    logger.warn("service-link: could not mint URL", { companyId, retellCallId, error: err.message });
+    return { ok: false };
+  });
+
   // SMS leg — best-effort, independent of the email leg below. Doesn't affect
   // `status` (email via ServiceTrade's own API remains the authoritative,
   // todo-tracked channel); a phone-send failure just gets logged, never
   // raises a todo or fails the row.
   let smsSent = false;
-  if (row.phone) {
+  if (row.phone && minted.ok) {
     try {
-      const minted = await mintServiceLinkUrl(companyId, row.job_external_ref);
-      if (minted.ok) {
-        smsSent = await sendSms({ to: row.phone, body: `Here's your service link: ${minted.url}` });
-      } else {
-        logger.warn("service-link: could not mint URL for sms leg", { companyId, retellCallId, error: minted.error });
-      }
+      smsSent = await sendSms({ to: row.phone, body: `Here's your service link: ${minted.url}` });
     } catch (err) {
       logger.warn("service-link: sms leg failed", { companyId, retellCallId, error: err.message });
     }
+  } else if (row.phone) {
+    logger.warn("service-link: could not mint URL for sms leg", { companyId, retellCallId, error: minted.error });
   }
 
   try {
     const result = await sendServiceLink(companyId, { contactId: row.contact_id, jobExternalRef: row.job_external_ref });
     if (result.ok) {
-      await serviceLinkMessagesDb.markSent(row.id, result.messageId);
+      await serviceLinkMessagesDb.markSent(row.id, result.messageId, minted.ok ? minted.url : null);
       logger.info("service-link: sent OK", { companyId, retellCallId, messageId: result.messageId, contactId: row.contact_id, smsSent });
-      return { sent: true, messageId: result.messageId, smsSent };
+      return { sent: true, messageId: result.messageId, smsSent, url: minted.ok ? minted.url : null };
     }
     const err = JSON.stringify(result.messages || { status: result.status, failureCount: result.failureCount });
     await serviceLinkMessagesDb.markFailed(row.id, err);

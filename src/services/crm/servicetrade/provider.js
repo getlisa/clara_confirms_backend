@@ -56,10 +56,16 @@ class ServiceTradeProvider extends CrmProvider {
    * Pull from ServiceTrade, populate raw tables, then normalize into platform.
    * Optional `engine` (workflow-engine instance) receives state transitions
    * and progress events. When omitted (cron path), sync runs silently.
+   * Optional `scheduleDateFrom`/`scheduleDateTo` (unix seconds) replace the
+   * default current-calendar-month job window — see buildJobParams in
+   * servicetrade-sync.js.
    */
-  async syncAll(companyId, { full = false, engine = null, range = "month" } = {}) {
+  async syncAll(companyId, {
+    full = false, engine = null, range = "month",
+    scheduleDateFrom = null, scheduleDateTo = null,
+  } = {}) {
     try {
-      const rawResult = await stEngine.runSync(companyId, { full, engine, range });
+      const rawResult = await stEngine.runSync(companyId, { full, engine, range, scheduleDateFrom, scheduleDateTo });
       if (!rawResult.success) {
         return { ok: false, counts: rawResult.counts || {}, error: rawResult.error };
       }

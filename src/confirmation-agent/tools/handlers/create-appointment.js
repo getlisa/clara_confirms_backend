@@ -10,6 +10,7 @@ const stAppointments = require("../../../services/servicetrade-appointments");
 const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
 const { getCompanyTimezone, localToUTC } = require("../../../utils/timezone");
 const confirmationEventsDb = require("../../../db/confirmation-events");
+const { labelFromConfirmedBy } = require("../confirmer-label");
 const logger = require("../../../utils/logger");
 
 const schema = z.object({
@@ -18,7 +19,7 @@ const schema = z.object({
 });
 
 async function run({ scheduled_start, scheduled_end }, config) {
-  const { companyId, jobId, threadId, recipientName } = config?.configurable?.ctx || {};
+  const { companyId, jobId, threadId, recipientName, confirmedBy } = config?.configurable?.ctx || {};
   const tz = await getCompanyTimezone(companyId);
   const startUTC = localToUTC(scheduled_start, tz);
   const endUTC = scheduled_end
@@ -44,7 +45,7 @@ async function run({ scheduled_start, scheduled_end }, config) {
   await confirmationEventsDb.recordSafe({
     companyId, eventType: "created", channel: "chat", callType: "customer_confirmation",
     jobId: Number(jobId), appointmentId: appointment.id,
-    actorName: recipientName || null, source: threadId,
+    actorName: labelFromConfirmedBy(confirmedBy) || recipientName || null, source: threadId,
     details: { scheduled_start: startUTC },
   });
 

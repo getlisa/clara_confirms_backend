@@ -127,31 +127,51 @@ async function buildSmsLinkUrl(token, link) {
 
 /**
  * @param {object} params
- * @param {string} params.phone        — recipient, E.164
- * @param {string|null} params.customerName
+ * @param {string} params.phone               — recipient, E.164
+ * @param {string|null} [params.recipientName] — a real contact's name, only when known
+ * @param {string|null} [params.siteName]      — the property/location name
+ * @param {string|null} [params.customerName]  — the billing account name (last-resort greeting)
  * @param {string} params.companyName
- * @param {string|null} params.jobName
+ * @param {string|null} [params.jobName]
+ * @param {string|null} [params.serviceSummary] — short spoken service list for the next visit
  * @param {string} params.token        — chat_links token
  * @param {object|null} [params.link]  — the chat_links row, when the caller has
  *   it. Without it the link cannot be masked and the plain URL is sent.
  * @returns {Promise<boolean>} whether the send succeeded (mirrors sendSms's return)
  */
-async function sendConfirmationLinkSms({ phone, customerName, companyName, jobName, token, link = null }) {
+async function sendConfirmationLinkSms({
+  phone, recipientName = null, siteName = null, customerName = null, companyName,
+  jobName = null, serviceSummary = null, token, link = null,
+}) {
   const row = link || (await chatLinksDb.getByToken(token).catch(() => null));
   const url = await buildSmsLinkUrl(token, row);
 
-  const name = toGsm7(customerName);
+  // Same "who to address" priority as chat-link-email.js's greeting logic —
+  // a real contact first (never the account, matching the agent's own "site
+  // is a location, not a person" rule), then the site, then the account.
+  // Each candidate is sanitized to GSM-7 BEFORE picking, not after — a name
+  // that turns out empty once stripped must fall through to the next
+  // candidate, not win the chain and leave a blank "Hi , ...".
+  const name = toGsm7(recipientName) || toGsm7(siteName) || toGsm7(customerName) || "";
   const company = toGsm7(companyName);
   const job = toGsm7(jobName);
+  const service = toGsm7(serviceSummary);
 
   const greeting = name ? `Hi ${name}, ` : "Hi, ";
-  const jobPhrase = job ? ` for ${job}` : "";
-  const body = `${greeting}please confirm your upcoming appointment${jobPhrase} with ${company}. Confirm here: ${url}`;
+  // Names the actual visit when known — a service summary ("Fire Alarm
+  // Inspection") is usually AS SHORT OR SHORTER than a bare job title/number
+  // ("Inspection Job #50049755") and far more meaningful, so this isn't the
+  // length tradeoff it looks like. Deliberately does NOT add site/date the
+  // way the email does — SMS has a real per-segment cost (see this file's
+  // header comment), and the chat itself supplies that detail immediately
+  // after the customer taps through.
+  const visitPhrase = service ? `${service} visit` : `upcoming appointment${job ? ` for ${job}` : ""}`;
+  const body = `${greeting}please confirm your ${visitPhrase} with ${company}. Confirm here: ${url}`;
 
   const sent = await sendSms({ to: phone, body });
 
   logger.info("chat-link-sms: confirmation sms sent", {
-    jobName, sent, masked: url !== buildChatLinkUrl(token), bodyLength: body.length,
+    jobName, serviceSummary, sent, masked: url !== buildChatLinkUrl(token), bodyLength: body.length,
   });
   return sent;
 }

@@ -29,7 +29,8 @@ let contactImpl = async () => null;
 stub("confirmation-agent/tools/confirmer-label", { resolveContact: async (...a) => contactImpl(...a) });
 stub("db/llm-call-logs", { logCall: async () => {} });
 stub("services/servicetrade-comments", { postConfirmationAgentComment: async () => {} });
-stub("confirmation-agent/graph/build", { getGraph: async () => ({}), phaseFromContext: () => "confirming" });
+let graphImpl = () => ({});
+stub("confirmation-agent/graph/build", { getGraph: async () => graphImpl(), phaseFromContext: () => "confirming" });
 
 const chatLinksDb = require("../src/db/chat-links");
 const { build } = require("../src/confirmation-agent/graph/prompt");
@@ -38,6 +39,7 @@ function reset() {
   queries.length = 0;
   queryImpl = async () => ({ rows: [], rowCount: 0 });
   contactImpl = async () => null;
+  graphImpl = () => ({});
 }
 const find = (frag) => queries.find((q) => q.sql.includes(frag));
 
@@ -285,4 +287,30 @@ test("a failing lookup degrades to no name rather than breaking the chat", async
   const r = await resolveRecipient(8, null, "account@x.test", "+1000", null, "tok");
   assert.equal(r.recipientName, null);
   assert.equal(r.recipientEmail, "account@x.test", "the conversation still opens");
+});
+
+// ── ensureOpened surfaces the same resolution to the widget ─────────────────
+// GET /:token needs the resolved contact (not just the messages) so the
+// widget can pre-fill the service-link email step with a real default —
+// ensureOpened already computes this for the prompt; it must hand it back
+// out too, on both the "just opened" and "already opened" branches.
+
+test("ensureOpened returns the resolved recipient alongside the messages, on an already-opened link", async () => {
+  reset();
+  graphImpl = () => ({ getState: async () => ({ values: { messages: [] } }) });
+  // An empty checkpoint would take the "just opened" branch and try to
+  // actually run the graph — this test is only about the plumbing of the
+  // fields, so give it one prior message to take the cheap read-only branch.
+  const { AIMessage } = require("@langchain/core/messages");
+  graphImpl = () => ({ getState: async () => ({ values: { messages: [new AIMessage("Hi there")] } }) });
+
+  const out = await agent.ensureOpened({
+    companyId: 8, jobId: 900, token: "tok", companyName: "Clara Fire",
+    recipient: { name: "Shivam Koli", email: "shivam@x.test", phone: "+15551234567" },
+  });
+
+  assert.equal(out.recipientName, "Shivam Koli");
+  assert.equal(out.recipientEmail, "shivam@x.test");
+  assert.equal(out.recipientPhone, "+15551234567");
+  assert.ok(Array.isArray(out.messages));
 });

@@ -753,8 +753,16 @@ Save and verify ServiceTrade credentials.
 ---
 
 ### `POST /integrations/servicetrade/sync` 🔒
-Query param: `?full=true` for a full re-sync (default: incremental).  
-**Response `200`** `{ "success": true, "counts": { "companies": 120, "locations": 340, "service_requests": 890, "assets": 200 } }`
+**Query params:** `full=true` for a full re-sync (default: incremental) · `stream=true` for SSE progress · `startDate`/`endDate` (`YYYY-MM-DD`) for a custom window — see `servicetrade-sync-range-frontend.md`.
+
+Without dates: incremental sync of the current calendar month. With both dates
+(company-local, inclusive, **max 31 days**): every job scheduled in that window,
+re-pulled in full. Mutually exclusive with `full=true`. A custom-range run
+deliberately leaves the incremental cursor and `last_sync_at` untouched.
+
+**Response `200`** `{ "success": true, "runId": "42", "counts": { "companies": 120, "locations": 340, "service_requests": 890, "assets": 200 } }`  
+**Response `202`** (`stream=true`) `{ "runId", "kind", "streamToken", "streamUrl", "snapshotUrl" }`  
+**Response `400`** `{ "error": "Date range cannot exceed 31 days" }` — and four other validation strings, all safe to display verbatim (see the frontend guide).
 
 ---
 
@@ -856,6 +864,33 @@ every 15 minutes. What a chosen time actually covers (today vs. yesterday)
 depends on the company's business-hours close; full worked examples and the
 exact UI copy to show live in **`daily-report-frontend.md`** — deliberately the
 single source of truth, so the two documents cannot drift.
+
+---
+
+### Chat cards & tool visibility — see `chat-cards-frontend.md`
+
+The confirmation chat widget's SSE stream (`POST /chat-links/:token/messages`)
+renamed `typing` → `thinking` and added `tool_call`/`tool_result` events, and
+the widget gained six new deterministic action routes — confirm/reschedule/
+cancel/bulk-confirm/service-link/end — that write directly, with **no LLM
+call involved**. Free-text chat still works exactly as before, alongside the
+cards.
+
+| | |
+|---|---|
+| `GET /chat-links/:token` | **+ `appointments: [...]`** — the card array (unchanged otherwise) |
+| `POST /:token/appointments/:id/confirm` | confirm one appointment |
+| `POST /:token/appointments/:id/reschedule` | move it, or (no date/time given) raise a staff follow-up instead |
+| `POST /:token/appointments/:id/cancel` | cancel it — `reason` required |
+| `POST /:token/appointments/bulk-confirm` | confirm several/all remaining at once |
+| `POST /:token/service-link` | send the job's tracking link to a given (already-confirmed-by-the-UI) email |
+| `POST /:token/end` | close out the conversation — same effect as the agent calling `end_conversation` |
+
+The full appointment card shape (including `arrival_window_label`, rendered
+in italic), every route's request/response, and the exact UI sequence for
+confirm / reschedule / cancel / the "confirm the rest?" follow-up live in
+**`chat-cards-frontend.md`** — deliberately the single source of truth, so the
+two documents cannot drift.
 
 ---
 
