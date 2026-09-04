@@ -355,11 +355,12 @@ router.post("/:id/appointments", async (req, res) => {
     const appointment = await jobsDb.createAppointment(companyId, jobId, fields);
 
     // An appointment can't exist without being tied to a scheduled job.
-    // Promote job status open → scheduled only. Never demote a completed job.
+    // Promote an UNSCHEDULED job (open, or InspectPoint's 'pending' — same
+    // state, different vocabulary) → scheduled. Never demote a completed job.
     const db = require("../db");
     await db.query(
       `UPDATE jobs SET status = 'scheduled', updated_at = NOW()
-       WHERE id = $1 AND company_id = $2 AND status = 'open'`,
+       WHERE id = $1 AND company_id = $2 AND status IN ('open', 'pending')`,
       [jobId, companyId]
     );
     // The new appointment is unconfirmed, so a job sitting at 'confirmed' must
@@ -434,9 +435,12 @@ router.patch("/appointments/:id", async (req, res) => {
     const db = require("../db");
 
     if (effectiveStatus === "cancelled") {
-      // Appointment cancelled — if no other active appointments, revert job to open.
-      // Checked before the confirmation recompute because 'open' outranks it:
-      // syncJobConfirmationStatus deliberately won't move a job out of 'open'.
+      // Appointment cancelled — if no other active appointments, revert the job
+      // to its unscheduled state, in that source's own vocabulary ('pending'
+      // for InspectPoint, 'open' otherwise) rather than flattening both to
+      // 'open'. Checked before the confirmation recompute because the
+      // unscheduled statuses outrank it: syncJobConfirmationStatus
+      // deliberately won't move a job out of them.
       const { rows } = await db.query(
         `SELECT COUNT(*) AS cnt FROM appointments
          WHERE job_id = $1 AND status NOT IN ('cancelled','rescheduled')
@@ -445,7 +449,8 @@ router.patch("/appointments/:id", async (req, res) => {
       );
       if (Number(rows[0].cnt) === 0) {
         await db.query(
-          `UPDATE jobs SET status = 'open', updated_at = NOW()
+          `UPDATE jobs SET status = CASE WHEN source = 'inspectpoint' THEN 'pending' ELSE 'open' END,
+                  updated_at = NOW()
            WHERE id = $1 AND company_id = $2 AND status IN ('scheduled','confirmed')`,
           [current.job_id, companyId]
         );

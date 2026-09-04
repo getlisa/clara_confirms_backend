@@ -43,6 +43,10 @@ const CTX = { configurable: { ctx: { companyId: 9, jobId: 10, threadId: "tok", j
 function reset() {
   db.reset(); logger.reset();
   searched.length = 0; created.length = 0; sent.length = 0;
+  // sendServiceLinkCore's isServiceTradeJob guard checks this before doing
+  // anything else — every test here is exercising a ServiceTrade job, so
+  // seed it fresh on every reset (db.reset() clears all routes too).
+  db.on("SELECT source FROM jobs WHERE", [{ source: "servicetrade" }]);
 }
 
 // ── The gate ─────────────────────────────────────────────────────────────────

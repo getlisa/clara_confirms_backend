@@ -15,6 +15,7 @@
  */
 
 const servicetrade = require("./servicetrade");
+const inspectpoint = require("./inspectpoint");
 
 const workflows = new Map();
 
@@ -34,5 +35,6 @@ function getWorkflow(slug) {
 }
 
 register(servicetrade);
+register(inspectpoint);
 
 module.exports = { register, getWorkflow };

@@ -3,7 +3,7 @@ const jobsDb = require("../../../../db/jobs");
 
 const schema = z.object({
   status: z
-    .enum(["open", "scheduled", "rescheduled", "confirmed", "in_progress", "completed", "cancelled"])
+    .enum(["open", "pending", "scheduled", "rescheduled", "confirmed", "in_progress", "completed", "cancelled"])
     .nullish()
     .describe("Optional job status filter."),
   customer_id: z.union([z.string(), z.number()]).nullish().describe("Optional: only this customer's jobs."),

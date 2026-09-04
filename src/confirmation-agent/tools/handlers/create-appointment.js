@@ -6,7 +6,7 @@
 const { z } = require("zod");
 const db = require("../../../db");
 const jobsDb = require("../../../db/jobs");
-const stAppointments = require("../../../services/servicetrade-appointments");
+const { getProviderForSource } = require("../../../services/crm");
 const { syncJobConfirmationStatus } = require("../../../services/job-confirmation-status");
 const { getCompanyTimezone, localToUTC } = require("../../../utils/timezone");
 const confirmationEventsDb = require("../../../db/confirmation-events");
@@ -32,13 +32,18 @@ async function run({ scheduled_start, scheduled_end }, config) {
   });
 
   await db.query(
-    `UPDATE jobs SET status = 'scheduled', updated_at = NOW() WHERE id = $1 AND company_id = $2 AND status = 'open'`,
+    `UPDATE jobs SET status = 'scheduled', updated_at = NOW() WHERE id = $1 AND company_id = $2 AND status IN ('open', 'pending')`,
     [jobId, companyId]
   );
   await syncJobConfirmationStatus(companyId, Number(jobId));
 
-  await stAppointments
-    .mirrorCreateAppointment(companyId, appointment, Number(jobId), { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: threadId })
+  // Dispatched by the JOB's source, not the appointment's — a freshly created
+  // platform appointment has no CRM source of its own yet; "which CRM to
+  // create it in" is a question about the job it belongs to (mirrors
+  // routes/retell-tools.js's create_appointment handler).
+  const { rows: jobRows } = await db.query(`SELECT source FROM jobs WHERE id = $1 AND company_id = $2`, [jobId, companyId]);
+  await getProviderForSource(jobRows[0]?.source)
+    ?.mirrorCreateAppointment(companyId, appointment, Number(jobId), { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: threadId })
     .catch((err) => logger.error("ConfirmationAgent create_appointment mirror failed", { error: err.message, companyId }));
 
   // See confirm-appointment.js for why call_type is hardcoded.

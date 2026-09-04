@@ -33,6 +33,24 @@ function getProvider(slug) {
   return p;
 }
 
+/**
+ * Safe variant of getProvider() for dispatching a CRM write-back mirror from
+ * a specific job/appointment row's own `source` column, rather than a
+ * resolved company-wide slug. Unlike getProvider(), never throws: `source` on
+ * a manually-created row is null, and an unrecognized/retired source string
+ * must degrade to "don't mirror" (matching the exact behavior the
+ * `row.source !== "servicetrade"` guards already had before this existed),
+ * not break a live confirm/reschedule/cancel action.
+ */
+function getProviderForSource(source) {
+  if (!source) return null;
+  try {
+    return getProvider(source);
+  } catch {
+    return null;
+  }
+}
+
 function listProviders() {
   return Array.from(providers.keys());
 }
@@ -77,6 +95,13 @@ async function resolveSlugForCompany(companyId) {
 
 // Eagerly register built-in providers.
 // Each subclass file should export a singleton instance.
+// Registered AFTER ServiceTrade deliberately: resolveSlugForCompany() returns
+// the first registered provider with an active credential row, so if a
+// company somehow had both connected, ServiceTrade would win the tie. In
+// practice a company should only ever have one CRM connected — see the
+// InspectPoint connect route, which refuses to connect while ServiceTrade is
+// active for that company (and vice versa).
 registerProvider(require("./servicetrade/provider"));
+registerProvider(require("./inspectpoint/provider"));
 
-module.exports = { CrmProvider, registerProvider, getProvider, listProviders, resolveSlugForCompany };
+module.exports = { CrmProvider, registerProvider, getProvider, getProviderForSource, listProviders, resolveSlugForCompany };

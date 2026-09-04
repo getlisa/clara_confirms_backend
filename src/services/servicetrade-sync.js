@@ -80,6 +80,7 @@ const stClient      = require("./servicetrade");
 const credentialsDb = require("../db/servicetrade-credentials");
 const syncDb        = require("../db/servicetrade-sync");
 const logger        = require("../utils/logger");
+const { mapWithConcurrency } = require("../utils/concurrency");
 
 const RETRY_ATTEMPTS = 3;
 const RETRY_BASE_MS  = 2000;
@@ -209,26 +210,6 @@ async function fetchAllPagesWithSideLoad(companyId, pathPrefix, listKey, credent
     page++;
   }
   return { rows: all, sideLoad, complete };
-}
-
-/**
- * Run `fn` over `items` with at most `limit` in flight at once. Used for
- * per-id detail fetches (e.g. GET /job/{id}) where there's no bulk list
- * endpoint — bounds concurrent requests instead of firing them all at once
- * or running them one at a time.
- */
-async function mapWithConcurrency(items, limit, fn) {
-  const results = new Array(items.length);
-  let next = 0;
-  async function worker() {
-    while (true) {
-      const i = next++;
-      if (i >= items.length) return;
-      results[i] = await fn(items[i], i);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
 }
 
 // ── Shape resolution (flat vs compound — see module doc) ───────────────────

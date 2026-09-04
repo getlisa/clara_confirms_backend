@@ -81,13 +81,16 @@ async function run({ customer_id, include_past }, config) {
     }
   }
 
-  // Open (unscheduled) jobs → open_job_due_soon candidates (reference = job).
+  // Unscheduled jobs → open_job_due_soon candidates (reference = job).
+  // 'pending' is InspectPoint's word for the same state as 'open' and must
+  // match here too, or an InspectPoint tenant yields no targets at all
+  // (see UNSCHEDULED_JOB_STATUSES in db/jobs.js).
   // Upcoming only by default: exclude jobs whose expected date has already
   // passed (jobs with no date yet are still upcoming, so they're kept).
   const openJobs = await db.query(
     `SELECT id AS job_id, title, status, scheduled_date
      FROM jobs
-     WHERE company_id = $1 AND customer_id = $2 AND status = 'open'
+     WHERE company_id = $1 AND customer_id = $2 AND status IN ('open', 'pending')
        ${includePast ? "" : "AND (scheduled_date >= CURRENT_DATE OR scheduled_date IS NULL)"}
      ORDER BY scheduled_date ASC NULLS LAST`,
     [companyId, customer_id]

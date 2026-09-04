@@ -12,7 +12,10 @@ const scheduledCallsDb = require("../db/scheduled-calls");
 const serviceOpportunitiesDb = require("../db/service-opportunities");
 const serviceLink = require("../services/servicetrade-service-link");
 const serviceLinkMessagesDb = require("../db/service-link-messages");
-const stAppointments = require("../services/servicetrade-appointments");
+const { getProviderForSource, resolveSlugForCompany } = require("../services/crm");
+const { getWorkflow } = require("../confirmation-agent/workflows");
+const slotHoldsDb = require("../db/slot-holds");
+const technicianAvailability = require("../services/technician-availability");
 const todosDb = require("../db/todos");
 const chatLinksDb = require("../db/chat-links");
 const confirmationEventsDb = require("../db/confirmation-events");
@@ -26,7 +29,7 @@ const { syncJobConfirmationStatus } = require("../services/job-confirmation-stat
 const { parseCallbackTime } = require("../services/callback-time");
 const { authenticate, getCompanyId: getCompanyIdFromToken } = require("../auth");
 const {
-  getCompanyTimezone, localToUTC, formatSpokenDate, formatSpokenDateTime, formatSpokenDateOnly,
+  getCompanyTimezone, localToUTC, toOffsetISOString, formatSpokenDate, formatSpokenDateTime, formatSpokenDateOnly,
 } = require("../utils/timezone");
 
 const router = express.Router();
@@ -364,8 +367,27 @@ router.post("/reschedule_appointment", async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     const { appointment_id, scheduled_start, scheduled_end } = getArgs(req);
-    if (!companyId || !appointment_id || !scheduled_start)
-      return res.status(400).json({ error: "company_id, appointment_id and scheduled_start are required" });
+    if (!companyId || !appointment_id)
+      return res.status(400).json({ error: "company_id and appointment_id are required" });
+
+    // The caller wants to reschedule but won't (or can't) commit to a time —
+    // same "staff follow-up, no appointment write" escalation chat's
+    // reschedule_appointment tool already had (see confirmation-agent/
+    // actions.js's raiseRescheduleRequest). Voice had no equivalent: this
+    // used to hard-400, which left no way to end the call in that case.
+    if (!scheduled_start) {
+      const before = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
+      await todosDb
+        .create({
+          companyId, callId: null,
+          type: todosDb.TODO_TYPES.ASKED_FOR_RESCHEDULE,
+          isTest: false, priority: "high",
+          metadata: { source: "voice_call", call_id: String(getConversationId(req) || ""), job_id: String(before?.job_id ?? ""), appointment_id: String(appointment_id) },
+        })
+        .catch((err) => logger.warn("Tool reschedule_appointment: failed to raise ASKED_FOR_RESCHEDULE todo", { error: err.message, companyId }));
+      logger.info("Tool: reschedule_appointment escalated (no time given)", { companyId, appointment_id });
+      return res.json({ success: true, escalated: true, message: "Our team will follow up to find a time." });
+    }
 
     const tz = await getCompanyTimezone(companyId);
     const startUTC = localToUTC(scheduled_start, tz);
@@ -376,21 +398,34 @@ router.post("/reschedule_appointment", async (req, res) => {
     // Captured BEFORE the write — the ledger's "from" time.
     const before = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
 
-    const appointment = await jobsDb.updateAppointment(Number(appointment_id), companyId, {
-      scheduled_start: startUTC,
-      scheduled_end: endUTC,
-      // A moved appointment is no longer confirmed — the customer agreed to the
-      // OLD time. Leaving this true let a job read 'confirmed' for a slot nobody
-      // ever agreed to, and kept the service-link gate open on stale consent.
-      customer_confirmed: false,
-      customer_confirmed_at: null,
-    });
+    let appointment;
+    try {
+      appointment = await jobsDb.updateAppointment(Number(appointment_id), companyId, {
+        scheduled_start: startUTC,
+        scheduled_end: endUTC,
+        // A moved appointment is no longer confirmed — the customer agreed to the
+        // OLD time. Leaving this true let a job read 'confirmed' for a slot nobody
+        // ever agreed to, and kept the service-link gate open on stale consent.
+        customer_confirmed: false,
+        customer_confirmed_at: null,
+      });
+    } catch (err) {
+      // See migrations/105_slot_holds.sql — appointments_inspectpoint_no_overlap
+      // is the real backstop against a double-booked technician. Soft holds
+      // (propose_reschedule_slots) make this rare but can't eliminate the race.
+      if (slotHoldsDb.isSlotConflictError(err)) {
+        return res.status(409).json({ success: false, conflict: true, error: "That time was just booked for this technician — please choose a different time." });
+      }
+      throw err;
+    }
     if (!appointment) return res.status(404).json({ error: "Appointment not found" });
 
-    // Mirror to ServiceTrade (best-effort; platform is source of truth). Awaited
-    // so serverless doesn't freeze before the PUT completes; never fails the tool.
-    await stAppointments
-      .mirrorRescheduleAppointment(companyId, appointment, { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: getConversationId(req) })
+    // Mirror to the CRM (best-effort; platform is source of truth). Awaited so
+    // serverless doesn't freeze before the write completes; never fails the
+    // tool. Dispatched by the appointment's own `source` — getProviderForSource
+    // degrades to a no-op for a manual row or an unrecognized source.
+    await getProviderForSource(appointment.source)
+      ?.mirrorRescheduleAppointment(companyId, appointment, { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: getConversationId(req) })
       .catch((err) => logger.error("crm-sync reschedule_appointment mirror failed", { error: err.message, companyId }));
 
     // Chat state tracking — harmless no-op for voice/SMS.
@@ -406,10 +441,76 @@ router.post("/reschedule_appointment", async (req, res) => {
       details: { from: before?.scheduled_start ?? null, to: startUTC },
     });
 
+    // Best-effort: consume the hold this exact slot was offered under (if any —
+    // see propose_reschedule_slots) and release the rest of this call's
+    // remaining candidate holds now that one has been confirmed.
+    const conversationId = getConversationId(req);
+    if (appointment.technician_id && conversationId) {
+      slotHoldsDb.consumeByWindow({ companyId, technicianId: appointment.technician_id, startsAt: startUTC, heldByToken: conversationId })
+        .then(() => slotHoldsDb.releaseAllForToken({ companyId, heldByToken: conversationId }))
+        .catch((err) => logger.warn("Tool reschedule_appointment: slot hold cleanup failed", { error: err.message, companyId }));
+    }
+
     logger.info("Tool: reschedule_appointment", { companyId, appointment_id, scheduled_start, startUTC, tz });
     return res.json({ success: true, appointment: localizeAppointmentForAgent(appointment, tz) });
   } catch (err) {
     logger.error("Tool reschedule_appointment failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PROPOSE RESCHEDULE SLOTS ──────────────────────────────────────────────────
+
+const SLOT_SEARCH_HORIZON_DAYS = 14;
+
+// Registered only when the company's workflow declares slotSuggestion:true
+// (services/retell-tools.js's applyWorkflowCapabilities gates this the same
+// way service_link_enabled gates resolve_service_link_contact/get_service_link)
+// — but this route itself stays company-agnostic, same as every other tool
+// route here; the gate lives entirely at registration time.
+router.post("/propose_reschedule_slots", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    const { appointment_id, preferred_date } = getArgs(req);
+    if (!companyId || !appointment_id)
+      return res.status(400).json({ error: "company_id and appointment_id are required" });
+
+    const appointment = await jobsDb.getAppointmentById(Number(appointment_id), companyId);
+    if (!appointment) return res.status(404).json({ error: "Appointment not found" });
+    if (!appointment.technician_id) {
+      return res.json({
+        success: false,
+        error: "No technician is assigned to this appointment yet, so there is no calendar to search — ask the customer for a preferred time instead.",
+      });
+    }
+
+    const tz = await getCompanyTimezone(companyId);
+    const windowStart = preferred_date ? localToUTC(`${preferred_date}T00:00:00`, tz) : new Date().toISOString();
+    const windowEnd = new Date(new Date(windowStart).getTime() + SLOT_SEARCH_HORIZON_DAYS * 24 * 60 * 60 * 1000).toISOString();
+
+    const slots = await technicianAvailability.offerSlots({
+      companyId, technicianId: appointment.technician_id, heldByToken: getConversationId(req),
+      windowStart, windowEnd, excludeAppointmentId: appointment.id,
+    });
+
+    logger.info("Tool: propose_reschedule_slots", { companyId, appointment_id, technicianId: appointment.technician_id, offered: slots.length });
+
+    if (slots.length === 0) {
+      return res.json({ success: true, slots: [], message: "No open times found in the next two weeks for this technician." });
+    }
+
+    return res.json({
+      success: true,
+      slots: slots.map((s) => ({
+        // Round-trips straight into reschedule_appointment's own scheduled_start —
+        // localToUTC there already strips this exact offset-ISO shape.
+        scheduled_start: toOffsetISOString(s.starts_at, tz),
+        scheduled_start_spoken: formatSpokenDateTime(s.starts_at, tz),
+      })),
+    });
+  } catch (err) {
+    logger.error("Tool propose_reschedule_slots failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });
@@ -437,7 +538,7 @@ router.post("/create_appointment", async (req, res) => {
 
     // Promote job status open → scheduled
     await db.query(
-      `UPDATE jobs SET status = 'scheduled', updated_at = NOW() WHERE id = $1 AND company_id = $2 AND status = 'open'`,
+      `UPDATE jobs SET status = 'scheduled', updated_at = NOW() WHERE id = $1 AND company_id = $2 AND status IN ('open', 'pending')`,
       [job_id, companyId]
     );
     // The new appointment is unconfirmed, so a job sitting at 'confirmed' has to
@@ -445,10 +546,14 @@ router.post("/create_appointment", async (req, res) => {
     // this appointment never gets a confirmation call.
     await syncJobConfirmationStatus(companyId, Number(job_id));
 
-    // Mirror to ServiceTrade: create the appointment there and stamp the id back.
+    // Mirror to the CRM: create the appointment there and stamp the id back.
     // Best-effort, awaited; never fails the tool (platform is source of truth).
-    await stAppointments
-      .mirrorCreateAppointment(companyId, appointment, Number(job_id), { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: getConversationId(req) })
+    // Dispatched by the JOB's source, not the appointment's — a freshly
+    // created platform appointment has no CRM source of its own yet; "which
+    // CRM to create it in" is a question about the job it belongs to.
+    const { rows: createJobRows } = await db.query(`SELECT source FROM jobs WHERE id = $1 AND company_id = $2`, [job_id, companyId]);
+    await getProviderForSource(createJobRows[0]?.source)
+      ?.mirrorCreateAppointment(companyId, appointment, Number(job_id), { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: getConversationId(req) })
       .catch((err) => logger.error("crm-sync create_appointment mirror failed", { error: err.message, companyId }));
 
     await confirmationEventsDb.recordSafe({
@@ -483,9 +588,9 @@ router.post("/reschedule_job", async (req, res) => {
     const job = await jobsDb.updateJob(Number(job_id), companyId, { scheduled_date: dateOnly });
     if (!job) return res.status(404).json({ error: "Job not found" });
 
-    // Mirror the new scheduled date to ServiceTrade (best-effort; awaited).
-    await stAppointments
-      .mirrorRescheduleJob(companyId, job, { scheduledDate: dateOnly, retellCallId: getConversationId(req) })
+    // Mirror the new scheduled date to the CRM (best-effort; awaited).
+    await getProviderForSource(job.source)
+      ?.mirrorRescheduleJob(companyId, job, { scheduledDate: dateOnly, retellCallId: getConversationId(req) })
       .catch((err) => logger.error("crm-sync reschedule_job mirror failed", { error: err.message, companyId }));
 
     logger.info("Tool: reschedule_job", { companyId, job_id, new_scheduled_date: dateOnly });
@@ -508,10 +613,17 @@ router.post("/cancel_appointment", async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     const { appointment_id, scope, reason } = getArgs(req);
-    if (!companyId || !appointment_id || !scope || !reason)
-      return res.status(400).json({ error: "company_id, appointment_id, scope and reason are required" });
+    if (!companyId || !appointment_id || !scope)
+      return res.status(400).json({ error: "company_id, appointment_id and scope are required" });
     if (!["appointment_only", "entire_job"].includes(scope))
       return res.status(400).json({ error: "scope must be 'appointment_only' or 'entire_job'" });
+    // Required by default (ServiceTrade's workflow); a workflow whose
+    // capabilities.cancellationReason is "optional" (InspectPoint) relaxes
+    // this — mirrors routes/chat-links.js's identical relaxation.
+    const workflow = getWorkflow(await resolveSlugForCompany(companyId));
+    if (workflow.capabilities?.cancellationReason !== "optional" && !reason) {
+      return res.status(400).json({ error: "reason is required" });
+    }
 
     const retellCallId = getConversationId(req);
 
@@ -521,7 +633,7 @@ router.post("/cancel_appointment", async (req, res) => {
     // ── Platform write (source of truth) ───────────────────────────────────
     const appointment = await jobsDb.updateAppointment(Number(appointment_id), companyId, {
       status: "cancelled",
-      cancellation_reason: reason,
+      cancellation_reason: reason || null,
     });
     await db.query(
       `UPDATE appointments
@@ -549,14 +661,14 @@ router.post("/cancel_appointment", async (req, res) => {
       await syncJobConfirmationStatus(companyId, existing.job_id);
     }
 
-    // ── Mirror to ServiceTrade (best-effort; awaited; never fails the tool) ──
-    await stAppointments
-      .mirrorCancelAppointment(companyId, appointment, { retellCallId })
+    // ── Mirror to the CRM (best-effort; awaited; never fails the tool) ───────
+    await getProviderForSource(appointment.source)
+      ?.mirrorCancelAppointment(companyId, appointment, { retellCallId })
       .catch((err) => logger.error("crm-sync cancel_appointment mirror failed", { error: err.message, companyId }));
     if (scope === "entire_job") {
       const { rows: jobRows } = await db.query(`SELECT external_ref, source FROM jobs WHERE id = $1 AND company_id = $2`, [existing.job_id, companyId]);
-      await stAppointments
-        .mirrorCancelJob(companyId, jobRows[0], { retellCallId })
+      await getProviderForSource(jobRows[0]?.source)
+        ?.mirrorCancelJob(companyId, jobRows[0], { retellCallId })
         .catch((err) => logger.error("crm-sync cancel_job mirror failed", { error: err.message, companyId }));
     }
 
@@ -1068,6 +1180,16 @@ router.post("/resolve_service_link_contact", async (req, res) => {
 
     const refs = await resolveConfirmationRefs(companyId, conversationId);
     if (!refs) return res.status(404).json({ error: "No scheduled call or chat found for this conversation" });
+    // Service link is a ServiceTrade-only capability — no InspectPoint
+    // equivalent exists at all. Defense-in-depth: voice tool registration
+    // will withhold this tool once Phase 5 lands; this guard protects the
+    // ServiceTrade-specific work below (a raw servicetrade_jobs lookup keyed
+    // by job_ref as a servicetrade_id, plus real ServiceTrade API calls) in
+    // the meantime.
+    if (refs.job_source !== "servicetrade") {
+      logger.info("Tool: resolve_service_link_contact — job is not from ServiceTrade; service link has no InspectPoint equivalent", { companyId, conversationId });
+      return res.status(400).json({ error: "Service link is not available for this job's CRM" });
+    }
 
     // Chat state tracking — harmless no-op for voice/SMS.
     await chatLinksDb.setState(conversationId, "collecting_contact_info").catch(() => {});
@@ -1176,6 +1298,13 @@ router.post("/get_service_link", async (req, res) => {
     const refs = await resolveConfirmationRefs(companyId, conversationId);
     if (!refs?.job_ref) {
       return res.status(404).json({ error: "No ServiceTrade job found for this conversation" });
+    }
+    // Service link is a ServiceTrade-only capability — see the identical
+    // guard in resolve_service_link_contact above for why this stays
+    // defense-in-depth rather than relying solely on tool registration.
+    if (refs.job_source !== "servicetrade") {
+      logger.info("Tool: get_service_link — job is not from ServiceTrade; service link has no InspectPoint equivalent", { companyId, conversationId });
+      return res.status(400).json({ error: "Service link is not available for this job's CRM" });
     }
 
     const minted = await serviceLink.mintServiceLinkUrl(companyId, refs.job_ref);

@@ -22,7 +22,8 @@ const jobsDb = require("../db/jobs");
 const chatLinksDb = require("../db/chat-links");
 const todosDb = require("../db/todos");
 const confirmationEventsDb = require("../db/confirmation-events");
-const stAppointments = require("../services/servicetrade-appointments");
+const { getProviderForSource } = require("../services/crm");
+const slotHoldsDb = require("../db/slot-holds");
 const serviceLink = require("../services/servicetrade-service-link");
 const serviceLinkMessagesDb = require("../db/service-link-messages");
 const { syncJobConfirmationStatus } = require("../services/job-confirmation-status");
@@ -198,17 +199,42 @@ async function rescheduleAppointmentCore({ companyId, appointmentId, threadId, r
 
   const before = await jobsDb.getAppointmentById(Number(appointmentId), companyId);
 
-  const appointment = await jobsDb.updateAppointment(Number(appointmentId), companyId, {
-    scheduled_start: startUTC, scheduled_end: endUTC, customer_confirmed: false, customer_confirmed_at: null,
-  });
+  let appointment;
+  try {
+    appointment = await jobsDb.updateAppointment(Number(appointmentId), companyId, {
+      scheduled_start: startUTC, scheduled_end: endUTC, customer_confirmed: false, customer_confirmed_at: null,
+    });
+  } catch (err) {
+    // The appointments_inspectpoint_no_overlap exclusion constraint (migrations/105)
+    // is the real backstop against a double-booked technician — soft holds
+    // (propose_reschedule_slots) reduce how often this happens but can't fully
+    // eliminate the race, so this must be a normal re-offer path, not a 500.
+    if (slotHoldsDb.isSlotConflictError(err)) {
+      return { success: false, conflict: true, error: "That time was just booked for this technician — please choose a different time." };
+    }
+    throw err;
+  }
   if (!appointment) return { success: false, error: "Appointment not found" };
+
+  // Best-effort: if this exact window was offered (and held) via
+  // propose_reschedule_slots, consume that hold and release any of this
+  // conversation's other held candidates now that one has been confirmed.
+  // A reschedule that never went through the propose tool simply has nothing
+  // to consume here — not an error.
+  if (appointment.technician_id && threadId) {
+    slotHoldsDb.consumeByWindow({ companyId, technicianId: appointment.technician_id, startsAt: startUTC, heldByToken: threadId })
+      .then(() => slotHoldsDb.releaseAllForToken({ companyId, heldByToken: threadId }))
+      .catch((err) => logger.warn("actions: slot hold cleanup failed", { error: err.message, companyId }));
+  }
 
   // Fire-and-forget: a best-effort CRM mirror whose own failure already raises
   // a CRM_SYNC todo and is never surfaced in this function's return value —
-  // awaiting it just put a live ServiceTrade round trip in the customer's
-  // response path for no benefit.
-  stAppointments
-    .mirrorRescheduleAppointment(companyId, appointment, { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: threadId })
+  // awaiting it just put a live CRM round trip in the customer's response
+  // path for no benefit. Dispatched by the appointment's own `source` rather
+  // than importing a concrete CRM module — getProviderForSource degrades to
+  // null (no-op) for a manual row or an unrecognized source, same as before.
+  getProviderForSource(appointment.source)
+    ?.mirrorRescheduleAppointment(companyId, appointment, { scheduledStart: startUTC, scheduledEnd: endUTC, retellCallId: threadId })
     .catch((err) => logger.error("actions: reschedule mirror failed", { error: err.message, companyId }));
 
   await syncJobConfirmationStatus(companyId, appointment.job_id);
@@ -271,13 +297,13 @@ async function cancelAppointmentCore({ companyId, appointmentId, threadId, recip
 
   // Fire-and-forget — same reasoning as the reschedule mirror above: best
   // effort, self-contained error handling, result never read here.
-  stAppointments
-    .mirrorCancelAppointment(companyId, appointment, { retellCallId: threadId })
+  getProviderForSource(appointment.source)
+    ?.mirrorCancelAppointment(companyId, appointment, { retellCallId: threadId })
     .catch((err) => logger.error("actions: cancel mirror failed", { error: err.message, companyId }));
   if (scope === "entire_job") {
     const { rows: jobRows } = await db.query(`SELECT external_ref, source FROM jobs WHERE id = $1 AND company_id = $2`, [existing.job_id, companyId]);
-    stAppointments
-      .mirrorCancelJob(companyId, jobRows[0], { retellCallId: threadId })
+    getProviderForSource(jobRows[0]?.source)
+      ?.mirrorCancelJob(companyId, jobRows[0], { retellCallId: threadId })
       .catch((err) => logger.error("actions: cancel_job mirror failed", { error: err.message, companyId }));
   }
 
@@ -311,6 +337,23 @@ async function cancelAppointmentCore({ companyId, appointmentId, threadId, recip
 }
 
 /**
+ * Service link is a ServiceTrade-only capability — no InspectPoint equivalent
+ * exists at all (not a different implementation, no implementation). This is
+ * defense-in-depth: chat's CAPABILITY_TOOLS already withholds the tools that
+ * call these functions when a workflow's capabilities.serviceLink is false,
+ * so this guard should never actually trigger in normal operation — but the
+ * ServiceTrade-specific work below (a raw `servicetrade_jobs` lookup keyed by
+ * `jobRef` as a servicetrade_id, plus real ServiceTrade API calls) would
+ * misbehave silently on a non-ServiceTrade job's numeric id if it were ever
+ * reached any other way.
+ */
+async function isServiceTradeJob(companyId, jobId) {
+  if (!jobId) return false;
+  const { rows } = await db.query(`SELECT source FROM jobs WHERE id = $1 AND company_id = $2`, [jobId, companyId]);
+  return rows[0]?.source === "servicetrade";
+}
+
+/**
  * The email step is implicitly "confirmed" here — this function only exists
  * to be called AFTER the UI's own Yes/No (or type-a-new-address) step, so
  * there is no `emailConfirmed` parameter the way the LLM tool has one: the
@@ -321,6 +364,10 @@ async function cancelAppointmentCore({ companyId, appointmentId, threadId, recip
  * email" step the LLM tool otherwise needs two round-trips for.
  */
 async function sendServiceLinkCore({ companyId, jobId, threadId, jobRef = null, customerRef = null, email, firstName = null, lastName = null, role = null, phone = null }) {
+  if (!(await isServiceTradeJob(companyId, jobId))) {
+    logger.info("actions: sendServiceLinkCore — job is not from ServiceTrade; service link has no InspectPoint equivalent", { companyId, jobId });
+    return { success: false, error: "Service link is not available for this job's CRM" };
+  }
   const candidates = await serviceLink.searchContacts(companyId, email);
   const exactMatch = candidates.find((c) => c.email && c.email.toLowerCase() === email.toLowerCase());
   const match = exactMatch || (candidates.length === 1 ? candidates[0] : null);
@@ -405,6 +452,10 @@ async function resolveServiceLinkContactRef(companyId, threadId, recipientContac
  */
 async function mintServiceLinkCore({ companyId, jobId, jobRef, threadId, recipientContactId = null }) {
   if (!jobRef) return { success: false, error: "No ServiceTrade job found for this conversation" };
+  if (!(await isServiceTradeJob(companyId, jobId))) {
+    logger.info("actions: mintServiceLinkCore — job is not from ServiceTrade; service link has no InspectPoint equivalent", { companyId, jobId });
+    return { success: false, error: "Service link is not available for this job's CRM" };
+  }
 
   const contactExternalRef = await resolveServiceLinkContactRef(companyId, threadId, recipientContactId, jobId);
   const minted = await serviceLink.mintServiceLinkUrl(companyId, jobRef, contactExternalRef);

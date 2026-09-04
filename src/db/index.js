@@ -242,15 +242,22 @@ class Database {
   /**
    * Fetch a company's full (external_ref -> id) map for a platform table in
    * ONE query, for resolving many FKs in memory instead of one SELECT per row.
+   *
+   * Scoped by `source` because platform tables are shared across CRMs: two
+   * providers can hold the same numeric external_ref for different records, so
+   * an unscoped map would cross-link them. The ServiceTrade default preserves
+   * every existing call site; new providers must pass their own slug, and
+   * should do so through a local one-line wrapper so the default is
+   * unreachable from their code rather than merely unused.
    */
-  async fetchExternalRefMap(companyId, table) {
+  async fetchExternalRefMap(companyId, table, source = "servicetrade") {
     const { rows } = await this.query(
-      `SELECT external_ref, id FROM ${table} WHERE company_id = $1 AND source = 'servicetrade' AND external_ref IS NOT NULL`,
-      [companyId]
+      `SELECT external_ref, id FROM ${table} WHERE company_id = $1 AND source = $2 AND external_ref IS NOT NULL`,
+      [companyId, source]
     );
     const map = new Map();
     for (const r of rows) map.set(r.external_ref, r.id);
-    logger.info("fetchExternalRefMap: table fetched", { table, companyId, rows: map.size, queries: 1 });
+    logger.info("fetchExternalRefMap: table fetched", { table, companyId, source, rows: map.size, queries: 1 });
     return map;
   }
 

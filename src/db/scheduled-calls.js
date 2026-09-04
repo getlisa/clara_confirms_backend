@@ -419,6 +419,20 @@ async function markCompletedWithChatLink(id, chatLinkToken) {
   );
 }
 
+/**
+ * Terminally cancel a queued call — NOT a failure, so deliberately not
+ * markFailedOrRetry: retrying is exactly the wrong response when the reason is
+ * "the work this call is about no longer exists". Used by the dispatcher's
+ * pre-dial guard when a job was cancelled or completed after the call was
+ * queued.
+ */
+async function markCancelled(id, reason) {
+  await db.query(
+    `UPDATE scheduled_calls SET status = 'cancelled', failure_reason = $2, updated_at = NOW() WHERE id = $1`,
+    [id, reason]
+  );
+}
+
 async function markFailedOrRetry(id, reason) {
   const result = await db.query(
     `UPDATE scheduled_calls
@@ -503,6 +517,7 @@ module.exports = {
   claimPending,
   markCompleted,
   markCompletedWithChatLink,
+  markCancelled,
   markFailedOrRetry,
   advanceToNextWindow,
   scheduleRetry,

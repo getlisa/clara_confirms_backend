@@ -107,7 +107,7 @@ const TOOL_SEEDS = [
   {
     call_type: "customer_confirmation",
     name: "reschedule_appointment",
-    description: "Update the scheduled time of an existing appointment when the customer requests a different time.",
+    description: "Update the scheduled time of an existing appointment when the customer requests a different time. Call with no scheduled_start if the customer wants to reschedule but won't commit to a time — this raises a staff follow-up instead of a hard failure, and does not change the appointment.",
     endpoint: "/retell/tools/reschedule_appointment",
     speak_during_execution: true,
     speak_after_execution: true,
@@ -118,10 +118,30 @@ const TOOL_SEEDS = [
       type: "object",
       properties: {
         appointment_id: { type: "string", description: "The numeric ID of the appointment you are acting on. Default to the next upcoming appointment (the one you were given at the start of the conversation), but when the customer is talking about a DIFFERENT appointment on this job, pass that appointment's ID from the get_appointments result instead." },
-        scheduled_start: { type: "string", description: "New start datetime in ISO 8601 format, e.g. 2026-05-28T10:00:00." },
+        scheduled_start: { type: "string", description: "New start datetime in ISO 8601 format, e.g. 2026-05-28T10:00:00. Omit ONLY when the customer wants to reschedule but won't give a specific time — this raises a staff follow-up instead." },
         scheduled_end:   { type: "string", description: "New end datetime in ISO 8601 format (optional — defaults to 2 hours after start)." },
       },
-      required: ["appointment_id", "scheduled_start"],
+      required: ["appointment_id"],
+    },
+  },
+  {
+    call_type: "customer_confirmation",
+    name: "propose_reschedule_slots",
+    description: "Look up real open time windows for the technician already assigned to an appointment, instead of asking the customer to name a time blind. Only available on CRMs that support slot suggestion (see workflow capabilities) — offered windows are held for a few minutes so another caller can't be offered the exact same slot; call reschedule_appointment with one of the returned scheduled_start values while it's still fresh.",
+    endpoint: "/retell/tools/propose_reschedule_slots",
+    speak_during_execution: true,
+    speak_after_execution: false,
+    execution_message_description: "Let me check what times are open.",
+    is_write_tool: true,
+    gated_by_setting: "slot_suggestion_enabled",
+    sort_order: 9,
+    parameters: {
+      type: "object",
+      properties: {
+        appointment_id: { type: "string", description: "The numeric ID of the appointment being rescheduled — its assigned technician's calendar is what gets searched." },
+        preferred_date: { type: "string", description: "The date the customer mentioned wanting, format YYYY-MM-DD, if any. Search starts from here; omit to search starting today." },
+      },
+      required: ["appointment_id"],
     },
   },
   {

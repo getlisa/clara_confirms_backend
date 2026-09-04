@@ -6,6 +6,22 @@ const db = require("./index");
 // the verification pass in the confirmation-scheduling plan.
 const UPCOMING_APPOINTMENT_STATUSES = ["scheduled", "confirmed", "rescheduled"];
 
+/**
+ * Job statuses meaning "exists, but nothing is scheduled on it yet".
+ *
+ * `open` is the platform's own word; `pending` is the same state under
+ * InspectPoint's vocabulary, kept distinct so the UI can show a customer the
+ * status their CRM actually shows them (migration 106). They are behaviourally
+ * IDENTICAL — anywhere one is actionable the other must be, or an InspectPoint
+ * tenant silently drops out of a sweep (its jobs are ~99% `pending`).
+ *
+ * Exported so every consumer shares one definition instead of scattering
+ * `status = 'open'` literals. `SQL` is the pre-rendered predicate list for raw
+ * queries that can't take a bound array.
+ */
+const UNSCHEDULED_JOB_STATUSES = ["open", "pending"];
+const UNSCHEDULED_JOB_STATUSES_SQL = "('open', 'pending')";
+
 function jobRow(row) {
   return {
     id:                     row.id,
@@ -179,7 +195,14 @@ async function listJobs(companyId, {
             a.customer_confirmed,
             a.technician_confirmed
      FROM jobs j
-     JOIN customers c ON c.id = j.customer_id
+     -- LEFT, not INNER: a job is not required to have a customer. InspectPoint
+     -- links work to a BUILDING, and its Account (our customers table) is
+     -- optional and usually absent -- on a real tenant 0 of 25 jobs had one,
+     -- so an inner join returned an empty job list for the whole company while
+     -- the rows sat right there in the table. ServiceTrade is affected too,
+     -- just invisibly: 12 of its jobs have a null/dangling customer_id and
+     -- were being silently omitted from every list and every total.
+     LEFT JOIN customers c ON c.id = j.customer_id
      LEFT JOIN locations l ON l.id = j.location_id
      LEFT JOIN technicians t ON t.id = j.technician_id
      LEFT JOIN LATERAL (
@@ -192,10 +215,10 @@ async function listJobs(companyId, {
      LIMIT $${i} OFFSET $${i + 1}`,
       [...values, limit, offset]
     ),
-    // JOIN customers is required, not optional: it's an INNER join, so it can
-    // exclude jobs (a job whose customer row is missing), and `search` filters
-    // on c.full_name. Without it `total` could exceed the rows actually
-    // returnable, or the count would fail outright on a search.
+    // The customers join must stay here and must stay LEFT, matching the rows
+    // query exactly: `search` filters on c.full_name, so the column has to be
+    // in scope, and any difference in join type between the two queries would
+    // make `total` disagree with the rows actually returned.
     //
     // The LEFT JOIN LATERAL is deliberately omitted — it only populates
     // active_appointment and can neither exclude nor duplicate rows, so it's
@@ -207,7 +230,7 @@ async function listJobs(companyId, {
     db.query(
       `SELECT COUNT(*)::int AS n
          FROM jobs j
-         JOIN customers c ON c.id = j.customer_id
+         LEFT JOIN customers c ON c.id = j.customer_id
          LEFT JOIN locations l ON l.id = j.location_id
          LEFT JOIN technicians t ON t.id = j.technician_id
         WHERE ${where}`,
@@ -262,7 +285,11 @@ async function getJobById(id, companyId) {
             t.email         AS technician_email,
             l.name          AS location_name
      FROM jobs j
-     JOIN customers c  ON c.id = j.customer_id
+     -- LEFT, for the same reason as listJobs: a customer is optional on a job
+     -- (InspectPoint links work to a building, and its Account is usually
+     -- absent). An inner join here made GET /jobs/:id 404 on a job that
+     -- exists.
+     LEFT JOIN customers c  ON c.id = j.customer_id
      LEFT JOIN technicians t ON t.id = j.technician_id
      -- LEFT JOIN, folded into the existing read rather than a second query:
      -- this sits on the voice-dispatch path, where an extra round trip is
@@ -726,4 +753,5 @@ module.exports = {
   fetchServicesByAppointment, fetchJobServiceLines,
   listAppointmentsByJob, createAppointment, updateAppointment, getAppointmentById,
   bulkConfirmAppointments,
+  UNSCHEDULED_JOB_STATUSES, UNSCHEDULED_JOB_STATUSES_SQL,
 };
