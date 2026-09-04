@@ -83,6 +83,13 @@ module.exports = {
     username: process.env.SERVICETRADE_USERNAME || "",
     password: process.env.SERVICETRADE_PASSWORD || "",
   },
+  inspectpoint: {
+    // Real InspectPoint has no single base URL — every tenant is
+    // https://{subdomain}.inspectpoint.com. This override exists purely for
+    // local development against scripts/mock-inspectpoint-server.js, which
+    // has no subdomain routing of its own; unset in every real environment.
+    baseUrlOverride: (process.env.INSPECTPOINT_BASE_URL_OVERRIDE || "").replace(/\/$/, ""),
+  },
   copilot: {
     // LLM providers — failover order is openai → groq (see src/copilot/graph/model.js)
     openaiApiKey: process.env.OPENAI_API_KEY || "",

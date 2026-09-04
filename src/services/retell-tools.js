@@ -19,6 +19,8 @@ const retell = require("./retell");
 const db = require("../db");
 const callSettingsDb = require("../db/call-settings");
 const toolDefsDb = require("../db/tool-definitions");
+const { resolveSlugForCompany } = require("./crm");
+const { getWorkflow } = require("../confirmation-agent/workflows");
 const logger = require("../utils/logger");
 
 function getBaseUrl() {
@@ -60,6 +62,29 @@ function dbRowToRetellTool(row, baseUrl, companyId) {
 }
 
 /**
+ * The company's CRM workflow can withhold a capability even when the manual
+ * `call_settings` flag is still on (e.g. left over from before a company
+ * switched CRMs, or just the column default) — same "constrain what's
+ * structurally possible" principle chat's tools/registry.js CAPABILITY_TOOLS
+ * already applies, just enforced here at registration time instead of per
+ * turn, since voice tools are pushed to Retell once, not rebuilt per call.
+ * Extracted as its own function so this specific gating decision is testable
+ * without mocking the whole Retell API interaction registerToolsForCompany does.
+ */
+function applyWorkflowCapabilities(settings, workflow) {
+  return {
+    ...settings,
+    service_link_enabled: settings.service_link_enabled === true && workflow.capabilities?.serviceLink !== false,
+    // Unlike service_link_enabled, there is no manual call_settings column for
+    // this — slot suggestion isn't a customer-facing feature toggle, purely a
+    // question of whether the connected CRM's data supports it. Computed
+    // fresh here, not read from `settings`, so it's undefined -> false for
+    // every existing settings row rather than needing a migration/default.
+    slot_suggestion_enabled: workflow.capabilities?.slotSuggestion === true,
+  };
+}
+
+/**
  * Push tools from tool_definitions DB → each subagent node in the company's
  * conversation flow. Respects agent_can_make_changes: when false, write tools
  * are omitted and the node prompt is annotated with a read-only notice.
@@ -74,6 +99,9 @@ async function registerToolsForCompany(companyId) {
   // Fetch agent_can_make_changes for this company
   const settings = await callSettingsDb.getByCompanyId(companyId);
   const canMakeChanges = settings.agent_can_make_changes !== false;
+
+  const workflow = getWorkflow(await resolveSlugForCompany(companyId));
+  const effectiveSettings = applyWorkflowCapabilities(settings, workflow);
 
   // Fetch subagent node IDs per call type
   const { rows: callTypeRows } = await db.query(
@@ -91,11 +119,12 @@ async function registerToolsForCompany(companyId) {
   }
 
   // Load all enabled tools from DB, filtered by write permission, then by any
-  // additional feature-flag gate (e.g. search_contact/create_contact require
-  // service_link_enabled — no point offering contact search/creation when the
-  // company has that feature off). `settings` is already loaded above.
+  // additional feature-flag gate (e.g. resolve_service_link_contact/
+  // get_service_link require service_link_enabled — no point offering
+  // contact search/creation when the company has that feature off, or when
+  // its CRM has no service-link capability at all regardless of the flag).
   const allToolRows = (await toolDefsDb.getAll({ writeToolsEnabled: canMakeChanges }))
-    .filter((t) => !t.gated_by_setting || settings[t.gated_by_setting] === true);
+    .filter((t) => !t.gated_by_setting || effectiveSettings[t.gated_by_setting] === true);
 
   // Split into universal vs per-call-type. Universal tools (call_type='_universal')
   // attach to every subagent node regardless of the company's call types — used
@@ -216,4 +245,5 @@ module.exports = {
   maybeResyncToolsAfterSettingsChange,
   TOOL_AFFECTING_SETTINGS,
   getBaseUrl,
+  applyWorkflowCapabilities,
 };

@@ -82,6 +82,7 @@ async function getStats(companyId, periodInput) {
            NULLIF(COUNT(*) FILTER (WHERE status != 'cancelled'), 0) * 100, 1
          )                                                                           AS confirmation_rate,
          COUNT(*) FILTER (WHERE status = 'open')                                    AS s_open,
+         COUNT(*) FILTER (WHERE status = 'pending')                                 AS s_pending,
          COUNT(*) FILTER (WHERE status = 'scheduled')                               AS s_scheduled,
          COUNT(*) FILTER (WHERE status = 'rescheduled')                             AS s_rescheduled,
          COUNT(*) FILTER (WHERE status = 'confirmed')                               AS s_confirmed,
@@ -212,6 +213,9 @@ async function getStats(companyId, periodInput) {
       confirmation_rate: j.confirmation_rate !== null ? Number(j.confirmation_rate) : null,
       by_status: {
         open:        Number(j.s_open),
+        // InspectPoint's vocabulary for the same state as `open` (migration
+        // 106). Counted separately so the tiles still sum to `total`.
+        pending:     Number(j.s_pending),
         scheduled:   Number(j.s_scheduled),
         rescheduled: Number(j.s_rescheduled),
         confirmed:   Number(j.s_confirmed),

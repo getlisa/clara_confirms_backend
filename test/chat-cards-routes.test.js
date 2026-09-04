@@ -299,7 +299,12 @@ test("reschedule_appointment: with NO date/time, still streams the same four-eve
 
 // ── trigger: cancel_appointment ──────────────────────────────────────────────
 
-test("cancel_appointment: reason is required — 400 before any SSE stream, before the token is even resolved", async () => {
+test("cancel_appointment: reason is required for a workflow that doesn't relax it (ServiceTrade) — 400 before any SSE stream", async () => {
+  // The token IS resolved before this check now (needed to look up the
+  // company's workflow and decide whether reason is even required — see
+  // handleCardTriggerMessage) — but the resolution itself never touches the
+  // graph/SSE, so the observable contract (400, no chat message sent) is
+  // unchanged from when this ran purely off request args.
   reset();
   const { status, json } = await trigger("valid-token", "cancel_appointment", { appointment_id: 501 });
   assert.equal(status, 400);

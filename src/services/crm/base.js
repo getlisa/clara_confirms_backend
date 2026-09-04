@@ -29,6 +29,23 @@ class CrmProvider {
   normalizeServiceRequest(_rawRow) { return null; }
   normalizeContact(_rawRow)        { return null; }
   normalizeQuote(_rawRow)          { return null; }
+
+  // ── CRM write-back mirrors ──────────────────────────────────────────────
+  //
+  // Called by BOTH the chat agent (confirmation-agent/actions.js) and the
+  // voice agent (routes/retell-tools.js, routes/retell.js), which resolve the
+  // provider from a job/appointment's own `source` column via
+  // crm/index.js's getProviderForSource() rather than importing a concrete
+  // CRM module directly. Default no-op: a provider that doesn't implement one
+  // (or a row with no CRM source at all) is simply not mirrored — the
+  // platform is always the system of record regardless.
+  async mirrorRescheduleAppointment(_companyId, _appointment, _opts) { return { skipped: "not_supported" }; }
+  async mirrorCreateAppointment(_companyId, _appointment, _platformJobId, _opts) { return { skipped: "not_supported" }; }
+  async mirrorRescheduleJob(_companyId, _job, _opts) { return { skipped: "not_supported" }; }
+  async mirrorCancelAppointment(_companyId, _appointment, _opts) { return { skipped: "not_supported" }; }
+  async mirrorCancelJob(_companyId, _job, _opts) { return { skipped: "not_supported" }; }
+  async mirrorPostChatComment(_companyId, _params) { return { skipped: "not_supported" }; }
+  async mirrorPostCallComment(_companyId, _params) { return { skipped: "not_supported" }; }
 }
 
 module.exports = { CrmProvider };

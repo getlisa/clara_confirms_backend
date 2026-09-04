@@ -4,6 +4,7 @@ const callTriggerConfigsDb = require("../db/call-trigger-configs");
 const callTypeConfigsDb = require("../db/call-type-configs");
 const scheduledCallsDb = require("../db/scheduled-calls");
 const todosDb = require("../db/todos");
+const { UNSCHEDULED_JOB_STATUSES_SQL } = require("../db/jobs");
 const { computeInitialPriority } = require("./call-priority");
 const { resolveOutboundChannel } = require("./channel-resolver");
 const { buildJobConfirmationContext, toDynamicVariables } = require("./job-confirmation-context");
@@ -174,6 +175,29 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
             reason: `Current time is outside business hours (${cs.business_hours_start}–${cs.business_hours_end} ${tz})`,
             rescheduledTo: nextWindow,
           });
+          skipped++; continue;
+        }
+      }
+
+      // Pre-dial staleness guard. A call is queued by a sweep and dialled
+      // later — up to a full CRM-sync interval afterwards — so the job it is
+      // about can be cancelled or completed in between and nothing downstream
+      // would notice. Re-checked here, immediately before dialling, because
+      // this is the only point that sees the state as it is at dial time.
+      //
+      // Provider-agnostic on purpose: the trigger was an InspectPoint gap, but
+      // the race is identical for ServiceTrade and for a manually-created row.
+      // Cancelled terminally, not retried — retrying is the wrong response to
+      // "the work no longer exists".
+      if (row.job_id) {
+        const { rows: jr } = await db.query(
+          `SELECT status FROM jobs WHERE id = $1 AND company_id = $2`,
+          [row.job_id, row.company_id]
+        );
+        const jobStatus = jr[0]?.status;
+        if (jobStatus === "cancelled" || jobStatus === "completed") {
+          await scheduledCallsDb.markCancelled(row.id, `Job is ${jobStatus} — cancelled before dialling`);
+          logger.info("Dispatcher: skipped — job no longer actionable", { ...ctx, jobStatus });
           skipped++; continue;
         }
       }
@@ -1207,7 +1231,7 @@ async function processOpenJobDueSoon(companyId, trigger, callSettings, tz, smsLi
     FROM jobs j
     JOIN customers c ON c.id = j.customer_id
     WHERE j.company_id = $1
-      AND j.status = 'open'
+      AND j.status IN ${UNSCHEDULED_JOB_STATUSES_SQL}
       AND ${dateClause}
       AND NOT EXISTS (
         SELECT 1 FROM appointments ap

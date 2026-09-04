@@ -20,6 +20,8 @@ const chatLinksDb = require("../db/chat-links");
 const sendEventsDb = require("../db/chat-link-send-events");
 const confirmationAgent = require("../confirmation-agent");
 const { PROPOSE_REMAINING_TRIGGER } = require("../confirmation-agent/actions");
+const { resolveSlugForCompany } = require("../services/crm");
+const { getWorkflow } = require("../confirmation-agent/workflows");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -566,7 +568,7 @@ async function resolveForAction(token) {
 async function resolveLinkOnly(token) {
   const link = await chatLinksDb.getByToken(token);
   if (!link) return { ok: false, status: 404, error: "Chat link not found" };
-  return { ok: true, threadId: token };
+  return { ok: true, threadId: token, companyId: link.company_id };
 }
 
 /**
@@ -672,7 +674,7 @@ const TRIGGERS_WITH_NEEDS_PROPOSE_REMAINING = new Set([
  * checked here — that surfaces as a tool_result-driven `error` event instead
  * (see bulkConfirmCore), exactly as it did on the old bulk-confirm route.
  */
-function buildCardTriggerArgs(trigger, args) {
+function buildCardTriggerArgs(trigger, args, { reasonRequired = true } = {}) {
   switch (trigger) {
     case "confirm_appointment": {
       const appointment_id = Number(args.appointment_id);
@@ -692,10 +694,16 @@ function buildCardTriggerArgs(trigger, args) {
     case "cancel_appointment": {
       const appointment_id = Number(args.appointment_id);
       if (!appointment_id) return { ok: false, status: 400, error: "args.appointment_id is required" };
-      if (!args.reason || !String(args.reason).trim()) return { ok: false, status: 400, error: "args.reason is required" };
+      // Required by default (ServiceTrade's workflow); a workflow whose
+      // capabilities.cancellationReason is "optional" (InspectPoint) relaxes
+      // this — see the caller, which resolves the company's workflow before
+      // building args.
+      if (reasonRequired && (!args.reason || !String(args.reason).trim())) {
+        return { ok: false, status: 400, error: "args.reason is required" };
+      }
       return {
         ok: true,
-        cardTriggerArgs: { appointment_id, reason: args.reason, scope: args.scope === "entire_job" ? "entire_job" : "appointment_only" },
+        cardTriggerArgs: { appointment_id, reason: args.reason || null, scope: args.scope === "entire_job" ? "entire_job" : "appointment_only" },
       };
     }
     case "confirm_job_appointments":
@@ -760,11 +768,19 @@ function buildCardTriggerArgs(trigger, args) {
 async function handleCardTriggerMessage(req, res, trigger, args) {
   let sse = null;
   try {
-    const built = buildCardTriggerArgs(trigger, args);
-    if (!built.ok) return res.status(built.status).json({ error: built.error });
-
     const r = await resolveLinkOnly(req.params.token);
     if (!r.ok) return res.status(r.status).json({ error: r.error });
+
+    // Only cancel_appointment's reason-required check depends on the
+    // company's workflow, so only resolve it for that trigger — every other
+    // trigger's arg validation is CRM-agnostic and doesn't need this.
+    let reasonRequired = true;
+    if (trigger === "cancel_appointment") {
+      const slug = await resolveSlugForCompany(r.companyId);
+      reasonRequired = getWorkflow(slug).capabilities?.cancellationReason !== "optional";
+    }
+    const built = buildCardTriggerArgs(trigger, args, { reasonRequired });
+    if (!built.ok) return res.status(built.status).json({ error: built.error });
 
     sse = startSse(res);
 
@@ -828,3 +844,8 @@ router.post("/:token/end", openCors, async (req, res) => {
 });
 
 module.exports = router;
+// Exported for direct unit testing of the pure arg-building/validation logic
+// (notably the cancellationReason relaxation), matching the existing
+// convention elsewhere (e.g. servicetrade-comments.js's buildCommentBody/
+// deriveLabel) of exposing small pure helpers alongside the route's default export.
+module.exports.buildCardTriggerArgs = buildCardTriggerArgs;

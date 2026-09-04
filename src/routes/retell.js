@@ -7,6 +7,7 @@ const todosDb = require("../db/todos");
 const scheduledCallsDb = require("../db/scheduled-calls");
 const stComments = require("../services/servicetrade-comments");
 const stServiceLink = require("../services/servicetrade-service-link");
+const { getProviderForSource, resolveSlugForCompany } = require("../services/crm");
 const db = require("../db");
 const { getNextWindowStart } = require("../services/scheduler");
 const { parseCallbackTime } = require("../services/callback-time");
@@ -352,38 +353,58 @@ async function handleCallAnalyzed(callData) {
     }
   }
 
-  // ── Post-call ServiceTrade write-backs (comment + service link) ────────────
+  // ── Post-call CRM write-backs (comment + service link) ─────────────────────
   // For ANSWERED calls only (voicemail/no-answer excluded). AWAITED (not
   // fire-and-forget) so the network POSTs complete before this handler returns —
   // on Vercel the function is frozen once the webhook responds, which would cut
   // off any still-pending async work (this was the root cause of comments not
   // posting). Each action is internally gated by its own per-company toggle.
+  //
+  // Dispatch is by the COMPANY's active CRM (resolveSlugForCompany), not a
+  // per-row `source` lookup: a company only ever has one CRM connected at a
+  // time (InspectPoint's connect route refuses to connect while ServiceTrade
+  // is active, and vice versa), and postCallComment's own resolveTargets
+  // already re-derives the real job/appointment source internally before
+  // writing anything — duplicating that resolution here with a fresh query
+  // risks disagreeing with it on an edge case (e.g. a null job_id) and
+  // silently dropping a legitimate comment. resolveSlugForCompany defaults to
+  // "servicetrade" on any ambiguity, which is exactly today's unconditional
+  // behavior preserved for the common case.
+  //
+  // Service link has no InspectPoint equivalent at all, so it stays a direct
+  // guard rather than a provider dispatch — there is no second implementation
+  // to route to. This was the one call site with NO guard whatsoever before
+  // Phase 3: it fired for every answered customer_confirmation call
+  // regardless of CRM, unlike the tool-driven paths which are at least gated
+  // by tool registration.
   const callType = metadata?.call_type;
   const wantsComment = !inVoicemail && !isNoAnswer && stComments.appliesToCallType(callType);
-  const wantsServiceLink = !inVoicemail && !isNoAnswer && callType === "customer_confirmation";
-  logger.info("servicetrade post-call: gate", {
-    callId: call_id, companyId, callType, inVoicemail, isNoAnswer, wantsComment, wantsServiceLink,
+  const wantsServiceLinkByCallType = !inVoicemail && !isNoAnswer && callType === "customer_confirmation";
+  logger.info("crm post-call: gate", {
+    callId: call_id, companyId, callType, inVoicemail, isNoAnswer, wantsComment, wantsServiceLinkByCallType,
   });
-  if (wantsComment || wantsServiceLink) {
+  if (wantsComment || wantsServiceLinkByCallType) {
     try {
       const { rows: scRows } = await db.query(`SELECT * FROM scheduled_calls WHERE retell_call_id = $1 LIMIT 1`, [call_id]);
       const sc = scRows[0];
       if (!sc) {
-        logger.warn("servicetrade post-call: no scheduled_calls row for retell_call_id; cannot resolve entity", { callId: call_id, companyId });
+        logger.warn("crm post-call: no scheduled_calls row for retell_call_id; cannot resolve entity", { callId: call_id, companyId });
       } else {
+        const companySlug = await resolveSlugForCompany(companyId);
+
         if (wantsComment) {
-          await stComments
-            .postCallComment({ companyId, scheduledCall: sc, outcome, custom, callSummary: outcome.callSummary, retellCallId: call_id, callId })
-            .catch((err) => logger.error("servicetrade comment write-back failed", { error: err.message, callId: call_id }));
+          await getProviderForSource(companySlug)
+            ?.mirrorPostCallComment(companyId, { scheduledCall: sc, outcome, custom, callSummary: outcome.callSummary, retellCallId: call_id, callId })
+            .catch((err) => logger.error("crm comment write-back failed", { error: err.message, callId: call_id }));
         }
-        if (wantsServiceLink) {
+        if (wantsServiceLinkByCallType && companySlug === "servicetrade") {
           await stServiceLink
             .postCallServiceLink({ companyId, scheduledCall: sc, outcome, retellCallId: call_id, callId })
             .catch((err) => logger.error("servicetrade service-link failed", { error: err.message, callId: call_id }));
         }
       }
     } catch (err) {
-      logger.error("servicetrade post-call: scheduled_calls lookup failed", { error: err.message, callId: call_id });
+      logger.error("crm post-call: scheduled_calls lookup failed", { error: err.message, callId: call_id });
     }
   }
 

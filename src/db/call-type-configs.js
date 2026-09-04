@@ -46,8 +46,30 @@ const BUILTIN_SEEDS = [
  * Built-in types get tailored prompts; custom types get generic ones derived
  * from the type's name and description.
  */
-function generateDefaultPrompts(type, name, description) {
+function generateDefaultPrompts(type, name, description, workflow = null) {
   if (type === "customer_confirmation") {
+    // `workflow` is only ever passed by prompt-sync.js's resetDefaultPrompts
+    // (the "reset to default" entry point) — every other caller (fresh
+    // company seeding, ad-hoc custom-type creation) omits it, which defaults
+    // to today's ServiceTrade-flavored behavior unchanged. See
+    // confirmation-agent/workflows/*.js for what a workflow actually is.
+    const hasServiceLink = workflow?.capabilities?.serviceLink !== false;
+    const cancellationReasonOptional = workflow?.capabilities?.cancellationReason === "optional";
+    const serviceLinkSection = !hasServiceLink ? "" :
+        "━━━ SERVICE LINK (only AFTER the customer has confirmed at least one appointment) ━━━\n" +
+        "Offer to send them a link to track this job. One link covers the whole job, not a single appointment:\n" +
+        "  → Ask: \"Would you like me to email you a service link where you can follow this job?\"\n" +
+        "  → If NO: skip this section and wrap up.\n" +
+        "  → If YES:\n" +
+        "     1. Read the address back and get an explicit yes. If {{customer_email}} is not empty: \"I have your email as {{customer_email}} — is that the right one to send it to?\" If it IS empty, ask for it and read back what you heard, letter by letter if it is at all unusual.\n" +
+        "     2. ONLY after they say yes (or give you a different address), call resolve_service_link_contact with that email AND email_confirmed=true. Do not ask for their name or role first.\n" +
+        "        • Calling it without email_confirmed=true returns status \"needs_email_confirmation\" and sends nothing — go back and ask.\n" +
+        "        • Never set email_confirmed=true for an address they have not actually agreed to. If no contact matches, this tool CREATES one in our CRM, so a misheard address is not just a misdirected link.\n" +
+        "        • If the result status is \"found\": confirm back with the customer (e.g. \"I found you in our system as [name] — is that right?\") and continue — no further info needed.\n" +
+        "        • If the result status is \"need_more_info\": THEN, and only then, ask who this is for / their role (e.g. management, billing, on-site, scheduling, owner) and their first/last name, then call resolve_service_link_contact again including email, first_name, last_name, and role.\n" +
+        "     3. If {{is_chat_session}} is \"true\": immediately call get_service_link. The link itself is displayed to the customer automatically as a preview card — do NOT type or paste the URL yourself, just say something like \"Perfect — here's your service link below! I've also sent it to [email].\" Do this every time, not just when asked.\n" +
+        "        If {{is_chat_session}} is NOT \"true\" (phone call): do NOT call get_service_link — there's nowhere to display a link on a phone call. resolve_service_link_contact's response includes link_sent (true/false) — check it and phrase accordingly: if link_sent is true, say \"Perfect — I've just sent that to [email].\"; if link_sent is false (the appointment isn't confirmed yet), say \"Perfect — I'll send that to [email] as soon as we wrap up.\" Never say \"right after we finish up\" if link_sent is true — it's already done.\n" +
+        "  → At ANY point in a chat session, if the customer asks you to share/send/show the link directly in the conversation, call get_service_link right away (never paste the URL text yourself — it displays automatically) — even if you already said it would only be emailed, even if you're past this section.\n\n";
     return {
       begin_message:
         "Hi {{location_name}}, this is {{representative_name}} calling from {{company_name}}. " +
@@ -149,13 +171,17 @@ function generateDefaultPrompts(type, name, description) {
         "  If the customer wants to CANCEL outright (not reschedule):\n" +
         "    → Establish WHICH appointment the same way.\n" +
         "    → Ask: \"Just to confirm — would you like to cancel just this appointment, or do you not need this job at all anymore?\" Only choose 'entire_job' if they don't need the job at all — remember this job may have other visits scheduled.\n" +
-        "    → Ask: \"Can I ask why you'd like to cancel?\" and note their reason.\n" +
+        (cancellationReasonOptional
+          ? "    → You may ask why they'd like to cancel, but don't press if they'd rather not say — it's optional here.\n"
+          : "    → Ask: \"Can I ask why you'd like to cancel?\" and note their reason.\n") +
         "    → Call cancel_appointment with that appointment_id, scope ('appointment_only' or 'entire_job'), and reason.\n" +
         "    → Confirm back: \"No problem, that's cancelled for you.\"\n\n" +
         "── CASE B: every upcoming appointment is already confirmed (all_upcoming_confirmed = true) ──\n" +
         "Do NOT ask for confirmation as though nothing is on file.\n" +
         "  → Say: \"Good news — everything on this job is already confirmed on our side. The next visit is [date] for [service]. I just wanted to make sure that still works for you.\"\n" +
-        "  → If it still works: thank them and go to the SERVICE LINK section. No tool call needed.\n" +
+        (hasServiceLink
+          ? "  → If it still works: thank them and go to the SERVICE LINK section. No tool call needed.\n"
+          : "  → If it still works: thank them and wrap up. No tool call needed.\n") +
         "  → If it doesn't: handle it as a reschedule or cancellation exactly as in CASE A.\n" +
         "  → SKIP STEP 3 — there is nothing left to confirm.\n\n" +
         "── CASE C: no upcoming appointments ({{upcoming_count}} is 0) ──\n" +
@@ -175,20 +201,7 @@ function generateDefaultPrompts(type, name, description) {
         "  → They want to reschedule or cancel one of them instead: handle it as in CASE A, then ask this question once more about whatever upcoming appointments are still unconfirmed.\n\n" +
         "  Do NOT ask this when there are no other upcoming appointments (a single-appointment job) or when every other upcoming appointment is already confirmed — asking then is confusing. Just move on.\n" +
         "  You may NOT say goodbye until you have either asked this question or established that it does not apply.\n\n" +
-        "━━━ SERVICE LINK (only AFTER the customer has confirmed at least one appointment) ━━━\n" +
-        "Offer to send them a link to track this job. One link covers the whole job, not a single appointment:\n" +
-        "  → Ask: \"Would you like me to email you a service link where you can follow this job?\"\n" +
-        "  → If NO: skip this section and wrap up.\n" +
-        "  → If YES:\n" +
-        "     1. Read the address back and get an explicit yes. If {{customer_email}} is not empty: \"I have your email as {{customer_email}} — is that the right one to send it to?\" If it IS empty, ask for it and read back what you heard, letter by letter if it is at all unusual.\n" +
-        "     2. ONLY after they say yes (or give you a different address), call resolve_service_link_contact with that email AND email_confirmed=true. Do not ask for their name or role first.\n" +
-        "        • Calling it without email_confirmed=true returns status \"needs_email_confirmation\" and sends nothing — go back and ask.\n" +
-        "        • Never set email_confirmed=true for an address they have not actually agreed to. If no contact matches, this tool CREATES one in our CRM, so a misheard address is not just a misdirected link.\n" +
-        "        • If the result status is \"found\": confirm back with the customer (e.g. \"I found you in our system as [name] — is that right?\") and continue — no further info needed.\n" +
-        "        • If the result status is \"need_more_info\": THEN, and only then, ask who this is for / their role (e.g. management, billing, on-site, scheduling, owner) and their first/last name, then call resolve_service_link_contact again including email, first_name, last_name, and role.\n" +
-        "     3. If {{is_chat_session}} is \"true\": immediately call get_service_link. The link itself is displayed to the customer automatically as a preview card — do NOT type or paste the URL yourself, just say something like \"Perfect — here's your service link below! I've also sent it to [email].\" Do this every time, not just when asked.\n" +
-        "        If {{is_chat_session}} is NOT \"true\" (phone call): do NOT call get_service_link — there's nowhere to display a link on a phone call. resolve_service_link_contact's response includes link_sent (true/false) — check it and phrase accordingly: if link_sent is true, say \"Perfect — I've just sent that to [email].\"; if link_sent is false (the appointment isn't confirmed yet), say \"Perfect — I'll send that to [email] as soon as we wrap up.\" Never say \"right after we finish up\" if link_sent is true — it's already done.\n" +
-        "  → At ANY point in a chat session, if the customer asks you to share/send/show the link directly in the conversation, call get_service_link right away (never paste the URL text yourself — it displays automatically) — even if you already said it would only be emailed, even if you're past this section.\n\n" +
+        serviceLinkSection +
         "━━━ GENERAL RULES ━━━\n" +
         "- Do NOT call get_appointments to open — you were already given this job's appointments. Call it in exactly three situations: (a) {{upcoming_count}} came through blank, (b) right after any confirm/reschedule/cancel/create, since the given values are now stale, (c) the customer asks about appointments beyond the \"...plus N more\" cutoff.\n" +
         "- Talk about the JOB and its visits — never as if the job were a single appointment.\n" +

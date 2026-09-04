@@ -19,6 +19,7 @@ const HANDLERS = [
   require("./handlers/confirm-job-appointments"),
   require("./handlers/list-upcoming-appointments"),
   require("./handlers/reschedule-appointment"),
+  require("./handlers/propose-reschedule-slots"),
   require("./handlers/cancel-appointment"),
   require("./handlers/create-appointment"),
   require("./handlers/resolve-service-link-contact"),
@@ -51,8 +52,8 @@ const byName = new Map(HANDLERS.map((h) => [h.name, h]));
 // action of any kind, and create_appointment (no_appointment's only action)
 // is one of those.
 const PHASE_TOOLS = {
-  confirming: ["confirm_appointment", "confirm_job_appointments", "list_upcoming_appointments", "reschedule_appointment", "cancel_appointment", "resolve_service_link_contact", "get_service_link", "decline_remaining_appointments", "capture_confirmer_identity"],
-  all_confirmed: ["list_upcoming_appointments", "reschedule_appointment", "cancel_appointment", "resolve_service_link_contact", "get_service_link", "decline_remaining_appointments", "capture_confirmer_identity"],
+  confirming: ["confirm_appointment", "confirm_job_appointments", "list_upcoming_appointments", "reschedule_appointment", "propose_reschedule_slots", "cancel_appointment", "resolve_service_link_contact", "get_service_link", "decline_remaining_appointments", "capture_confirmer_identity"],
+  all_confirmed: ["list_upcoming_appointments", "reschedule_appointment", "propose_reschedule_slots", "cancel_appointment", "resolve_service_link_contact", "get_service_link", "decline_remaining_appointments", "capture_confirmer_identity"],
   no_appointment: ["create_appointment", "capture_confirmer_identity"],
 };
 
@@ -98,6 +99,7 @@ function build() {
 // itself already applies per-phase.
 const CAPABILITY_TOOLS = {
   serviceLink: ["resolve_service_link_contact", "get_service_link"],
+  slotSuggestion: ["propose_reschedule_slots"],
 };
 
 /**

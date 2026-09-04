@@ -16,7 +16,7 @@ const { HumanMessage } = require("@langchain/core/messages");
 const { getGraph } = require("./graph/build");
 const db = require("../db");
 const chatLinksDb = require("../db/chat-links");
-const { postConfirmationAgentComment } = require("../services/servicetrade-comments");
+const { getProviderForSource, resolveSlugForCompany } = require("../services/crm");
 const { resolveContact, labelFromConfirmedBy } = require("./tools/confirmer-label");
 const confirmerIdentitiesDb = require("../db/confirmer-identities");
 const sendEventsDb = require("../db/chat-link-send-events");
@@ -389,11 +389,18 @@ async function finalizeConversation(threadId, ctx) {
   // Prefer a name the customer actually gave us this session over the link's
   // addressed-to recipient — see capture-confirmer-identity.js.
   const confirmedBy = ctx.confirmedBy || (await resolveConfirmedBy(threadId));
-  await postConfirmationAgentComment({
-    companyId: ctx.companyId, jobId: ctx.jobId, threadId,
-    summaryLines, appointmentIds, messageCount: messages.length,
-    recipientName: labelFromConfirmedBy(confirmedBy) || ctx.recipientName || null,
-  }).catch((err) => logger.warn("ConfirmationAgent: outcome comment post failed", { error: err.message, threadId }));
+  // Dispatched by the company's active CRM (see routes/retell.js's post-call
+  // sweep for why this resolves company-wide rather than re-deriving a
+  // per-row source: a company only ever has one CRM connected at a time, and
+  // duplicating postConfirmationAgentComment's own internal target
+  // resolution here risks disagreeing with it on an edge case).
+  const companySlug = await resolveSlugForCompany(ctx.companyId);
+  await getProviderForSource(companySlug)
+    ?.mirrorPostChatComment(ctx.companyId, {
+      jobId: ctx.jobId, threadId,
+      summaryLines, appointmentIds, messageCount: messages.length,
+      recipientName: labelFromConfirmedBy(confirmedBy) || ctx.recipientName || null,
+    }).catch((err) => logger.warn("ConfirmationAgent: outcome comment post failed", { error: err.message, threadId }));
 }
 
 async function runGraph(threadId, ctx, input, onEvent = null) {
@@ -551,8 +558,9 @@ async function postExpiredOutcomeComment({ companyId, jobId, token }) {
     const { lines: summaryLines, appointmentIds } = summarizeOutcome(messages, { tools: EXPIRY_OUTCOME_TOOLS });
     if (!summaryLines.length) return { posted: false, reason: "no_outcome" };
 
-    await postConfirmationAgentComment({
-      companyId, jobId, threadId: token,
+    const companySlug = await resolveSlugForCompany(companyId);
+    await getProviderForSource(companySlug)?.mirrorPostChatComment(companyId, {
+      jobId, threadId: token,
       summaryLines, appointmentIds, messageCount: messages.length,
       // Marks the comment as coming from a lapsed conversation, so the office can
       // tell it from a chat that closed properly.

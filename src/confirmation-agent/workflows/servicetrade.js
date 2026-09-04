@@ -52,6 +52,13 @@ module.exports = {
   // get_service_link vanish together — the same "constrain what's
   // structurally possible rather than instructing against it" principle
   // PHASE_TOOLS already applies to phases.
-  capabilities: { serviceLink: true },
+  // slotSuggestion is explicitly OFF here (Phase 6): the underlying
+  // technician-availability service is CRM-agnostic and would work fine
+  // against ServiceTrade-synced data, but ServiceTrade has years of existing
+  // live customers on the current "ask for a time, just write it" flow —
+  // turning on a brand-new soft-hold/race-handling code path for all of them
+  // by default is a rollout decision for later, not an automatic side effect
+  // of building it for InspectPoint's launch. See workflows/inspectpoint.js.
+  capabilities: { serviceLink: true, slotSuggestion: false },
   checklist,
 };

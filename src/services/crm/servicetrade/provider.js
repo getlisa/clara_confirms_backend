@@ -22,7 +22,15 @@ const normalize       = require("./normalize");
 const callSettingsDb  = require("../../../db/call-settings");
 const { inferJobConfirmations } = require("../../job-confirmation-inference");
 const { syncAllJobStatuses } = require("../../job-confirmation-status");
+const { replaceJunction, bulkInsertPlain } = require("../shared/junctions");
 const logger          = require("../../../utils/logger");
+
+// db.fetchExternalRefMap defaults to source="servicetrade" for backward
+// compatibility, but every call in this file goes through this local wrapper
+// instead of relying on that default — so a future edit here can never
+// silently cross-link another CRM's rows just by omitting an argument.
+const SOURCE = "servicetrade";
+const refMap = (companyId, table) => db.fetchExternalRefMap(companyId, table, SOURCE);
 
 class ServiceTradeProvider extends CrmProvider {
   get slug() { return "servicetrade"; }
@@ -48,6 +56,49 @@ class ServiceTradeProvider extends CrmProvider {
   async request(companyId, method, path, opts = {}) {
     const creds = await this.getCredentials(companyId);
     return await stClient.request(companyId, method, path, opts, creds);
+  }
+
+  // ── CRM write-back mirrors ───────────────────────────────────────────────
+  //
+  // Thin delegates to the existing servicetrade-appointments.js/
+  // servicetrade-comments.js functions — zero behavior change, just exposed
+  // through the CrmProvider interface so actions.js/retell-tools.js/retell.js
+  // can dispatch by a row's `source` instead of importing this CRM directly.
+  //
+  // Required LAZILY, not at module top: both modules pull in
+  // servicetrade-api.js, which does an eager `require("./crm")` — and this
+  // very provider.js is required BY services/crm/index.js while registering
+  // providers, so a top-level require here would close the cycle mid-load
+  // (crm/index.js's own module.exports is still the default {} at that point,
+  // so servicetrade-api.js's `getProvider` would be undefined). Same
+  // workaround the syncAll method below already uses for servicetrade-account.js.
+
+  async mirrorRescheduleAppointment(companyId, appointment, opts) {
+    return require("../../servicetrade-appointments").mirrorRescheduleAppointment(companyId, appointment, opts);
+  }
+
+  async mirrorCreateAppointment(companyId, appointment, platformJobId, opts) {
+    return require("../../servicetrade-appointments").mirrorCreateAppointment(companyId, appointment, platformJobId, opts);
+  }
+
+  async mirrorRescheduleJob(companyId, job, opts) {
+    return require("../../servicetrade-appointments").mirrorRescheduleJob(companyId, job, opts);
+  }
+
+  async mirrorCancelAppointment(companyId, appointment, opts) {
+    return require("../../servicetrade-appointments").mirrorCancelAppointment(companyId, appointment, opts);
+  }
+
+  async mirrorCancelJob(companyId, job, opts) {
+    return require("../../servicetrade-appointments").mirrorCancelJob(companyId, job, opts);
+  }
+
+  async mirrorPostChatComment(companyId, params) {
+    return require("../../servicetrade-comments").postConfirmationAgentComment({ companyId, ...params });
+  }
+
+  async mirrorPostCallComment(companyId, params) {
+    return require("../../servicetrade-comments").postCallComment({ companyId, ...params });
   }
 
   // ── Sync ───────────────────────────────────────────────────────────────────
@@ -411,8 +462,8 @@ class ServiceTradeProvider extends CrmProvider {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_locations", { updatedSince });
     // Bulk-fetch both FK maps ONCE instead of one lookup query per row.
     const [customersMap, contactsMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "customers"),
-      db.fetchExternalRefMap(companyId, "contacts"),
+      refMap(companyId, "customers"),
+      refMap(companyId, "contacts"),
     ]);
     // A location's primaryContact may be one of the duplicates that got merged
     // away, so resolve it through the alias to the surviving contact.
@@ -437,8 +488,8 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeLocationOffices(companyId) {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_locations", { columns: "id, servicetrade_id, payload" });
     const [locationsMap, officesMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "locations"),
-      db.fetchExternalRefMap(companyId, "offices"),
+      refMap(companyId, "locations"),
+      refMap(companyId, "offices"),
     ]);
     const pairs = [];
     const parents = new Set();
@@ -463,8 +514,8 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeLocationTags(companyId) {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_locations", { columns: "id, servicetrade_id, payload" });
     const [locationsMap, tagsMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "locations"),
-      db.fetchExternalRefMap(companyId, "tags"),
+      refMap(companyId, "locations"),
+      refMap(companyId, "tags"),
     ]);
     const pairs = [];
     const parents = new Set();
@@ -494,9 +545,9 @@ class ServiceTradeProvider extends CrmProvider {
     const rawContacts = await db.fetchAllByCompanyChunked(companyId, "servicetrade_contacts", { columns: "id, servicetrade_id, payload, email" });
     const alias = (dedupe || dedupeContactsByEmail(rawContacts)).alias;
     const [contactsMap, locationsMap, customersMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "contacts"),
-      db.fetchExternalRefMap(companyId, "locations"),
-      db.fetchExternalRefMap(companyId, "customers"),
+      refMap(companyId, "contacts"),
+      refMap(companyId, "locations"),
+      refMap(companyId, "customers"),
     ]);
     const locationPairs = [];
     const companyPairs = [];
@@ -610,14 +661,14 @@ class ServiceTradeProvider extends CrmProvider {
       ? rawAll.filter((r) => r.updated_at && new Date(r.updated_at) > new Date(updatedSince))
       : rawAll;
     const [customersMap, crmUsersMap, officesMap, projectsMap, contractsMap, appointmentsMap, locationsMap, contactsMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "customers"),
-      db.fetchExternalRefMap(companyId, "crm_users"),
-      db.fetchExternalRefMap(companyId, "offices"),
-      db.fetchExternalRefMap(companyId, "projects"),
-      db.fetchExternalRefMap(companyId, "contracts"),
-      db.fetchExternalRefMap(companyId, "appointments"),
-      db.fetchExternalRefMap(companyId, "locations"),
-      db.fetchExternalRefMap(companyId, "contacts"),
+      refMap(companyId, "customers"),
+      refMap(companyId, "crm_users"),
+      refMap(companyId, "offices"),
+      refMap(companyId, "projects"),
+      refMap(companyId, "contracts"),
+      refMap(companyId, "appointments"),
+      refMap(companyId, "locations"),
+      refMap(companyId, "contacts"),
     ]);
     const argsList = raw
       .map((row) => {
@@ -651,8 +702,8 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeJobOffices(companyId, rawJobs = null) {
     const raw = rawJobs || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_jobs", { columns: "id, servicetrade_id, payload" }));
     const [jobsMap, officesMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "jobs"),
-      db.fetchExternalRefMap(companyId, "offices"),
+      refMap(companyId, "jobs"),
+      refMap(companyId, "offices"),
     ]);
     const pairs = [];
     const parents = new Set();
@@ -674,8 +725,8 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeJobTags(companyId, rawJobs = null) {
     const raw = rawJobs || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_jobs", { columns: "id, servicetrade_id, payload" }));
     const [jobsMap, tagsMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "jobs"),
-      db.fetchExternalRefMap(companyId, "tags"),
+      refMap(companyId, "jobs"),
+      refMap(companyId, "tags"),
     ]);
     const pairs = [];
     const parents = new Set();
@@ -700,7 +751,7 @@ class ServiceTradeProvider extends CrmProvider {
    */
   async _normalizeSchedulingComments(companyId, rawJobs = null) {
     const raw = rawJobs || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_jobs", { columns: "id, servicetrade_id, payload" }));
-    const jobsMap = await db.fetchExternalRefMap(companyId, "jobs");
+    const jobsMap = await refMap(companyId, "jobs");
     // Keyed by comment id, not pushed to an array: the same comment can
     // legitimately appear more than once across a company's jobs — a
     // duplicate external_ref within one batch INSERT makes Postgres error
@@ -740,7 +791,7 @@ class ServiceTradeProvider extends CrmProvider {
       columns: "id, servicetrade_id, servicetrade_job_id, payload",
       updatedSince,
     });
-    const jobsMap = await db.fetchExternalRefMap(companyId, "jobs");
+    const jobsMap = await refMap(companyId, "jobs");
     // De-duped by comment id for the same reason as scheduling comments —
     // a repeated external_ref in one batch trips "ON CONFLICT DO UPDATE
     // command cannot affect row a second time".
@@ -764,7 +815,7 @@ class ServiceTradeProvider extends CrmProvider {
    */
   async _normalizeJobNotes(companyId, rawJobs = null) {
     const raw = rawJobs || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_jobs", { columns: "id, servicetrade_id, payload" }));
-    const jobsMap = await db.fetchExternalRefMap(companyId, "jobs");
+    const jobsMap = await refMap(companyId, "jobs");
     const jobIds = [];
     const rows = [];
     for (const row of raw) {
@@ -788,8 +839,8 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeAppointments(companyId, engine = null, rawAppointments = null) {
     const raw = rawAppointments || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_appointments"));
     const [jobsMap, techniciansMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "jobs"),
-      db.fetchExternalRefMap(companyId, "technicians"),
+      refMap(companyId, "jobs"),
+      refMap(companyId, "technicians"),
     ]);
     const argsList = raw
       .map((row) => {
@@ -811,8 +862,8 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeAppointmentTechnicians(companyId, rawAppointments = null) {
     const raw = rawAppointments || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_appointments", { columns: "id, servicetrade_id, payload" }));
     const [appointmentsMap, techniciansMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "appointments"),
-      db.fetchExternalRefMap(companyId, "technicians"),
+      refMap(companyId, "appointments"),
+      refMap(companyId, "technicians"),
     ]);
     const pairs = [];
     const parents = new Set();
@@ -834,8 +885,8 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeAppointmentOffices(companyId, rawAppointments = null) {
     const raw = rawAppointments || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_appointments", { columns: "id, servicetrade_id, payload" }));
     const [appointmentsMap, officesMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "appointments"),
-      db.fetchExternalRefMap(companyId, "offices"),
+      refMap(companyId, "appointments"),
+      refMap(companyId, "offices"),
     ]);
     const pairs = [];
     const parents = new Set();
@@ -859,7 +910,7 @@ class ServiceTradeProvider extends CrmProvider {
    */
   async _normalizeAppointmentNotes(companyId, rawAppointments = null) {
     const raw = rawAppointments || (await db.fetchAllByCompanyChunked(companyId, "servicetrade_appointments", { columns: "id, servicetrade_id, payload" }));
-    const appointmentsMap = await db.fetchExternalRefMap(companyId, "appointments");
+    const appointmentsMap = await refMap(companyId, "appointments");
     const appointmentIds = [];
     const rows = [];
     for (const row of raw) {
@@ -958,13 +1009,13 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeServiceRequests(companyId, engine = null, { updatedSince = null } = {}) {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_service_requests", { updatedSince });
     const [locationsMap, jobsMap, deficienciesMap, changeOrdersMap, contractsMap, recurrencesMap, serviceLinesMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "locations"),
-      db.fetchExternalRefMap(companyId, "jobs"),
-      db.fetchExternalRefMap(companyId, "deficiencies"),
-      db.fetchExternalRefMap(companyId, "change_orders"),
-      db.fetchExternalRefMap(companyId, "contracts"),
-      db.fetchExternalRefMap(companyId, "service_recurrences"),
-      db.fetchExternalRefMap(companyId, "service_lines"),
+      refMap(companyId, "locations"),
+      refMap(companyId, "jobs"),
+      refMap(companyId, "deficiencies"),
+      refMap(companyId, "change_orders"),
+      refMap(companyId, "contracts"),
+      refMap(companyId, "service_recurrences"),
+      refMap(companyId, "service_lines"),
     ]);
     const argsList = raw
       .map((row) => {
@@ -994,8 +1045,8 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeServiceRequestPreferredTechs(companyId) {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_service_requests", { columns: "id, servicetrade_id, payload" });
     const [requestsMap, techniciansMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "service_requests"),
-      db.fetchExternalRefMap(companyId, "technicians"),
+      refMap(companyId, "service_requests"),
+      refMap(companyId, "technicians"),
     ]);
     const pairs = [];
     const parents = new Set();
@@ -1045,9 +1096,9 @@ class ServiceTradeProvider extends CrmProvider {
       extraWhere: "servicetrade_appointment_id IS NOT NULL",
     });
     const [appointmentsMap, jobsMap, serviceLinesMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "appointments"),
-      db.fetchExternalRefMap(companyId, "jobs"),
-      db.fetchExternalRefMap(companyId, "service_lines"),
+      refMap(companyId, "appointments"),
+      refMap(companyId, "jobs"),
+      refMap(companyId, "service_lines"),
     ]);
     const argsList = raw
       .map((row) => {
@@ -1070,8 +1121,8 @@ class ServiceTradeProvider extends CrmProvider {
   async _normalizeServiceOpportunityPreferredTechs(companyId) {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_service_requests", { columns: "id, servicetrade_id, payload" });
     const [opportunitiesMap, techniciansMap] = await Promise.all([
-      db.fetchExternalRefMap(companyId, "service_opportunities"),
-      db.fetchExternalRefMap(companyId, "technicians"),
+      refMap(companyId, "service_opportunities"),
+      refMap(companyId, "technicians"),
     ]);
     const pairs = [];
     const parents = new Set();
@@ -1176,95 +1227,6 @@ function dedupeContactsByEmail(rawContacts) {
   return { canonicalRows, alias, dropped };
 }
 
-async function bulkInsertJunction(table, colA, colB, pairs, { batchSize = 1000 } = {}) {
-  if (!pairs.length) return;
-  let queryCount = 0;
-  for (let i = 0; i < pairs.length; i += batchSize) {
-    const chunk = pairs.slice(i, i + batchSize);
-    const values = [];
-    const params = [];
-    let idx = 0;
-    for (const [a, b] of chunk) {
-      values.push(`($${++idx}, $${++idx})`);
-      params.push(a, b);
-    }
-    await db.query(
-      `INSERT INTO ${table} (${colA}, ${colB}) VALUES ${values.join(", ")}
-       ON CONFLICT (${colA}, ${colB}) DO NOTHING`,
-      params
-    );
-    queryCount++;
-  }
-  logger.info("bulkInsertJunction: table upserted", { table, pairs: pairs.length, batchSize, queries: queryCount });
-}
-
-/**
- * Junction write with REPLACE-SET semantics, scoped to the parents this pass
- * actually looked at.
- *
- * bulkInsertJunction above can only ever ADD a link. Nothing deleted one, so a
- * link removed in the CRM survived every subsequent sync forever — verified on a
- * real account: a contact unlinked from a location in ServiceTrade stayed
- * attached in `contact_locations`, and would still have been sent that
- * location's confirmations. The raw table was correct the whole time; only the
- * normalized junction was stale. The hourly poll had this bug too — webhooks
- * only made it visible in a minute instead of an hour.
- *
- * @param parentIds EVERY parent this pass processed — NOT merely the parents
- *   appearing in `pairs`. This distinction is the whole correctness argument:
- *   a parent whose links were ALL removed contributes zero pairs, so deriving
- *   the scope from `pairs` would skip exactly the case that needs cleaning
- *   (the last contact removed from a location, the last technician unassigned
- *   from an appointment). Conversely the scope must never be "everything",
- *   because the appointment passes are watermark-filtered — deleting outside
- *   the processed set would wipe live links for parents the pass never read.
- */
-async function replaceJunction(table, colA, colB, pairs, parentIds, { batchSize = 1000 } = {}) {
-  const parents = [...new Set(parentIds)].filter((id) => id != null);
-  if (!parents.length) return;
-
-  // Delete first, then insert: the pairs that survive are re-added by the
-  // INSERT below, and every write here is idempotent, so a crash between the
-  // two leaves rows to be restored by the next run rather than duplicated.
-  const flatA = pairs.map(([a]) => a);
-  const flatB = pairs.map(([, b]) => b);
-  const { rowCount: removed } = await db.query(
-    `DELETE FROM ${table} t
-      WHERE t.${colA} = ANY($1::bigint[])
-        AND NOT EXISTS (
-          SELECT 1 FROM (SELECT unnest($2::bigint[]) AS a, unnest($3::bigint[]) AS b) v
-           WHERE v.a = t.${colA} AND v.b = t.${colB}
-        )`,
-    [parents, flatA, flatB]
-  );
-
-  await bulkInsertJunction(table, colA, colB, pairs, { batchSize });
-
-  if (removed > 0) {
-    logger.info("replaceJunction: stale links removed", { table, removed, parents: parents.length, pairs: pairs.length });
-  }
-}
-
-/**
- * Plain bulk INSERT (no upsert/conflict handling) for rows with no stable
- * external identity to key an upsert on — e.g. job/appointment notes, which
- * ServiceTrade never assigns an id to. Callers delete the prior rows for the
- * affected parents first, then re-insert, so this never needs ON CONFLICT.
- */
-async function bulkInsertPlain(table, columns, rows, { batchSize = 1000 } = {}) {
-  if (!rows.length) return;
-  for (let i = 0; i < rows.length; i += batchSize) {
-    const chunk = rows.slice(i, i + batchSize);
-    const values = [];
-    const params = [];
-    let idx = 0;
-    for (const row of chunk) {
-      values.push(`(${columns.map(() => `$${++idx}`).join(", ")})`);
-      params.push(...columns.map((c) => row[c] ?? null));
-    }
-    await db.query(`INSERT INTO ${table} (${columns.join(", ")}) VALUES ${values.join(", ")}`, params);
-  }
-}
 
 // ── Field descriptors for db.bulkUpsertByExternalRef (column, args key, jsonb?, transform?, updateExpr?) ──
 

@@ -32,11 +32,23 @@ async function hydrateScheduledUnconfirmed(companyId, appointmentId) {
     `SELECT a.id AS appointment_id, a.scheduled_start, a.status AS appointment_status,
             j.id AS job_id, j.scheduled_date, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
-            c.phone AS customer_phone, c.full_name AS customer_name,
+            -- InspectPoint Accounts carry NO phone or email at all (verified:
+            -- null on every job of a real tenant), so the site's own number is
+            -- the only one to call about a visit there. Falling back at read
+            -- time rather than copying it onto the customer record keeps the
+            -- two entities honest -- a building phone is not the customer's.
+            COALESCE(c.phone, l.phone) AS customer_phone,
+            COALESCE(c.full_name, l.name) AS customer_name,
             c.address_line1, c.city, c.state
        FROM appointments a
        JOIN jobs j      ON j.id = a.job_id
-       JOIN customers c ON c.id = j.customer_id
+       LEFT JOIN locations l ON l.id = j.location_id
+       -- LEFT: a job need not have a customer (InspectPoint links work to a
+       -- BUILDING; its Account is optional and usually absent). An inner join
+       -- made this report "not found" for a row that plainly exists, hiding
+       -- the real problem. Missing contact details are caught downstream by
+       -- the missing_phone gate, which says so accurately.
+       LEFT JOIN customers c ON c.id = j.customer_id
       WHERE a.id = $1 AND j.company_id = $2
       LIMIT 1`,
     [appointmentId, companyId]
@@ -129,10 +141,17 @@ async function hydrateOpenJobDueSoon(companyId, jobIdInput) {
   const { rows } = await db.query(
     `SELECT j.id AS job_id, j.scheduled_date, j.status AS job_status,
             j.title AS job_name, j.description AS job_description, j.job_type,
-            c.phone AS customer_phone, c.full_name AS customer_name,
+            -- See hydrateScheduledUnconfirmed: the site's phone/name is the
+            -- usable contact point when the job has no customer record.
+            COALESCE(c.phone, l.phone) AS customer_phone,
+            COALESCE(c.full_name, l.name) AS customer_name,
             c.address_line1, c.city, c.state
        FROM jobs j
-       JOIN customers c ON c.id = j.customer_id
+       LEFT JOIN locations l ON l.id = j.location_id
+       -- LEFT, same reason as hydrateScheduledUnconfirmed above: "Job not
+       -- found" on an existing job is a misleading 404. Let the phone gate
+       -- report the actual gap.
+       LEFT JOIN customers c ON c.id = j.customer_id
       WHERE j.id = $1 AND j.company_id = $2
       LIMIT 1`,
     [jobIdInput, companyId]

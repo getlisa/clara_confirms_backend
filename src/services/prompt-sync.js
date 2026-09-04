@@ -10,6 +10,8 @@ const retell = require("./retell");
 const callTypeConfigsDb = require("../db/call-type-configs");
 const logger = require("../utils/logger");
 const { CHAT_SESSION_INSTRUCTION } = require("./retell-flow");
+const { resolveSlugForCompany } = require("./crm");
+const { getWorkflow } = require("../confirmation-agent/workflows");
 
 const serviceLineDescriptionsDb = require("../db/service-line-descriptions");
 
@@ -51,10 +53,11 @@ async function resetDefaultPrompts(companyId, types = null) {
   const seeds = callTypeConfigsDb.BUILTIN_SEEDS.filter(
     s => !types || types.includes(s.type)
   );
+  const workflow = getWorkflow(await resolveSlugForCompany(companyId));
   let updated = 0;
   for (const seed of seeds) {
     const { begin_message, general_prompt } = callTypeConfigsDb.generateDefaultPrompts(
-      seed.type, seed.name, seed.description
+      seed.type, seed.name, seed.description, workflow
     );
     // Only the confirmation prompt carries onsite expectations, and only for
     // companies that have any. Appending here (rather than at push time) keeps

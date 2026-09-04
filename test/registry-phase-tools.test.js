@@ -49,3 +49,27 @@ test("the opening turn still withholds end_conversation/report_customer_intent, 
   assert.ok(!opening.includes("report_customer_intent"));
   assert.ok(opening.includes("capture_confirmer_identity"), "identity capture is still allowed on the opening turn");
 });
+
+// Phase 6: propose_reschedule_slots is phase-gated the same as
+// reschedule_appointment (confirming/all_confirmed, never no_appointment —
+// there's no existing appointment/technician to search yet), AND
+// capability-gated by workflows/*.js's slotSuggestion flag.
+test("propose_reschedule_slots is reachable in confirming and all_confirmed when no workflow is passed (capability defaults on)", () => {
+  assert.ok(names(getToolsForPhase("confirming")).includes("propose_reschedule_slots"));
+  assert.ok(names(getToolsForPhase("all_confirmed")).includes("propose_reschedule_slots"));
+});
+
+test("propose_reschedule_slots does NOT apply to no_appointment — nothing booked yet to reschedule", () => {
+  assert.ok(!names(getToolsForPhase("no_appointment")).includes("propose_reschedule_slots"));
+});
+
+test("propose_reschedule_slots is withheld when the workflow's slotSuggestion capability is explicitly false (ServiceTrade)", () => {
+  const tools = names(getToolsForPhase("confirming", { workflow: { capabilities: { slotSuggestion: false } } }));
+  assert.ok(!tools.includes("propose_reschedule_slots"));
+  assert.ok(tools.includes("reschedule_appointment"), "the plain reschedule tool is unaffected by this capability");
+});
+
+test("propose_reschedule_slots is offered when the workflow's slotSuggestion capability is true (InspectPoint)", () => {
+  const tools = names(getToolsForPhase("confirming", { workflow: { capabilities: { slotSuggestion: true } } }));
+  assert.ok(tools.includes("propose_reschedule_slots"));
+});

@@ -25,6 +25,8 @@ const { buildJobConfirmationContext } = require("./job-confirmation-context");
 const { buildAppointmentCards } = require("../confirmation-agent/appointment-card");
 const onsiteInstructionsDb = require("../db/onsite-instructions");
 const serviceLinkMessagesDb = require("../db/service-link-messages");
+const { resolveSlugForCompany } = require("./crm");
+const { getWorkflow } = require("../confirmation-agent/workflows");
 
 /**
  * The job's service-link status/url for THIS conversation (service_link_messages
@@ -360,9 +362,26 @@ async function resolveChatLink(token) {
   const serviceLink = await loadServiceLinkForCard(link.company_id, token);
   const onsiteInstructionsAll = await onsiteInstructionsDb.listByCompany(link.company_id);
 
+  // What this company's CRM can actually do, so the widget can shape its own
+  // UI instead of guessing or hardcoding per-CRM behaviour. Bootstrap-only:
+  // capabilities are a property of the connected CRM, so they cannot change
+  // mid-conversation and don't need repeating on every turn.
+  //
+  // `cancellationReason: "optional"` is the one the frontend MUST honour —
+  // routes/chat-links.js stops requiring `args.reason` on a cancel trigger for
+  // those CRMs, and without this flag the widget has no way to know it can let
+  // the customer skip it (see docs/inspectpoint-integration-frontend.md §4.11).
+  const workflow = getWorkflow(await resolveSlugForCompany(link.company_id));
+
   return {
     ok: true,
     company_name: company.name,
+    crm: workflow.slug,
+    capabilities: {
+      service_link: workflow.capabilities?.serviceLink !== false,
+      slot_suggestion: workflow.capabilities?.slotSuggestion === true,
+      cancellation_reason: workflow.capabilities?.cancellationReason === "optional" ? "optional" : "required",
+    },
     job_name: hydrated.params.jobName || null,
     customer_name: hydrated.params.customerName || null,
     // Same resolution the prompt itself uses (recipient snapshot → nominated

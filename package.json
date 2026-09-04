@@ -9,7 +9,8 @@
     "migrate": "node scripts/run-migrations.js",
     "build": "node scripts/build-check.js",
     "start": "node src/server.js",
-    "dev": "node src/server.js"
+    "dev": "node src/server.js",
+    "mock:inspectpoint": "node scripts/mock-inspectpoint-server.js"
   },
   "keywords": [],
   "author": "",
