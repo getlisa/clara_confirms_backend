@@ -97,6 +97,139 @@ async function createMissingEmail({ companyId, jobId, subjectKind, subjectName, 
 }
 
 /**
+ * Create a CRM_SYNC todo for a CRM integration whose stored credentials have
+ * stopped working (password rotated upstream, or — for ZenTrades — the
+ * rememberMe window lapsing) — see services/zentrades.js's login(). Mirrors
+ * createMissingPhone's idempotent-reuse pattern exactly: re-uses any existing
+ * OPEN reauth todo for this (company, source) rather than filing a new one
+ * every sync attempt, since the cron runs every 2 hours and a bad password
+ * doesn't fix itself between runs.
+ *
+ * @param {object} args
+ * @param {number|string} args.companyId
+ * @param {string} args.source — CRM provider slug, e.g. "zentrades"
+ * @param {'invalid_credentials'|'forbidden'} args.reason
+ * @param {string} [args.error] — raw server message, truncated for storage
+ */
+async function createCrmReauthTodo({ companyId, source, reason, error = null }) {
+  const existing = await db.query(
+    `SELECT id FROM todos
+     WHERE company_id = $1 AND type = 'CRM_SYNC' AND status = 'open'
+       AND metadata->>'source' = $2
+       AND metadata->>'reason' = $3
+     LIMIT 1`,
+    [companyId, source, reason]
+  );
+  if (existing.rows.length > 0) return existing.rows[0];
+
+  const fullMeta = {
+    source,
+    reason, // 'invalid_credentials' | 'forbidden'
+    error: error ? String(error).slice(0, 2000) : null,
+  };
+  const notes = reason === "forbidden"
+    ? `${source}: the connected account lacks access to a required module — re-check its role/permissions.`
+    : `${source}: login failed — the stored password no longer works. Reconnect with the current password.`;
+  const r = await db.query(
+    `INSERT INTO todos (company_id, type, priority, is_test, metadata, notes)
+     VALUES ($1, 'CRM_SYNC', 'high', FALSE, $2, $3) RETURNING *`,
+    [companyId, JSON.stringify(fullMeta), notes]
+  );
+  const todo = r.rows[0];
+  await db.query(
+    `INSERT INTO todo_logs (todo_id, company_id, actor_type, event_type, change)
+     VALUES ($1, $2, 'system', 'created', $3)`,
+    [todo.id, companyId, JSON.stringify({ type: "CRM_SYNC", priority: "high", source, reason })]
+  );
+  return todo;
+}
+
+/**
+ * Resolve any OPEN reauth todo(s) for a CRM integration — called once a
+ * reconnect succeeds. Plural on purpose: 'invalid_credentials' and
+ * 'forbidden' are distinct metadata.reason values, so a tenant could in
+ * theory have accumulated one of each before this ever ran.
+ */
+async function resolveCrmReauthTodos({ companyId, source }) {
+  await db.query(
+    `UPDATE todos SET status = 'resolved', resolved_at = NOW(), updated_at = NOW()
+     WHERE company_id = $1 AND type = 'CRM_SYNC' AND status = 'open'
+       AND metadata->>'source' = $2 AND metadata->>'reason' IN ('invalid_credentials', 'forbidden')`,
+    [companyId, source]
+  );
+}
+
+/**
+ * Create a CRM_SYNC todo for ANY ZenTrades API call that ultimately fails
+ * (network error, or a non-2xx response) — the general "surface this to the
+ * UI" mechanism requested for ZenTrades specifically, distinct from
+ * createCrmReauthTodo's narrower auth-only scope (401-login-failed,
+ * 403-forbidden). Both share TODO_TYPES.CRM_SYNC and coexist under
+ * different `metadata` shapes — this one is tagged `kind: 'api_error'` and
+ * deduped on (company, source, method, path) rather than (source, reason),
+ * so a different endpoint failing files its own todo while the SAME
+ * endpoint failing repeatedly (e.g. every slice of a paginated sync hitting
+ * the same 500) collapses into one open item instead of flooding Action
+ * Items.
+ *
+ * @param {object} args
+ * @param {number|string} args.companyId
+ * @param {string} args.source — CRM provider slug, e.g. "zentrades"
+ * @param {string} args.method
+ * @param {string} args.path
+ * @param {number} [args.status] — HTTP status, or 0 for a network-level failure
+ * @param {string} [args.error]
+ */
+async function createCrmApiErrorTodo({ companyId, source, method, path, status = null, error = null }) {
+  const existing = await db.query(
+    `SELECT id FROM todos
+     WHERE company_id = $1 AND type = 'CRM_SYNC' AND status = 'open'
+       AND metadata->>'kind' = 'api_error'
+       AND metadata->>'source' = $2
+       AND metadata->>'method' = $3
+       AND metadata->>'path' = $4
+     LIMIT 1`,
+    [companyId, source, method, path]
+  );
+  if (existing.rows.length > 0) return existing.rows[0];
+
+  const fullMeta = {
+    kind: "api_error",
+    source, method, path,
+    status,
+    error: error ? String(error).slice(0, 2000) : null,
+  };
+  const notes = `${source}: ${method} ${path} failed${status ? ` (HTTP ${status})` : ""}${error ? ` — ${error}` : ""}`.slice(0, 2000);
+  const r = await db.query(
+    `INSERT INTO todos (company_id, type, priority, is_test, metadata, notes)
+     VALUES ($1, 'CRM_SYNC', 'high', FALSE, $2, $3) RETURNING *`,
+    [companyId, JSON.stringify(fullMeta), notes]
+  );
+  const todo = r.rows[0];
+  await db.query(
+    `INSERT INTO todo_logs (todo_id, company_id, actor_type, event_type, change)
+     VALUES ($1, $2, 'system', 'created', $3)`,
+    [todo.id, companyId, JSON.stringify({ type: "CRM_SYNC", priority: "high", source, method, path, status })]
+  );
+  return todo;
+}
+
+/**
+ * Resolve any OPEN api_error todos for a CRM integration — called once a
+ * sync run for that company completes with nothing incomplete, so a stale
+ * "this endpoint was failing" item doesn't linger in Action Items after the
+ * underlying problem has cleared on its own.
+ */
+async function resolveCrmApiErrorTodos({ companyId, source }) {
+  await db.query(
+    `UPDATE todos SET status = 'resolved', resolved_at = NOW(), updated_at = NOW()
+     WHERE company_id = $1 AND type = 'CRM_SYNC' AND status = 'open'
+       AND metadata->>'kind' = 'api_error' AND metadata->>'source' = $2`,
+    [companyId, source]
+  );
+}
+
+/**
  * Derive todo type(s) from post-call analysis outcome.
  * Returns an array — a single call can produce at most one todo.
  */
@@ -271,4 +404,9 @@ async function getLogs(todoId, companyId) {
   return result.rows;
 }
 
-module.exports = { TODO_TYPES, deriveTodoType, create, createMissingPhone, createMissingEmail, list, updateStatus, assign, getLogs };
+module.exports = {
+  TODO_TYPES, deriveTodoType, create, createMissingPhone, createMissingEmail,
+  createCrmReauthTodo, resolveCrmReauthTodos,
+  createCrmApiErrorTodo, resolveCrmApiErrorTodos,
+  list, updateStatus, assign, getLogs,
+};

@@ -19,6 +19,7 @@ const locationsRoutes = require("./routes/locations");
 const serviceOpportunitiesRoutes = require("./routes/service-opportunities");
 const servicetradeRoutes = require("./routes/servicetrade");
 const inspectpointRoutes = require("./routes/inspectpoint");
+const zentradesRoutes = require("./routes/zentrades");
 const agentSettingsRoutes = require("./routes/agent-settings");
 const retellRoutes = require("./routes/retell");
 const todosRoutes = require("./routes/todos");
@@ -153,6 +154,9 @@ app.use("/integrations/servicetrade", servicetradeRoutes);
 
 // InspectPoint integration - requires auth
 app.use("/integrations/inspectpoint", inspectpointRoutes);
+
+// ZenTrades integration - requires auth
+app.use("/integrations/zentrades", zentradesRoutes);
 
 // Agent settings - requires auth
 app.use("/agent-settings", agentSettingsRoutes);

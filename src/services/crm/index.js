@@ -103,5 +103,6 @@ async function resolveSlugForCompany(companyId) {
 // active for that company (and vice versa).
 registerProvider(require("./servicetrade/provider"));
 registerProvider(require("./inspectpoint/provider"));
+registerProvider(require("./zentrades/provider"));
 
 module.exports = { CrmProvider, registerProvider, getProvider, getProviderForSource, listProviders, resolveSlugForCompany };
