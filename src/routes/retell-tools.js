@@ -1195,10 +1195,12 @@ router.post("/resolve_service_link_contact", async (req, res) => {
     await chatLinksDb.setState(conversationId, "collecting_contact_info").catch(() => {});
 
     // ALWAYS search by email first — regardless of whether the model also
-    // supplied first_name/last_name/role on this same call.
+    // supplied first_name/last_name/role on this same call. searchContacts is
+    // a free-text CRM search (name / phone / email), so a single result can
+    // still have matched on name or phone, not email — only trust a contact
+    // whose OWN email actually equals what the customer confirmed.
     const candidates = await serviceLink.searchContacts(companyId, email);
-    const exactMatch = candidates.find((c) => c.email && c.email.toLowerCase() === email.toLowerCase());
-    const match = exactMatch || (candidates.length === 1 ? candidates[0] : null);
+    const match = candidates.find((c) => c.email && c.email.toLowerCase() === email.toLowerCase()) || null;
 
     let contactId, contactName, status, contactPhone;
     if (match) {

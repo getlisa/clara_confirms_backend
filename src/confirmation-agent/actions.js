@@ -368,9 +368,13 @@ async function sendServiceLinkCore({ companyId, jobId, threadId, jobRef = null, 
     logger.info("actions: sendServiceLinkCore — job is not from ServiceTrade; service link has no InspectPoint equivalent", { companyId, jobId });
     return { success: false, error: "Service link is not available for this job's CRM" };
   }
+  // searchContacts is a free-text CRM search (name / phone / email) — it can
+  // return exactly one result that only matched on name or phone, not email.
+  // Only ever treat a contact as "this email's contact" when its OWN email
+  // field actually equals what the customer confirmed; a single loose match
+  // is not the same thing and must fall through to create/need_more_info.
   const candidates = await serviceLink.searchContacts(companyId, email);
-  const exactMatch = candidates.find((c) => c.email && c.email.toLowerCase() === email.toLowerCase());
-  const match = exactMatch || (candidates.length === 1 ? candidates[0] : null);
+  const match = candidates.find((c) => c.email && c.email.toLowerCase() === email.toLowerCase()) || null;
 
   let contactId, contactName, status, contactPhone;
   if (match) {
