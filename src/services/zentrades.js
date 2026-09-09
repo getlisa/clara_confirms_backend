@@ -44,7 +44,13 @@ const tokenCache = new Map();
 //   is with the same two values already inside the JWT's own payload.
 // `Authorization: Bearer` is kept alongside `access-token` at zero cost in
 // case some other endpoint reads it instead.
-function buildAuthHeaders(accessToken, zentradesCompanyId, zentradesUserId) {
+//
+// timezone-offset/timezonename are additionally required by the write path
+// (api_doc/ztticket_update.md: "recommended... omit it and editRecurringEvent
+// maths drifts") — sent on every request, not just writes, so a read and a
+// subsequent write for the same company never disagree about which zone is
+// in effect.
+function buildAuthHeaders(accessToken, zentradesCompanyId, zentradesUserId, timezoneRegionName) {
   const headers = {
     "access-token": accessToken,
     Authorization: `Bearer ${accessToken}`,
@@ -52,7 +58,37 @@ function buildAuthHeaders(accessToken, zentradesCompanyId, zentradesUserId) {
   };
   if (zentradesCompanyId != null) headers["company-id"] = String(zentradesCompanyId);
   if (zentradesUserId != null) headers["user-id"] = String(zentradesUserId);
+  if (timezoneRegionName) {
+    headers["timezonename"] = timezoneRegionName;
+    const offsetMin = computeTimezoneOffsetMinutes(timezoneRegionName);
+    if (offsetMin != null) headers["timezone-offset"] = String(offsetMin);
+  }
   return headers;
+}
+
+/**
+ * Minutes offset from UTC for an IANA zone, in the SAME sign convention as
+ * `Date.prototype.getTimezoneOffset()` — negative for zones AHEAD of UTC
+ * (e.g. Asia/Calcutta => -330). Verified against the real captured request in
+ * api_doc/zentrades.md, which carries exactly `timezone-offset: -330` for an
+ * Asia/Calcutta browser. Computed per-call (not cached) since the correct
+ * value changes across a DST boundary for zones that observe it.
+ */
+function computeTimezoneOffsetMinutes(tz) {
+  if (!tz) return null;
+  try {
+    const part = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "shortOffset" })
+      .formatToParts(new Date())
+      .find((p) => p.type === "timeZoneName");
+    const m = /^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(part?.value || "GMT");
+    if (!m) return 0;
+    // GMT+X means the zone is AHEAD of UTC; getTimezoneOffset()'s convention
+    // is negative for "ahead" — hence the sign inversion.
+    const sign = m[1] === "+" ? -1 : 1;
+    return sign * (Number(m[2]) * 60 + Number(m[3] || 0));
+  } catch {
+    return null;
+  }
 }
 
 function buildBaseUrl() {
@@ -204,6 +240,7 @@ async function refreshAccessToken(companyId) {
   tokenCache.set(cacheKey, {
     accessToken: result.accessToken, expiresAt: result.expiresAt,
     zentradesCompanyId: result.zentradesCompanyId, zentradesUserId: result.zentradesUserId,
+    timezoneRegionName: result.timezoneRegionName,
   });
   return result.accessToken;
 }
@@ -238,6 +275,7 @@ async function getAccessToken(companyId) {
         accessToken: stored.accessToken, expiresAt,
         zentradesCompanyId: stored.metadata?.zentradesCompanyId ?? null,
         zentradesUserId: stored.metadata?.zentradesUserId ?? null,
+        timezoneRegionName: stored.metadata?.timezoneRegionName ?? null,
       });
       return stored.accessToken;
     }
@@ -265,15 +303,20 @@ function getCachedIdentity(companyId) {
  * @param {string|number} companyId
  * @param {string} method
  * @param {string} path — e.g. "/api/ticket/search/filtered"
- * @param {{query?: object, body?: object, retryable?: boolean}} [options] —
+ * @param {{query?: object, body?: object, retryable?: boolean, suppressErrorTodo?: boolean}} [options] —
  *   `retryable` gates whether a 429/5xx/network failure is retried at all.
  *   Defaults to true for GET, false for POST — a POST here is usually a
- *   search-as-POST (safe to retry, pass retryable:true explicitly) but once
- *   write-back exists, a mutating POST retried blind would double-create
- *   records. Never let this default flip silently.
+ *   search-as-POST (safe to retry, pass retryable:true explicitly) but a
+ *   mutating write-back POST/PUT retried blind could double-apply, so that
+ *   class of call must NEVER override this default.
+ *   `suppressErrorTodo` skips the generic api-error todo (createCrmApiErrorTodo)
+ *   on failure — for write-back mirrors, which raise their own richer todo
+ *   naming the specific action/entity; without this, Action Items would show
+ *   two rows for one failed mirror. Never suppresses the 401/403
+ *   auth-specific todos, which are about the CONNECTION, not one call.
  */
 async function request(companyId, method, path, options = {}) {
-  const { query = {}, body = null, retryable = method === "GET" } = options;
+  const { query = {}, body = null, retryable = method === "GET", suppressErrorTodo = false } = options;
 
   const url = new URL(`${buildBaseUrl()}${path.startsWith("/") ? path : `/${path}`}`);
   // VERIFIED LIVE: a real captured request carries `timestamp=<unix ms>` on
@@ -308,7 +351,7 @@ async function request(companyId, method, path, options = {}) {
     try {
       response = await fetch(url.toString(), {
         method,
-        headers: buildAuthHeaders(token, identity.zentradesCompanyId, identity.zentradesUserId),
+        headers: buildAuthHeaders(token, identity.zentradesCompanyId, identity.zentradesUserId, identity.timezoneRegionName),
         body: requestBody,
       });
     } catch (err) {
@@ -317,9 +360,11 @@ async function request(companyId, method, path, options = {}) {
         continue;
       }
       logger.error("zentrades: request failed (network)", { companyId, method, path, error: err.message });
-      await todosDb
-        .createCrmApiErrorTodo({ companyId, source: "zentrades", method, path, status: 0, error: err.message })
-        .catch((e) => logger.warn("zentrades: failed to raise api-error todo", { error: e.message, companyId }));
+      if (!suppressErrorTodo) {
+        await todosDb
+          .createCrmApiErrorTodo({ companyId, source: "zentrades", method, path, status: 0, error: err.message })
+          .catch((e) => logger.warn("zentrades: failed to raise api-error todo", { error: e.message, companyId }));
+      }
       return { ok: false, status: 0, data: null, messages: { error: [err.message] } };
     }
 
@@ -386,9 +431,11 @@ async function request(companyId, method, path, options = {}) {
     if (!response.ok) {
       const message = respBody?.message || `HTTP ${response.status}`;
       logger.error("zentrades: request failed", { companyId, method, path, status: response.status, message });
-      await todosDb
-        .createCrmApiErrorTodo({ companyId, source: "zentrades", method, path, status: response.status, error: message })
-        .catch((e) => logger.warn("zentrades: failed to raise api-error todo", { error: e.message, companyId }));
+      if (!suppressErrorTodo) {
+        await todosDb
+          .createCrmApiErrorTodo({ companyId, source: "zentrades", method, path, status: response.status, error: message })
+          .catch((e) => logger.warn("zentrades: failed to raise api-error todo", { error: e.message, companyId }));
+      }
     }
 
     return { ok: response.ok, status: response.status, data, messages, envelope: respBody };
@@ -430,8 +477,6 @@ async function fetchAllPages(companyId, path, requestBody, { pageSize = PER_PAGE
 
     const result = await request(companyId, "POST", path, { query, body: requestBody, retryable });
 
-    console.log("Result:", result);
-    console.log("Result.data:", result.data);
     if (!result.ok) {
       logger.warn("zentrades: fetchAllPages page failed", { companyId, path, page, status: result.status });
       return { rows, complete: false, count };

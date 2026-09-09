@@ -288,6 +288,50 @@ test("request() omits company-id/user-id headers rather than sending the literal
   assert.equal("user-id" in seenHeaders, false);
 });
 
+test("request() attaches timezonename/timezone-offset headers from the connected account's stored timezone", async () => {
+  const exp = Math.floor(Date.now() / 1000) + 86400;
+  credentialsDb._seed(216, {
+    username: "tz-test", password: "pw", accessToken: makeJwt({ exp }), accessTokenExpiresAt: new Date(exp * 1000),
+    metadata: { timezoneRegionName: "Asia/Calcutta" },
+  });
+  let seenHeaders = null;
+  global.fetch = async (url, opts) => { seenHeaders = opts.headers; return jsonResponse(200, { status: "success", result: {} }); };
+  await zentrades.request(216, "GET", "/api/ticket");
+  assert.equal(seenHeaders["timezonename"], "Asia/Calcutta");
+  // Asia/Calcutta is UTC+5:30 — VERIFIED LIVE against a real captured request
+  // carrying exactly this value for this zone (see api_doc/zentrades.md).
+  assert.equal(seenHeaders["timezone-offset"], "-330");
+});
+
+test("request() omits timezone headers entirely when no timezone is known, rather than sending a wrong default", async () => {
+  const exp = Math.floor(Date.now() / 1000) + 86400;
+  credentialsDb._seed(217, { username: "no-tz", password: "pw", accessToken: makeJwt({ exp }), accessTokenExpiresAt: new Date(exp * 1000), metadata: {} });
+  let seenHeaders = null;
+  global.fetch = async (url, opts) => { seenHeaders = opts.headers; return jsonResponse(200, { status: "success", result: {} }); };
+  await zentrades.request(217, "GET", "/api/ticket");
+  assert.equal("timezonename" in seenHeaders, false);
+  assert.equal("timezone-offset" in seenHeaders, false);
+});
+
+test("request() with suppressErrorTodo:true does not raise the generic api-error todo on failure", async () => {
+  const exp = Math.floor(Date.now() / 1000) + 86400;
+  credentialsDb._seed(218, { username: "suppressed", password: "pw", accessToken: makeJwt({ exp }), accessTokenExpiresAt: new Date(exp * 1000) });
+  todosDb._apiErrors.length = 0;
+  global.fetch = async () => jsonResponse(404, { message: "not found" });
+  const result = await zentrades.request(218, "GET", "/api/ticket", { retryable: false, suppressErrorTodo: true });
+  assert.equal(result.ok, false);
+  assert.equal(todosDb._apiErrors.length, 0, "the caller (a write-back mirror) will raise its own richer todo instead");
+});
+
+test("suppressErrorTodo does NOT suppress the 403-forbidden auth todo — that's a connection problem, not a per-call one", async () => {
+  const exp = Math.floor(Date.now() / 1000) + 86400;
+  credentialsDb._seed(219, { username: "suppressed2", password: "pw", accessToken: makeJwt({ exp }), accessTokenExpiresAt: new Date(exp * 1000) });
+  todosDb._created.length = 0;
+  global.fetch = async () => jsonResponse(403, { message: "role lacks access" });
+  await zentrades.request(219, "GET", "/api/ticket", { suppressErrorTodo: true });
+  assert.equal(todosDb._created.length, 1);
+});
+
 test("a fresh login also populates company-id/user-id for the SAME request that triggered it", async () => {
   credentialsDb._seed(214, { username: "fresh", password: "pw" }); // no cached token at all — forces refreshAccessToken
   let seenHeaders = null;
