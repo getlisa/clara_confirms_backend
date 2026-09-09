@@ -866,6 +866,7 @@ hits:
 ```
 
 Sample Response: 
+
 ```
 {
     "status": "success",
@@ -1004,3 +1005,60 @@ Sample Response:
         "VAPID_PUBLIC": "BPP3Htf3UfRW-VUkGHT7CMaoFJLlx9vpCrdvsoxn1FM6sBrmY4XbLEMc5Lnlo21QZkPU0XjzR4QTWxKXtUQHeeA"
     }
 }
+```
+
+
+
+## 4. API for posting note:
+
+```
+- curl --url 'https://services.zentrades.pro/api/note/ticket/create/v2?timestamp=1788953812887' \
+  -H 'accept: */*' \
+  -H 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \
+  -H 'access-token: <redacted — a live JWT; obtain one from the login endpoint in §3>' \
+  -H 'company-id: 3' \
+  -H 'content-type: application/json;charset=UTF-8' \
+  -H 'origin: https://app.zentrades.pro' \
+  -H 'priority: u=1, i' \
+  -H 'referer: https://app.zentrades.pro/' \
+  -H 'request-from: WEB_APP' \
+  -H 'sec-ch-ua: "Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"' \
+  -H 'sec-ch-ua-mobile: ?0' \
+  -H 'sec-ch-ua-platform: "macOS"' \
+  -H 'sec-fetch-dest: empty' \
+  -H 'sec-fetch-mode: cors' \
+  -H 'sec-fetch-site: same-site' \
+  -H 'timezone-offset: -330' \
+  -H 'timezonename: Asia/Calcutta' \
+  -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36' \
+  -H 'user-id: 3' \
+  --data-raw '{"ticketId":1924543,"text":"Test Note for the API","isPrivate":false,"addAttachments":[],"deleteAttachments":[]}'
+```
+
+- Sample Response:
+
+```
+{
+    "status": "success",
+    "requestId": null,
+    "result": {
+        "id": 3189254,
+        "text": "Test Note for the API",
+        "companyId": 3,
+        "isActive": true,
+        "isDeleted": false,
+        "isPrivate": false,
+        "createdUser": 3,
+        "updatedUser": 3,
+        "createdBy": "app_rw@10.0.3.159",
+        "updatedBy": "app_rw@10.0.3.159",
+        "createdAt": "2026-09-09T11:36:53.000Z",
+        "updatedAt": "2026-09-09T11:36:53.000Z"
+    }
+}
+```
+
+
+
+## 5. API for updating job - api_doc/ztticket_update.md
+

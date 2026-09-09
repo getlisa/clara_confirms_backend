@@ -75,13 +75,19 @@ test("request() is a thin pass-through — no credentials object threaded throug
   assert.deepEqual(requestArgs[0], [11, "GET", "/api/ticket", { query: { id: 1 } }]);
 });
 
-test("every write-back mirror is the CrmProvider default — not_supported, never throws", async () => {
-  const skipped = { skipped: "not_supported" };
-  assert.deepEqual(await provider.mirrorRescheduleAppointment(11, {}, {}), skipped);
-  assert.deepEqual(await provider.mirrorCancelAppointment(11, {}, {}), skipped);
-  assert.deepEqual(await provider.mirrorCancelJob(11, {}, {}), skipped);
-  assert.deepEqual(await provider.mirrorCreateAppointment(11, {}, 1, {}), skipped);
-  assert.deepEqual(await provider.mirrorRescheduleJob(11, {}, {}), skipped);
-  assert.deepEqual(await provider.mirrorPostChatComment(11, {}), skipped);
-  assert.deepEqual(await provider.mirrorPostCallComment(11, {}), skipped);
+// Write-back is now implemented (see test/zentrades-writeback.test.js for the
+// real mirror behavior) — this just pins that every mirror still self-guards
+// cleanly on a non-zentrades/unresolvable source and never reaches the HTTP
+// client, the way the CrmProvider contract expects.
+test("every write-back mirror self-guards on a non-zentrades source and never calls the API", async () => {
+  requestArgs.length = 0;
+  const notZt = { source: "servicetrade", external_ref: "5000", job_id: 1 };
+  assert.deepEqual(await provider.mirrorRescheduleAppointment(11, notZt, {}), { skipped: "not_zentrades" });
+  assert.deepEqual(await provider.mirrorCancelAppointment(11, notZt), { skipped: "not_zentrades" });
+  assert.deepEqual(await provider.mirrorCancelJob(11, notZt), { skipped: "not_zentrades" });
+  assert.deepEqual(await provider.mirrorCreateAppointment(11, {}, 1, {}), { skipped: "not_zentrades" });
+  assert.deepEqual(await provider.mirrorRescheduleJob(11, notZt, {}), { skipped: "not_zentrades" });
+  assert.deepEqual(await provider.mirrorPostChatComment(11, { jobId: 1, summaryLines: ["x"] }), { skipped: "not_zentrades" });
+  assert.deepEqual(await provider.mirrorPostCallComment(11, { scheduledCall: { job_id: 1 } }), { skipped: "not_zentrades" });
+  assert.equal(requestArgs.length, 0, "a self-guarded mirror must never reach the HTTP client");
 });
