@@ -23,12 +23,18 @@ const { toE164 } = require("../../../utils/phone");
 
 const SOURCE = "zentrades";
 
-// ZenTrades only ever fetches status_id=1 ("Open") tickets — see
-// services/zentrades-sync.js. A ticket reaching normalize with a different
-// id therefore indicates either a future change to what gets fetched, or an
-// upstream filter being ignored; mapJobStatus below warns rather than
-// guessing in that case.
-const OPEN_JOB_STATUS_ID = 1;
+// `jobStatusId` is per-tenant configuration, not a stable ZenTrades-wide enum
+// — verified live 2026-09-10: company 12's sandbox tenant uses 1 for "Open",
+// company 13's real one (Element Fire) uses 1988. services/zentrades-sync.js
+// only ever stores tickets whose STRING label is "Open" (see its own
+// OPEN_JOB_STATUS_LABEL comment), so match on that same label here too —
+// comparing against any hardcoded numeric id silently mis-derives status for
+// every tenant whose id isn't exactly that constant (this previously fell
+// into the "unmapped" branch below for company 13's tickets, which skips the
+// live-assignment check entirely — misclassifying a ticket with an actually-
+// dispatched technician as unscheduled, precisely what this function exists
+// to avoid).
+const OPEN_JOB_STATUS_LABEL = "open";
 
 /**
  * One `name` string -> {firstName, lastName}. Only needed for
@@ -101,15 +107,15 @@ function mapJobStatus(row) {
   const p = row.payload || {};
   if (p.isDeleted === true || p.isActive === false) return { status: "cancelled", warning: null };
 
-  const statusId = Number(row.job_status_id);
-  if (statusId === OPEN_JOB_STATUS_ID) {
+  const statusLabel = String(row.job_status ?? "").trim().toLowerCase();
+  if (statusLabel === OPEN_JOB_STATUS_LABEL) {
     return { status: ticketHasLiveAssignment(p) ? "scheduled" : "open", warning: null };
   }
   return {
     status: "open",
     warning: {
-      code: "unmapped_job_status_id",
-      message: `Unrecognized ZenTrades jobStatusId "${row.job_status_id}" — defaulted to open. Only status 1 (Open) is currently fetched by the sync.`,
+      code: "unmapped_job_status",
+      message: `Unrecognized ZenTrades jobStatus "${row.job_status}" — defaulted to open. Only "Open" tickets are currently fetched by the sync.`,
     },
   };
 }
