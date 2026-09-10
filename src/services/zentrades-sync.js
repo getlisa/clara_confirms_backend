@@ -39,10 +39,17 @@ const SLICE_CONCURRENCY = 4;
 const RECURRENCE_CONCURRENCY = 8;
 const RECURRENCE_FANOUT_CAP = 500;
 
-// "1" in the request, 1 (number) in the response — see api_doc/zentrades.md.
-// Only "Open" tickets are ever fetched; a real status map for the rest of
-// ZenTrades' vocabulary is unresolved (Phase B concern).
-const OPEN_JOB_STATUS_ID = 1;
+// `jobStatusId` is PER-TENANT configuration, not a global ZenTrades enum —
+// confirmed live 2026-09-10: company 12 (the sandbox tenant, zentradesCompanyId
+// 3) uses jobStatusId 1 for "Open", but company 13 (Element Fire, a real
+// production tenant, zentradesCompanyId 974) uses 1988 for the exact same
+// "Open" label. This used to be hardcoded to 1 as a server-side search term,
+// which silently matched zero of company 13's tickets — a fully successful,
+// zero-error sync that fetched nothing, for every run since that company
+// connected. Matched on the STRING label instead (`jobStatus`, present on
+// every hit alongside its tenant-specific numeric id), which is
+// tenant-portable; never reintroduce a hardcoded numeric jobStatusId.
+const OPEN_JOB_STATUS_LABEL = "open";
 
 // ── Window slicing ────────────────────────────────────────────────────────
 //
@@ -85,14 +92,31 @@ function sliceWindow(from, to, sliceDays = SLICE_DAYS) {
  * right below, exactly the fallback this design was already built around.
  */
 async function fetchTicketSlice(companyId, { from, to }) {
+  // No jobStatusId term — see OPEN_JOB_STATUS_LABEL's comment: the numeric id
+  // is per-tenant, so a server-side filter on it can't be written correctly
+  // without already knowing this specific tenant's mapping. Status filtering
+  // happens client-side below, on the tenant-portable string label instead.
   const body = {
     gteDate: [{ scheduledEndTime: from.toISOString() }],
     ltDate: [{ scheduledStartTime: to.toISOString() }],
     businessUnitIds: [],
-    terms: [{ jobStatusId: [String(OPEN_JOB_STATUS_ID)] }],
+    terms: [],
   };
   const result = await zentrades.fetchAllPages(companyId, TICKET_SEARCH_PATH, body);
   const distinctIds = new Set(result.rows.map((r) => r?.id).filter((id) => id != null));
+
+  // Diagnostic trail for exactly the class of bug the switch to a string
+  // label just fixed — if a tenant's "open" label is spelled differently
+  // than expected, this makes that visible immediately instead of silently
+  // fetching zero rows again.
+  const statusCounts = {};
+  for (const hit of result.rows) {
+    const label = String(hit?.jobStatus ?? "").trim().toLowerCase() || "(none)";
+    statusCounts[label] = (statusCounts[label] || 0) + 1;
+  }
+  logger.debug("zentrades sync: ticket slice status distribution", {
+    companyId, from: from.toISOString(), to: to.toISOString(), totalHits: result.rows.length, statusCounts,
+  });
 
   let complete = result.complete;
   if (result.count != null && distinctIds.size < result.count) {
@@ -402,11 +426,20 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
     // mismatch are filtered but do NOT mark the run incomplete (the result
     // is still correct, just costlier); a tenant mismatch DOES, since it
     // means credentials/scoping are wrong, not just a loose filter. ────────
+    //
+    // Status is now filtered by fetchTicketSlice's own client-side pass too
+    // (no server-side term at all — see OPEN_JOB_STATUS_LABEL), so this loop
+    // is the SOLE place "which tickets are actually Open" gets decided.
+    // Matched on the string label, never the numeric jobStatusId — that id is
+    // per-tenant configuration (verified live: 1 for company 12's sandbox
+    // tenant, 1988 for company 13's real one), so comparing it against any
+    // hardcoded constant silently drops every ticket for a tenant whose id
+    // differs, exactly as it did for company 13 until this fix.
     let tenantMismatchDetected = false;
     const validTickets = [];
     for (const hit of ticketsById.values()) {
-      if (Number(hit.jobStatusId) !== OPEN_JOB_STATUS_ID) {
-        logger.error("zentrades sync: server returned a ticket outside the requested status — filtering client-side", { companyId, ticketId: hit.id, jobStatusId: hit.jobStatusId });
+      const statusLabel = String(hit.jobStatus ?? "").trim().toLowerCase();
+      if (statusLabel !== OPEN_JOB_STATUS_LABEL) {
         continue;
       }
       const start = hit.scheduledStartTime ? new Date(hit.scheduledStartTime) : null;

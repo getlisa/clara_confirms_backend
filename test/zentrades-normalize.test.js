@@ -17,22 +17,35 @@ function ticketRow(overrides = {}) {
   return {
     zentrades_id: 1924543,
     job_status_id: 1,
+    job_status: "Open",
     payload: { isActive: true, isDeleted: false, assignments: [], ...overrides.payload },
     ...overrides,
   };
 }
 
-test("mapJobStatus: status 1 with a live assignment maps to 'scheduled', NOT 'open'", () => {
+test("mapJobStatus: Open with a live assignment maps to 'scheduled', NOT 'open'", () => {
   const row = ticketRow({ payload: { assignments: [{ isActive: true, isDeleted: false, startTime: "2026-09-14T13:15:00.000Z" }] } });
   const { status, warning } = normalize.mapJobStatus(row);
   assert.equal(status, "scheduled");
   assert.equal(warning, null);
 });
 
-test("mapJobStatus: status 1 with NO live assignment maps to 'open' — genuinely unscheduled", () => {
+test("mapJobStatus: Open with NO live assignment maps to 'open' — genuinely unscheduled", () => {
   const row = ticketRow({ payload: { assignments: [] } });
   const { status } = normalize.mapJobStatus(row);
   assert.equal(status, "open");
+});
+
+test("mapJobStatus: matches on the STRING label, not the numeric jobStatusId — jobStatusId is per-tenant configuration (regression: company 13/Element Fire uses 1988 for 'Open', not 1)", () => {
+  const row = ticketRow({ job_status_id: 1988, job_status: "Open", payload: { assignments: [{ isActive: true, isDeleted: false, startTime: "2026-09-14T13:15:00.000Z" }] } });
+  const { status, warning } = normalize.mapJobStatus(row);
+  assert.equal(status, "scheduled", "a live assignment must still be recognized regardless of this tenant's numeric jobStatusId");
+  assert.equal(warning, null);
+});
+
+test("mapJobStatus: the 'Open' label match is case-insensitive", () => {
+  const row = ticketRow({ job_status: "OPEN", payload: { assignments: [] } });
+  assert.equal(normalize.mapJobStatus(row).status, "open");
 });
 
 test("mapJobStatus: an assignment with no startTime does not count as live", () => {
@@ -52,12 +65,12 @@ test("mapJobStatus: isDeleted/isActive:false on the TICKET itself is authoritati
   assert.equal(normalize.mapJobStatus(row).status, "cancelled");
 });
 
-test("mapJobStatus: an unrecognized jobStatusId defaults to 'open' with a warning, never guesses another status", () => {
-  const row = ticketRow({ job_status_id: 99 });
+test("mapJobStatus: an unrecognized jobStatus label defaults to 'open' with a warning, never guesses another status", () => {
+  const row = ticketRow({ job_status: "Completed" });
   const { status, warning } = normalize.mapJobStatus(row);
   assert.equal(status, "open");
-  assert.equal(warning.code, "unmapped_job_status_id");
-  assert.match(warning.message, /99/);
+  assert.equal(warning.code, "unmapped_job_status");
+  assert.match(warning.message, /Completed/);
 });
 
 test("mapJobStatus never produces 'pending' — that is InspectPoint's word, not ZenTrades'", () => {

@@ -90,7 +90,12 @@ test("a custom window reaches ZenTrades as day-boundary UTC instants, sliced int
   const first = calls[0].body;
   assert.equal(first.gteDate[0].scheduledEndTime, new Date(Date.UTC(2026, 5, 1, 0, 0, 0)).toISOString());
   assert.equal(calls.at(-1).body.ltDate[0].scheduledStartTime, new Date(Date.UTC(2026, 5, 14, 23, 59, 59)).toISOString());
-  assert.ok(calls.every((c) => c.body.terms[0].jobStatusId.includes("1")), "only the Open status is ever requested");
+  // No server-side jobStatusId term — that id is per-tenant configuration
+  // (company 12's sandbox tenant uses 1 for "Open", company 13's real one
+  // uses 1988), so it can't be filtered on without already knowing this
+  // specific tenant's mapping. Status filtering happens client-side instead,
+  // on the tenant-portable string label — see services/zentrades-sync.js.
+  assert.ok(calls.every((c) => Array.isArray(c.body.terms) && c.body.terms.length === 0), "no jobStatusId term is ever sent — that id is per-tenant, not a stable constant");
 });
 
 test("no window still produces the default rolling incremental slices", async () => {

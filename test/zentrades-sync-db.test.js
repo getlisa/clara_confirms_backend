@@ -155,13 +155,14 @@ test("updateSyncState with nothing to write issues no query", async () => {
 
 // ── listOpenTicketIdsInWindow ────────────────────────────────────────────────
 
-test("listOpenTicketIdsInWindow filters on job_status_id = 1 and the same overlap predicate the API's own filter uses", async () => {
+test("listOpenTicketIdsInWindow filters on the job_status STRING label (job_status_id is per-tenant, not a stable constant) and the same overlap predicate the API's own filter uses", async () => {
   reset();
   db.on("SELECT zentrades_id", [{ zentrades_id: "555" }]);
   const ids = await listOpenTicketIdsInWindow(9, new Date("2026-09-01T00:00:00Z"), new Date("2026-09-08T00:00:00Z"));
   assert.deepEqual(ids, ["555"]);
   const sql = db.sqls()[0];
-  assert.match(sql, /job_status_id = 1/);
+  assert.match(sql, /LOWER\(job_status\) = 'open'/);
+  assert.doesNotMatch(sql, /job_status_id\s*=/, "must never filter on the numeric jobStatusId — it differs per tenant");
   assert.match(sql, /scheduled_end >= \$2 AND scheduled_start < \$3/);
 });
 

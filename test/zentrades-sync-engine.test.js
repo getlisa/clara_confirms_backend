@@ -151,8 +151,11 @@ test("incremental mode (no full, no custom range) slices a 67-day window (7 back
   reset();
   await runSync(9, {});
   assert.equal(fetchCalls.length, 10, "ceil(67/7) = 10 slices");
-  // Every request is scoped to the OPEN status only.
-  assert.ok(fetchCalls.every((c) => c.terms[0].jobStatusId.includes("1")));
+  // No server-side status term — jobStatusId is per-tenant configuration
+  // (company 12's sandbox tenant uses 1 for "Open", company 13's real one
+  // uses 1988), so a hardcoded numeric filter can't be correct across
+  // tenants. Status filtering happens client-side on the string label.
+  assert.ok(fetchCalls.every((c) => Array.isArray(c.terms) && c.terms.length === 0));
 });
 
 test("full mode widens the window to 90 back + 365 forward — many more slices than incremental", async () => {
@@ -245,6 +248,13 @@ test("a hit outside the requested status is filtered client-side and does NOT ma
   const result = await runSync(9, {});
   assert.equal(result.counts.tickets, 0, "the off-status ticket must be dropped");
   assert.deepEqual(result.incomplete, [], "a loose/misbehaving status filter doesn't mean OUR fetch was incomplete");
+});
+
+test("an Open ticket is kept regardless of its numeric jobStatusId — that id is per-tenant, not a stable constant (regression: company 13/Element Fire uses 1988 for 'Open', not 1)", async () => {
+  reset();
+  seedHits = [sampleTicket({ jobStatusId: 1988, jobStatus: "Open" })];
+  const result = await runSync(9, {});
+  assert.equal(result.counts.tickets, 1, "an Open ticket must sync regardless of this tenant's own numeric jobStatusId");
 });
 
 test("a hit outside the requested schedule window (server ignored the date filter) is dropped and does NOT mark incomplete", async () => {

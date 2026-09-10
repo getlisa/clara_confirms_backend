@@ -488,6 +488,22 @@ async function fetchAllPages(companyId, path, requestBody, { pageSize = PER_PAGE
     if (page === 1) count = typeof envelope.count === "number" ? envelope.count : null;
     const hits = Array.isArray(envelope.hits) ? envelope.hits : [];
 
+    // A zero-match search returns a DIFFERENT envelope shape on this endpoint
+    // — {results: [], total: 0} instead of {requestId, count, hits} — verified
+    // live 2026-09-10 (company 13/zentradesCompanyId 974). Harmless for the
+    // zero-hits case itself (falls through to the same "empty page" return
+    // below either way), but logged explicitly since an envelope shape this
+    // API can silently change on is exactly the kind of thing worth having a
+    // trail for the next time something here looks empty that shouldn't be.
+    if (!("hits" in envelope) && Object.keys(envelope).length > 0) {
+      logger.warn("zentrades: fetchAllPages got an unexpected envelope shape (no 'hits' key)", {
+        companyId, path, page, envelopeKeys: Object.keys(envelope),
+      });
+    }
+    logger.debug("zentrades: fetchAllPages page result", {
+      companyId, path, page, hits: hits.length, envelopeCount: envelope.count ?? envelope.total ?? null,
+    });
+
     if (hits.length === 0) return { rows, complete: true, count };
     rows.push(...hits);
   }
