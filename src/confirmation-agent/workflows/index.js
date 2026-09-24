@@ -17,6 +17,7 @@
 const servicetrade = require("./servicetrade");
 const inspectpoint = require("./inspectpoint");
 const csv = require("./csv");
+const zentrades = require("./zentrades");
 
 const workflows = new Map();
 
@@ -38,5 +39,6 @@ function getWorkflow(slug) {
 register(servicetrade);
 register(inspectpoint);
 register(csv);
+register(zentrades);
 
 module.exports = { register, getWorkflow };

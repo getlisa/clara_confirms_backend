@@ -108,5 +108,6 @@ registerProvider(require("./inspectpoint/provider"));
 // real CRM should win the tie — resolveSlugForCompany returns the first
 // registered provider with an active row.
 registerProvider(require("./csv/provider"));
+registerProvider(require("./zentrades/provider"));
 
 module.exports = { CrmProvider, registerProvider, getProvider, getProviderForSource, listProviders, resolveSlugForCompany };

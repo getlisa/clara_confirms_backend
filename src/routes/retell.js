@@ -61,6 +61,50 @@ function extractNodeTransitions(transcriptWithToolCalls) {
 }
 
 /**
+ * deriveTodoType's ASKED_FOR_CANCELLATION/ASKED_FOR_RESCHEDULE verdict comes
+ * from Retell's own post-call LLM classification, which only sees "the
+ * customer asked to X" — it has no way to know whether the agent actually
+ * fulfilled that request LIVE via the real tool during the same call. Asked
+ * is not the same as escalation-worthy: a customer who asks to reschedule,
+ * gets a new time booked live via reschedule_appointment, and then confirms
+ * it produces `reschedule_requested: true` from the exact same transcript a
+ * genuinely-unresolved "customer wants to reschedule but wouldn't give a
+ * time" call would — deriveTodoType can't tell these apart on its own, so an
+ * already-fully-resolved call was raising a spurious "needs staff follow-up"
+ * todo (observed live 2026-09-09, call_a90e16d79c1f09f84366fc5556e: two
+ * visits rescheduled and both re-confirmed live, yet ASKED_FOR_RESCHEDULE
+ * still fired).
+ *
+ * Checked against durable, tool-written ground truth — never re-derived from
+ * the LLM's own analysis:
+ *  - cancellation: `additional_information.cancelled_by_agent_call_id`,
+ *    stamped by cancelAppointmentCore/cancel_appointment.
+ *  - reschedule: a `rescheduled` confirmation_events row keyed by this exact
+ *    call/chat id (recordSafe's `source` — rescheduleAppointmentCore/
+ *    reschedule_appointment already write one on every live reschedule).
+ */
+async function wasAlreadyFulfilledLive(todoType, companyId, conversationId) {
+  if (todoType === todosDb.TODO_TYPES.ASKED_FOR_CANCELLATION) {
+    const { rows } = await db.query(
+      `SELECT 1 FROM appointments WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
+       UNION ALL
+       SELECT 1 FROM jobs WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
+       LIMIT 1`,
+      [companyId, conversationId]
+    );
+    return rows.length > 0;
+  }
+  if (todoType === todosDb.TODO_TYPES.ASKED_FOR_RESCHEDULE) {
+    const { rows } = await db.query(
+      `SELECT 1 FROM confirmation_events WHERE company_id = $1 AND source = $2 AND event_type = 'rescheduled' LIMIT 1`,
+      [companyId, conversationId]
+    );
+    return rows.length > 0;
+  }
+  return false;
+}
+
+/**
  * POST /retell/webhook
  * Retell fires call_ended then call_analyzed per call.
  */
@@ -282,27 +326,19 @@ async function handleCallAnalyzed(callData) {
     customerOutcome: custom.customer_outcome ?? null,
   });
 
-  // If the agent already cancelled the appointment/job LIVE via the
-  // cancel_appointment tool during this call (marked with
-  // additional_information.cancelled_by_agent_call_id), the ASKED_FOR_CANCELLATION
-  // escalation would be redundant — the tool already raised its own low-priority
-  // APPOINTMENT_CANCELLED FYI todo. Suppress only that case.
-  let suppressCancellationTodo = false;
-  if (todoType === todosDb.TODO_TYPES.ASKED_FOR_CANCELLATION) {
-    const { rows: cancelledCheck } = await db.query(
-      `SELECT 1 FROM appointments WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
-       UNION ALL
-       SELECT 1 FROM jobs WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
-       LIMIT 1`,
-      [companyId, call_id]
-    );
-    suppressCancellationTodo = cancelledCheck.length > 0;
-    if (suppressCancellationTodo) {
-      logger.info("Cancellation already actioned live via cancel_appointment tool; skipping ASKED_FOR_CANCELLATION todo", { callId: call_id, companyId });
-    }
+  // See wasAlreadyFulfilledLive's own comment — an ASKED_FOR_CANCELLATION/
+  // ASKED_FOR_RESCHEDULE verdict from the LLM classifier doesn't know whether
+  // the agent already fulfilled that request live via the real tool, which
+  // makes the escalation todo redundant at best (cancellation already has its
+  // own low-priority APPOINTMENT_CANCELLED FYI todo) and actively misleading
+  // at worst (a fully rescheduled-and-reconfirmed job showing as "needs
+  // follow-up").
+  const suppressLiveFulfilledTodo = await wasAlreadyFulfilledLive(todoType, companyId, call_id);
+  if (suppressLiveFulfilledTodo) {
+    logger.info(`${todoType} already actioned live during the call; skipping the escalation todo`, { callId: call_id, companyId, todoType });
   }
 
-  if (todoType && !suppressCancellationTodo) {
+  if (todoType && !suppressLiveFulfilledTodo) {
     await todosDb.create({
       companyId,
       callId,
@@ -582,19 +618,11 @@ async function handleChatAnalyzed(chatData) {
     customerOutcome: custom.customer_outcome ?? null,
   });
 
-  let suppressCancellationTodo = false;
-  if (todoType === todosDb.TODO_TYPES.ASKED_FOR_CANCELLATION) {
-    const { rows: cancelledCheck } = await db.query(
-      `SELECT 1 FROM appointments WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
-       UNION ALL
-       SELECT 1 FROM jobs WHERE company_id = $1 AND additional_information->>'cancelled_by_agent_call_id' = $2
-       LIMIT 1`,
-      [companyId, chat_id]
-    );
-    suppressCancellationTodo = cancelledCheck.length > 0;
-  }
+  // See wasAlreadyFulfilledLive's own comment (routes/retell.js, above
+  // handleCallAnalyzed) for why this check exists.
+  const suppressLiveFulfilledTodo = await wasAlreadyFulfilledLive(todoType, companyId, chat_id);
 
-  if (todoType && !suppressCancellationTodo) {
+  if (todoType && !suppressLiveFulfilledTodo) {
     await todosDb.create({
       companyId,
       callId,
@@ -761,3 +789,7 @@ async function handleRetryOrCallback({ companyId, retellCallId, inVoicemail, isN
 // live schedule_callback Retell tool in routes/retell-tools.js).
 
 module.exports = router;
+// Exported for tests: wasAlreadyFulfilledLive is a pure DB-facing decision
+// (given a todoType/companyId/conversationId) worth pinning directly, rather
+// than only indirectly through a full webhook-route invocation.
+module.exports.wasAlreadyFulfilledLive = wasAlreadyFulfilledLive;

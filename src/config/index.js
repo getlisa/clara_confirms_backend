@@ -90,6 +90,14 @@ module.exports = {
     // has no subdomain routing of its own; unset in every real environment.
     baseUrlOverride: (process.env.INSPECTPOINT_BASE_URL_OVERRIDE || "").replace(/\/$/, ""),
   },
+  zentrades: {
+    // Real ZenTrades is one shared host for every tenant — auth/companyId
+    // scoping happens inside the JWT, not via a subdomain the way
+    // InspectPoint works. The override exists purely for local development
+    // against a mock server; unset in every real environment.
+    baseUrl: (process.env.ZENTRADES_BASE_URL || "https://services.zentrades.pro").replace(/\/$/, ""),
+    baseUrlOverride: (process.env.ZENTRADES_BASE_URL_OVERRIDE || "").replace(/\/$/, ""),
+  },
   copilot: {
     // LLM providers — failover order is openai → groq (see src/copilot/graph/model.js)
     openaiApiKey: process.env.OPENAI_API_KEY || "",
