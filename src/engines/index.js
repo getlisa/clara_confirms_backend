@@ -6,10 +6,12 @@
 
 const crmSync = require("./crm-sync");
 const schedulerRun = require("./scheduler-run");
+const csvImport = require("./csv-import");
 
 const registry = {
   crm_sync:       crmSync,
   scheduler_run:  schedulerRun,
+  csv_import:     csvImport,
 };
 
 function getEngine(kind) {

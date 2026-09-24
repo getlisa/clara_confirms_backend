@@ -35,6 +35,7 @@ const dashboardRoutes = require("./routes/dashboard");
 const dynamicVariablesRoutes = require("./routes/dynamic-variables");
 const adminRoutes = require("./routes/admin");
 const enginesRoutes = require("./routes/engines");
+const importsRoutes = require("./routes/imports");
 const manualCallsRoutes = require("./routes/manual-calls");
 const serviceLinkMessagesRoutes = require("./routes/service-link-messages");
 const chatLinksRoutes = require("./routes/chat-links");
@@ -200,6 +201,10 @@ app.use("/admin", adminRoutes);
 // Workflow-engine runs (CRM sync, scheduler-run, ...) — JWT for control,
 // signed query-string token for SSE stream.
 app.use("/engines", enginesRoutes);
+
+// CSV/XLSX import — for companies with no CRM. Takes the file as a RAW body
+// (see routes/imports.js), so it must NOT sit behind the global express.json.
+app.use("/imports", importsRoutes);
 
 // Manual call trigger — UI "Call now" button for any call_type.
 app.use("/calls/manual", manualCallsRoutes);

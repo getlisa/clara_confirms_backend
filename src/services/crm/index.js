@@ -103,6 +103,11 @@ async function resolveSlugForCompany(companyId) {
 // active for that company (and vice versa).
 registerProvider(require("./servicetrade/provider"));
 registerProvider(require("./inspectpoint/provider"));
+// Registered LAST on purpose. CSV is the "no CRM" fallback, so if a company
+// somehow carried both a real CRM's credentials and a csv_integration row, the
+// real CRM should win the tie — resolveSlugForCompany returns the first
+// registered provider with an active row.
+registerProvider(require("./csv/provider"));
 registerProvider(require("./zentrades/provider"));
 
 module.exports = { CrmProvider, registerProvider, getProvider, getProviderForSource, listProviders, resolveSlugForCompany };
