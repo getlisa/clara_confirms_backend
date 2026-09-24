@@ -56,6 +56,10 @@
       "schedule": "17 * * * *"
     },
     {
+      "path": "/admin/csv-imports/gc",
+      "schedule": "37 4 * * *"
+    },
+    {
       "path": "/admin/servicetrade-webhooks/drain",
       "schedule": "* * * * *"
     },

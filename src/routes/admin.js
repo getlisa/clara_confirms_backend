@@ -21,6 +21,7 @@ const enginesDb = require("../engines/core/db");
 const webhookProcessor = require("../services/servicetrade-webhook-processor");
 const webhooksDb = require("../db/servicetrade-webhooks");
 const chatLinksDb = require("../db/chat-links");
+const csvImportsDb = require("../db/csv-imports");
 const { runSweep: runDailyReportSweep } = require("../services/daily-report/send");
 const logger = require("../utils/logger");
 
@@ -182,6 +183,27 @@ router.all("/engines/gc", async (req, res) => {
     return res.json({ ok: true, days, deleted, staleMinutes, reaped });
   } catch (err) {
     logger.error("Admin engines/gc failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/csv-imports/gc — retention sweep for CSV uploads.
+//
+// Clears the stored FILE and its raw per-row mirror for imports older than
+// ?days=30, keeping the summary row so the office's import archive stays
+// complete. Deliberately not a delete: "what was imported on the 3rd, and who
+// uploaded it" is the question the archive exists to answer, and the summary
+// costs a few hundred bytes. What's expensive — the file text and
+// csv_import_rows — is what expires.
+router.all("/csv-imports/gc", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const days = Math.max(parseInt(req.query.days, 10) || csvImportsDb.CONTENT_RETENTION_DAYS, 1);
+    const { purgedFiles, deletedRows } = await csvImportsDb.purgeExpiredContent({ days });
+    logger.info("Admin: csv-imports retention sweep", { days, purgedFiles, deletedRows });
+    return res.json({ ok: true, days, purgedFiles, deletedRows });
+  } catch (err) {
+    logger.error("Admin csv-imports/gc failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });
