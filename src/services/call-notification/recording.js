@@ -19,19 +19,41 @@
 const config = require("../../config");
 const logger = require("../../utils/logger");
 const { PREFIX, maskUrl, since } = require("./log");
+const { fetchStreaming } = require("../../utils/streaming-fetch");
 
 // SendGrid's 30 MB ceiling applies to the BASE64 payload, which is ~1.33x the
-// raw bytes. 12 MB raw lands near 16 MB encoded, leaving room for the HTML and
-// the transcript. Env-overridable because the right number depends on Retell's
-// actual encoding — see the verification notes in the frontend doc.
-const MAX_BYTES = Number(process.env.RECORDING_ATTACH_MAX_BYTES) || 12 * 1024 * 1024;
+// raw bytes, so 18 MB raw lands near 24 MB encoded and leaves ~6 MB for the
+// HTML and the transcript.
+//
+// 18 MB is MEASURED, not guessed. Retell serves uncompressed WAV at ~48 KB/s
+// (2.75 MB per minute), and across 137 real voice calls: median 87s, p90 165s,
+// longest 290s = 13.3 MB. So 18 MB (~6.5 minutes) covers every call observed
+// with headroom, where the 12 MB this started at would have silently dropped
+// the audio on 2 of those 137.
+//
+// Erring UP matters more than erring down: exceeding SendGrid's own limit makes
+// the whole send fail, which costs the recipient the transcript and summary too
+// — strictly worse than an email with no attachment.
+const MAX_BYTES = Number(process.env.RECORDING_ATTACH_MAX_BYTES) || 18 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = Number(process.env.RECORDING_FETCH_TIMEOUT_MS) || 20000;
+// Separate budget for the BODY, once headers are in. A 7 MB recording over a
+// slow link legitimately needs longer than the response timeout allows, and
+// this one is cleared in a finally so it cannot fire after we have returned.
+const BODY_BUDGET_MS = Number(process.env.RECORDING_BODY_BUDGET_MS) || 120000;
 
 /**
  * A player only appears if the MIME type is a real audio type AND the filename
  * extension agrees with it. Sent as application/octet-stream, every client
  * renders a dead paperclip instead — so the type comes from the response header
  * and the extension is derived FROM that type, never hardcoded.
+ *
+ * VERIFIED AGAINST REAL RECORDINGS: Retell serves its recordings from
+ * CloudFront with `Content-Type: binary/octet-stream` (sometimes
+ * `application/octet-stream`) — NEVER audio/wav. So the header alone is useless
+ * here and the URL-extension fallback below is not a nicety, it is the path
+ * every real attachment actually takes. Without it every email would carry an
+ * unplayable octet-stream blob, which is the one thing this feature exists to
+ * avoid.
  */
 const TYPE_TO_EXT = {
   "audio/wav":      "wav",
@@ -86,6 +108,25 @@ function resolveAudioType(contentType, url) {
 }
 
 /**
+ * Discard a response body we have decided not to read.
+ *
+ * THIS PREVENTS A PROCESS CRASH. Returning from a fetch without consuming or
+ * cancelling the body leaves the request in flight. If a timeout then fires,
+ * undici aborts it and the detached body stream emits 'error' with nobody
+ * listening — and an unhandled 'error' event takes the whole process down:
+ *
+ *   DOMException [TimeoutError]: The operation was aborted due to timeout
+ *   Emitted 'error' event on Readable instance at: ...
+ *
+ * The archive sweep hits the `!res.ok` path every five minutes whenever Retell
+ * has not attached a recording yet, so this was not a rare edge — it was a
+ * recurring crash on a cron, needing no user action at all.
+ */
+async function releaseBody(res) {
+  try { await res?.body?.cancel(); } catch { /* already closed or errored */ }
+}
+
+/**
  * @typedef {object} RecordingFetch
  * @property {"ok"|"too_large"|"unavailable"|"bad_type"} status
  * @property {Buffer|null} buffer
@@ -115,8 +156,16 @@ async function fetchRecording(recordingUrl) {
   });
 
   let res;
+  let abortUpstream = () => {};
+  let bodyBudget = null;
   try {
-    res = await fetch(recordingUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    // Response-phase timeout, then a body budget WE own — so the timer is
+    // always cleared in the finally below and can never fire against a
+    // request we have already walked away from. See utils/streaming-fetch.js.
+    const opened = await fetchStreaming(recordingUrl, { responseTimeoutMs: FETCH_TIMEOUT_MS });
+    res = opened.response;
+    abortUpstream = opened.abort;
+    bodyBudget = setTimeout(() => abortUpstream(new Error("Recording body transfer exceeded its budget")), BODY_BUDGET_MS);
   } catch (err) {
     logger.warn(`${PREFIX} recording   → download failed (will be retried)`, {
       url: maskUrl(recordingUrl), error: err.message, ms: since(startedAt),
@@ -125,7 +174,12 @@ async function fetchRecording(recordingUrl) {
              reason: `Recording fetch failed: ${err.message}` };
   }
 
+  // Every path from here on MUST either read the body or release it, and must
+  // clear bodyBudget. The try/finally makes that structural rather than a rule
+  // each early return has to remember.
+  try {
   if (!res.ok) {
+    await releaseBody(res);
     // A 403/404 here is usually Retell not having attached the object yet —
     // expected on the first pass, which is why this is warn and not error.
     logger.warn(`${PREFIX} recording   → upstream returned HTTP ${res.status} (will be retried)`, {
@@ -139,6 +193,7 @@ async function fetchRecording(recordingUrl) {
   // file is never pulled into memory at all.
   const advertised = Number(res.headers.get("content-length"));
   if (Number.isFinite(advertised) && advertised > MAX_BYTES) {
+    await releaseBody(res);
     logger.warn(`${PREFIX} recording   → too large to attach; refused before reading the body`, {
       url: maskUrl(recordingUrl), bytes: advertised, maxBytes: MAX_BYTES, ms: since(startedAt),
     });
@@ -148,6 +203,7 @@ async function fetchRecording(recordingUrl) {
 
   const audio = resolveAudioType(res.headers.get("content-type"), recordingUrl);
   if (!audio) {
+    await releaseBody(res);
     return { status: "bad_type", buffer: null, contentType: null, ext: null, bytes: null,
              reason: "Recording was not a recognised audio format" };
   }
@@ -178,6 +234,10 @@ async function fetchRecording(recordingUrl) {
   });
   return { status: "ok", buffer, contentType: audio.contentType, ext: audio.ext,
            bytes: buffer.length, reason: null };
+  } finally {
+    // The one line that guarantees no armed timer outlives this function.
+    if (bodyBudget) clearTimeout(bodyBudget);
+  }
 }
 
 /**

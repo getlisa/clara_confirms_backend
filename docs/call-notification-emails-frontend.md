@@ -23,8 +23,9 @@ So there are two new things:
    worth an email to them. The recording rides along as a **playable audio
    attachment**.
 2. **A recording player in the portal** — `calls.recording_url` did not exist
-   before this; Retell sent it on every call and the backend discarded it. It is
-   now stored, and served through a proxy endpoint (§7).
+   before this; Retell sent it on every call and the backend discarded it. Now
+   the audio itself is copied into our own private bucket and served through an
+   authorised proxy (§7), so playback no longer depends on Retell.
 
 Both are **off by default**. Every one of the 13 existing companies has
 `enabled: false` and zero recipients, so nothing emails until someone opts in.
@@ -188,14 +189,17 @@ cost the audio on that email *permanently*. Queued, it simply retries.
 
 ## 7. The recording player
 
-`GET /calls` and `GET /calls/:id` gain **`has_recording: boolean`**.
-`GET /calls/:id` additionally returns **`recording_stream_url`** when that is true:
+`GET /calls` and `GET /calls/:id` return **`recording_state`**, and `GET /calls/:id`
+adds **`recording_stream_url`** when the audio is playable:
 
 ```json
 { "call": {
-  "id": 142,
+  "id": 607,
+  "recording_state": "available",
+  "recording_source": "archive",
+  "recording_bytes": 7064670,
   "has_recording": true,
-  "recording_stream_url": "/calls/142/recording?token=eyJydW5JZCI6...abc123"
+  "recording_stream_url": "/calls/607/recording?token=eyJydW5JZCI6...abc123"
 } }
 ```
 
@@ -204,25 +208,53 @@ Drop it straight into an audio element:
 <audio controls preload="metadata" :src="apiBase + call.recording_stream_url" />
 ```
 
-**Why it isn't Retell's own URL.** Retell's URL is unauthenticated — anyone holding
-it can replay a customer conversation. It never leaves the backend. This endpoint
-proxies the bytes and forwards `Range` headers, so seeking works normally.
+### `recording_state` — render all four, not just a boolean
+
+This is the part to get right. **"No audio" has two completely different meanings**
+and they must not look the same to a user:
+
+| state | meaning | what to show |
+|---|---|---|
+| `available` | playable right now | the player |
+| `pending` | a voice call whose audio we have not captured yet (usually < 5 min old) | *"Recording is being processed…"* — it appears on its own, no user action |
+| `purged` | **deleted after the retention window — permanently gone** | *"Recording deleted after the retention period"*. No player, no retry affordance |
+| `none` | no recording exists (a chat, or a call that never had one) | nothing at all |
+
+`has_recording` is kept as a convenience (`true` only when `recording_state === "available"`),
+but **a bare boolean cannot express the difference between "wait a moment" and
+"never coming back"** — a player rendered for a purged call is just broken.
+
+`recording_source` is `"archive"` (our own copy) or `"retell"` (not yet archived).
+Ops/debug only — playback works identically either way. `recording_bytes` is the
+stored size, handy for a download affordance.
+
+### Endpoint behaviour
+
+**`GET /calls/:id/recording`** — streams the audio, forwarding `Range` so seeking works.
+
+- **`200` / `206`** with the audio, plus an `X-Recording-Source: archive|retell` header
+- **`410 Gone`** `{ "error": "This recording has been deleted under the retention policy", "recording_state": "purged", "purged_at": "..." }` — treat as final, never retry
+- **`404`** `{ "error": "No recording for this call", "recording_state": "pending" }` — may succeed later
+- **`401`** invalid or expired token
 
 **Three things to get right:**
 
-1. **The token expires in 30 minutes.** Re-read the call rather than caching this
-   URL in a store. If playback 401s, re-fetch `GET /calls/:id`.
-2. **It is not `authenticate`-guarded** — an HTML5 `<audio>` element cannot set an
-   `Authorization` header, so the signed query token *is* the auth. Same pattern as
-   the SSE stream in `routes/engines.js`. Do not add a Bearer header to it.
-3. Use `has_recording` for the list view (it is on `GET /calls` rows too); only
-   `GET /calls/:id` mints a `recording_stream_url`.
+1. **The token expires in 30 minutes.** Re-read the call rather than caching the
+   URL. On a `401`, re-fetch `GET /calls/:id` and retry once.
+2. **It is not `authenticate`-guarded** — an `<audio>` element cannot set an
+   `Authorization` header, so the signed query token *is* the auth. Do not add a
+   Bearer header to it.
+3. **Distinguish `410` from `404`.** A `410` is permanent; showing "retry" there
+   is misleading.
 
-**404** `{ "error": "No recording for this call" }` — chats never have one, and
-calls from before this shipped have no stored URL.
-**401** `{ "error": "Invalid or expired recording token" }`
+### Where the audio actually lives
 
----
+Recordings are copied into our own private storage bucket within ~5 minutes of a
+call (a cron sweep), and playback is served from that copy. Retell is only a
+fallback for the gap before the sweep catches up. **Recordings are deleted 30 days after the call** and the state becomes `purged`.
+The window is measured from the CALL's date (not from when we archived it) and is
+configurable server-side (`RECORDING_RETENTION_DAYS`) — so don't hardcode "30
+days" anywhere you can instead say "the retention period".
 
 ## 8. What the email itself looks like
 
@@ -296,6 +328,15 @@ see §6. The cron owns retries; a UI retry would risk a duplicate email, which t
 backend's unique index is there to prevent.
 
 **`POST /test` is a real send.** Never wire it to a hover-preview or an autosave.
+
+**Never render a player for `recording_state: "purged"`.** It is deleted, not
+slow. A spinner or a retry button there is a lie the user will act on. Equally,
+don't show a permanent "unavailable" for `"pending"` — that one resolves itself
+within a few minutes.
+
+**Don't hardcode "30 days" in UI copy.** The retention window is a server-side
+setting (`RECORDING_RETENTION_DAYS`) and has already changed once (90 → 30).
+"After the retention period" ages better.
 
 ---
 

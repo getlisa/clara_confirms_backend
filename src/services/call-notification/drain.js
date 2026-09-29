@@ -93,6 +93,37 @@ async function resolveRecording({ call, retellCallId, minAttempts, isChat }) {
     retellCallId, attempt: minAttempts, maxAttempts: RECORDING_MAX_ATTEMPTS,
   });
 
+  // Prefer OUR archived copy: it saves a second trip to Retell, and once a call
+  // is archived the email no longer depends on Retell at all. Falls through to
+  // the Retell path below when the archive sweep has not caught up yet.
+  const src = await callsDb.getRecordingSourceByRetellId(retellCallId);
+  if (src?.storagePath) {
+    const fromArchive = await readArchived(src);
+    if (fromArchive) {
+      logger.info(`${PREFIX} drain   3/6 — recording read from our archive`, {
+        retellCallId, objectPath: src.storagePath,
+        kb: Math.round(fromArchive.bytes / 1024), contentType: fromArchive.contentType,
+      });
+      return { recording: fromArchive, holdFor: null };
+    }
+    logger.warn(`${PREFIX} drain   3/6 — archived copy unreadable, falling back to Retell`, {
+      retellCallId, objectPath: src.storagePath,
+    });
+  }
+
+  // Purged under the retention policy: there is nothing to wait for, and the
+  // email must not stall. Send it with transcript + summary and say so.
+  if (src?.purgedAt && !src?.storagePath) {
+    logger.warn(`${PREFIX} drain   3/6 — recording was purged under retention; sending without audio`, {
+      retellCallId, purgedAt: src.purgedAt,
+    });
+    return {
+      recording: { status: "purged", buffer: null, contentType: null, ext: null, bytes: null,
+                   reason: "The recording was deleted under the retention policy" },
+      holdFor: null,
+    };
+  }
+
   let url = await callsDb.getRecordingUrlByRetellId(retellCallId);
   let urlSource = url ? "stored on the call row" : null;
 
@@ -131,6 +162,27 @@ async function resolveRecording({ call, retellCallId, minAttempts, isChat }) {
     });
   }
   return { recording, holdFor: null };
+}
+
+/**
+ * Read an archived object into the shape fetchRecording returns, so the email
+ * builder cannot tell the two sources apart.
+ * Returns null on any problem — the caller then falls back to Retell.
+ */
+async function readArchived(src) {
+  try {
+    const { openRecording } = require("../call-recording-archive");
+    const { source, response } = await openRecording({ storagePath: src.storagePath, retellUrl: null });
+    if (source !== "archive" || !response) return null;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!buffer.length) return null;
+    const contentType = src.contentType || response.headers.get("content-type") || "audio/wav";
+    const ext = (src.storagePath.split(".").pop() || "wav").toLowerCase();
+    return { status: "ok", buffer, contentType, ext, bytes: buffer.length, reason: null };
+  } catch (err) {
+    logger.warn(`${PREFIX} drain       → reading archived copy threw`, { error: err.message });
+    return null;
+  }
 }
 
 /** Send one queued row. Never throws — the caller tallies the result. */

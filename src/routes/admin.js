@@ -23,6 +23,7 @@ const webhooksDb = require("../db/servicetrade-webhooks");
 const chatLinksDb = require("../db/chat-links");
 const { runSweep: runDailyReportSweep } = require("../services/daily-report/send");
 const { runSweep: runCallNotificationSweep } = require("../services/call-notification/drain");
+const { runArchiveSweep, runPurgeSweep } = require("../services/call-recording-archive");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -294,6 +295,42 @@ router.all("/call-notifications/drain", async (req, res) => {
     return res.json({ ok: true, ...result });
   } catch (err) {
     logger.error("Admin call-notifications/drain failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/recordings/archive — pull call audio from Retell into our own
+// private bucket (migration 108).
+//
+// Its OWN sweep, deliberately not part of the notification drain: that drain
+// only runs when somebody is subscribed to a call's outcome, so hanging
+// archival off it would leave a company with notifications switched off
+// retaining no audio at all. Retention is a property of the record, not of
+// anyone's email preferences.
+router.all("/recordings/archive", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const result = await runArchiveSweep();
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error("Admin recordings/archive failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/recordings/purge — delete archived audio past the retention
+// window (RECORDING_RETENTION_DAYS, default 90).
+//
+// IRREVERSIBLE. Every deletion is logged individually at info level so the
+// purge is auditable from the logs alone. Transcript, summary and the Retell
+// URL are all left intact — only our copy of the audio is removed.
+router.all("/recordings/purge", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const result = await runPurgeSweep();
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error("Admin recordings/purge failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });
