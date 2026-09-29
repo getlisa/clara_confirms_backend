@@ -24,6 +24,7 @@ async function upsertAnalyzed({
   callSuccessful, callSummary, userSentiment,
   appointmentConfirmed, rescheduleRequested, cancellationRequested,
   transcript, transcriptWithToolCalls, callCost, rawAnalysis, channel = "voice",
+  recordingUrl = null, publicLogUrl = null,
 }) {
   await db.query(
     `INSERT INTO calls
@@ -31,8 +32,9 @@ async function upsertAnalyzed({
         disconnection_reason, in_voicemail, metadata, status, is_test,
         call_successful, call_summary, user_sentiment,
         appointment_confirmed, reschedule_requested, cancellation_requested,
-        transcript, transcript_with_tool_calls, call_cost, raw_analysis, channel)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'analyzed',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+        transcript, transcript_with_tool_calls, call_cost, raw_analysis, channel,
+        recording_url, public_log_url)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'analyzed',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
      ON CONFLICT (retell_call_id) DO UPDATE SET
        status                      = 'analyzed',
        duration_ms                 = COALESCE(EXCLUDED.duration_ms, calls.duration_ms),
@@ -51,6 +53,11 @@ async function upsertAnalyzed({
        call_cost                   = EXCLUDED.call_cost,
        raw_analysis                = EXCLUDED.raw_analysis,
        channel                     = EXCLUDED.channel,
+       -- COALESCE, not EXCLUDED: Retell types recording_url as optional and the
+       -- S3 object can lag this webhook, so a redelivery that arrives WITHOUT
+       -- the field must not blank a URL we already captured.
+       recording_url               = COALESCE(EXCLUDED.recording_url, calls.recording_url),
+       public_log_url              = COALESCE(EXCLUDED.public_log_url, calls.public_log_url),
        updated_at                  = NOW()`,
     [
       retellCallId, companyId, toNumber, fromNumber, durationMs,
@@ -62,7 +69,39 @@ async function upsertAnalyzed({
       callCost ? JSON.stringify(callCost) : null,
       rawAnalysis ? JSON.stringify(rawAnalysis) : null,
       channel || "voice",
+      recordingUrl || null,
+      publicLogUrl || null,
     ]
+  );
+}
+
+/**
+ * The recording URL for one call — read ONLY by the backend (the notification
+ * email's audio fetch and the GET /calls/:id/recording proxy). Deliberately not
+ * part of rowToCall: it is an unauthenticated link to a customer conversation,
+ * so it must never reach an email body or a browser. See migration 107.
+ */
+async function getRecordingUrl(id, companyId) {
+  const { rows } = await db.query(
+    `SELECT recording_url FROM calls WHERE id = $1 AND company_id = $2`,
+    [id, companyId]
+  );
+  return rows[0]?.recording_url ?? null;
+}
+
+/** Same, keyed by Retell's id — what the notification drain has in hand. */
+async function getRecordingUrlByRetellId(retellCallId) {
+  const { rows } = await db.query(
+    `SELECT recording_url FROM calls WHERE retell_call_id = $1`,
+    [retellCallId]
+  );
+  return rows[0]?.recording_url ?? null;
+}
+
+async function setRecordingUrl(retellCallId, recordingUrl) {
+  await db.query(
+    `UPDATE calls SET recording_url = $2, updated_at = NOW() WHERE retell_call_id = $1`,
+    [retellCallId, recordingUrl]
   );
 }
 
@@ -114,7 +153,7 @@ async function list(companyId, { limit = 50, offset = 0, status, appointmentConf
             c.duration_ms, c.disconnection_reason, c.in_voicemail, c.channel,
             c.call_successful, c.call_summary, c.user_sentiment,
             c.appointment_confirmed, c.reschedule_requested, c.cancellation_requested,
-            c.transcript, c.created_at, c.updated_at,
+            c.transcript, c.recording_url, c.created_at, c.updated_at,
             cu.id          AS customer_id,
             cu.full_name   AS customer_name,
             cu.email       AS customer_email,
@@ -165,6 +204,9 @@ function rowToCall(row) {
     reschedule_requested:    row.reschedule_requested,
     cancellation_requested:  row.cancellation_requested,
     transcript:              row.transcript,
+    // A boolean, never the URL itself — see getRecordingUrl. The portal plays
+    // it through GET /calls/:id/recording instead.
+    has_recording:           !!row.recording_url,
     location_name:           row.location_name ?? null,
     // Manual vs swept, and who clicked. A manually-dialled call and a
     // scheduler-dialled one were indistinguishable in the logs before this.
@@ -209,4 +251,5 @@ async function getById(id, companyId) {
 }
 
 module.exports = {
-  searchClause, upsertStub, upsertAnalyzed, list, getById };
+  searchClause, upsertStub, upsertAnalyzed, list, getById,
+  getRecordingUrl, getRecordingUrlByRetellId, setRecordingUrl };

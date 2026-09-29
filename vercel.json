@@ -66,6 +66,10 @@
     {
       "path": "/admin/reports/daily-sweep",
       "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/admin/call-notifications/drain",
+      "schedule": "* * * * *"
     }
   ]
 }

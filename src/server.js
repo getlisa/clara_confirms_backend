@@ -38,6 +38,7 @@ const manualCallsRoutes = require("./routes/manual-calls");
 const serviceLinkMessagesRoutes = require("./routes/service-link-messages");
 const chatLinksRoutes = require("./routes/chat-links");
 const reportsRoutes = require("./routes/reports");
+const callNotificationsRoutes = require("./routes/call-notifications");
 const copilotRoutes = require("./routes/copilot");
 const servicetradeWebhooksRoutes = require("./routes/servicetrade-webhooks");
 const logsRoutes = require("./routes/logs");
@@ -206,6 +207,10 @@ app.use("/service-link-messages", serviceLinkMessagesRoutes);
 // Shareable chat-widget links — generate (staff) + resolve (public, token-authed).
 app.use("/chat-links", chatLinksRoutes);
 app.use("/reports", reportsRoutes);
+
+// Per-conversation notification emails — recipients, per-recipient outcome
+// filters, and the master switch. Delivery itself is the admin drain cron.
+app.use("/call-notifications", callNotificationsRoutes);
 
 // AI Copilot — embedded assistant. JWT for control endpoints, signed
 // query-string token for the SSE turn stream.
