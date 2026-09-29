@@ -31,11 +31,21 @@ stub("db/call-notification-sends", {
 let call = null;
 let recordingUrl = null;
 const recordingUrlReads = [];
+// `archivedSource` drives the new "prefer our own copy" branch. Default null =
+// nothing archived yet, which is the state these Retell-path tests describe.
+let archivedSource = null;
 stub("db/calls", {
   getById: async () => call,
   getRecordingUrlByRetellId: async (id) => { recordingUrlReads.push(id); return recordingUrl; },
   getRecordingUrl: async () => recordingUrl,
   setRecordingUrl: async (id, url) => { recordingUrl = url; },
+  getRecordingSourceByRetellId: async () => archivedSource,
+});
+
+// Reading an archived object goes through the archive service.
+let archiveReadImpl = async () => ({ source: "none", response: null, purged: false });
+stub("services/call-recording-archive", {
+  openRecording: async (...a) => archiveReadImpl(...a),
 });
 
 stub("db", {
@@ -104,6 +114,8 @@ function reset() {
   recordingUrlReads.length = 0;
   fetchCalls.length = 0;
   fetchResult = { status: "ok", buffer: Buffer.alloc(4096), contentType: "audio/wav", ext: "wav", bytes: 4096, reason: null };
+  archivedSource = null;
+  archiveReadImpl = async () => ({ source: "none", response: null, purged: false });
   logger.reset();
 }
 
@@ -441,4 +453,55 @@ test("an idle sweep logs at debug, so a once-a-minute cron cannot flood info", a
 
   assert.equal(logger.records.info.length, 0, "nothing at info level when there is no work");
   assert.ok(logger.records.debug.some(([msg]) => /nothing due/.test(String(msg))));
+});
+
+// ── preferring our own archived copy ─────────────────────────────────────────
+
+test("the email attaches OUR archived copy and never touches Retell for it", async () => {
+  reset();
+  archivedSource = { storagePath: "8/call_abc/recording.wav", retellUrl: RETELL_URL, purgedAt: null, contentType: "audio/wav" };
+  archiveReadImpl = async () => ({
+    source: "archive",
+    response: { headers: new Map([["content-type", "audio/wav"]]), arrayBuffer: async () => new ArrayBuffer(5000) },
+    purged: false,
+  });
+  dueRows = [row()];
+
+  const result = await runSweep();
+
+  assert.equal(result.sent, 1);
+  assert.equal(fetchCalls.length, 0, "an archived call does not re-download from Retell");
+  assert.equal(sent[0].attachments.length, 2, "audio still attached");
+  assert.equal(sent[0].attachments[0].contentType, "audio/wav");
+  assert.equal(sent[0].attachments[0].content.length, 5000);
+  assert.equal(marks.sent[0].recordingAttached, true);
+});
+
+test("an unreadable archived copy falls back to Retell rather than losing the audio", async () => {
+  reset();
+  archivedSource = { storagePath: "8/call_abc/recording.wav", retellUrl: RETELL_URL, purgedAt: null, contentType: "audio/wav" };
+  archiveReadImpl = async () => ({ source: "none", response: null, purged: false });
+  dueRows = [row()];
+
+  const result = await runSweep();
+
+  assert.equal(result.sent, 1);
+  assert.equal(fetchCalls.length, 1, "it fell back to the Retell download");
+  assert.equal(sent[0].attachments.length, 2, "the recipient still gets the audio");
+});
+
+test("a purged recording sends immediately without audio — never held waiting", async () => {
+  reset();
+  archivedSource = { storagePath: null, retellUrl: RETELL_URL, purgedAt: "2026-01-01T00:00:00Z", contentType: null };
+  dueRows = [row()];
+
+  const result = await runSweep();
+
+  // Nothing is coming back, so holding would just delay the transcript forever.
+  assert.equal(result.held, 0);
+  assert.equal(result.sent, 1);
+  assert.equal(fetchCalls.length, 0, "no point asking Retell for something we deleted on purpose");
+  assert.equal(sent[0].attachments.length, 1, "transcript only");
+  assert.equal(marks.sent[0].recordingAttached, false);
+  assert.ok(/retention policy/i.test(sent[0].html), "and the email explains why");
 });

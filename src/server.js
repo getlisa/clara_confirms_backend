@@ -273,6 +273,41 @@ async function start() {
   }
 }
 
+// ============================================================================
+// Last-resort guards
+// ============================================================================
+//
+// A single detached stream error must not be able to end the process for every
+// tenant. This backend already lost availability twice that way: an aborted
+// recording transfer emitted 'error' on a Readable nobody was listening to, and
+// Node's response to an unhandled 'error' event is to throw at the top level.
+//
+// Both root causes are fixed (utils/streaming-fetch.js and the pipeline() guard
+// in routes/calls.js), but the failure mode is worth a net: the errors that
+// reach here are I/O events detached from any request, carrying no shared
+// state, so continuing to serve is strictly better than a hard stop. Anything
+// that genuinely corrupts state will fail its own request on its own terms.
+//
+// These are logged as loudly as possible on purpose — a quiet uncaughtException
+// handler turns a crash into an invisible bug, which is worse.
+process.on("uncaughtException", (err) => {
+  logger.error("UNCAUGHT EXCEPTION — logged and survived; this is a bug, not a normal condition", {
+    error: err?.message,
+    name: err?.name,
+    code: err?.code,
+    stack: err?.stack,
+  });
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error("UNHANDLED PROMISE REJECTION — logged and survived; this is a bug, not a normal condition", {
+    error: reason?.message ?? String(reason),
+    name: reason?.name,
+    code: reason?.code,
+    stack: reason?.stack,
+  });
+});
+
 // Handle graceful shutdown
 process.on("SIGTERM", async () => {
   logger.info("SIGTERM received, shutting down gracefully");

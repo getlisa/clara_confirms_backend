@@ -74,6 +74,14 @@
     {
       "path": "/admin/call-notifications/drain",
       "schedule": "* * * * *"
+    },
+    {
+      "path": "/admin/recordings/archive",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/admin/recordings/purge",
+      "schedule": "30 4 * * *"
     }
   ]
 }

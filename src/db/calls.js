@@ -89,6 +89,44 @@ async function getRecordingUrl(id, companyId) {
   return rows[0]?.recording_url ?? null;
 }
 
+/**
+ * Everything GET /calls/:id/recording needs to serve the audio: our own object
+ * first, Retell's URL as the fallback, and whether it was deliberately purged
+ * (so the route can answer "gone for good" rather than a bare 404).
+ */
+async function getRecordingSource(id, companyId) {
+  const { rows } = await db.query(
+    `SELECT recording_storage_path, recording_url, recording_purged_at, recording_content_type
+       FROM calls WHERE id = $1 AND company_id = $2`,
+    [id, companyId]
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    storagePath: row.recording_storage_path ?? null,
+    retellUrl: row.recording_url ?? null,
+    purgedAt: row.recording_purged_at ?? null,
+    contentType: row.recording_content_type ?? null,
+  };
+}
+
+/** Same, keyed by Retell's id — what the notification drain has in hand. */
+async function getRecordingSourceByRetellId(retellCallId) {
+  const { rows } = await db.query(
+    `SELECT recording_storage_path, recording_url, recording_purged_at, recording_content_type
+       FROM calls WHERE retell_call_id = $1`,
+    [retellCallId]
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    storagePath: row.recording_storage_path ?? null,
+    retellUrl: row.recording_url ?? null,
+    purgedAt: row.recording_purged_at ?? null,
+    contentType: row.recording_content_type ?? null,
+  };
+}
+
 /** Same, keyed by Retell's id — what the notification drain has in hand. */
 async function getRecordingUrlByRetellId(retellCallId) {
   const { rows } = await db.query(
@@ -153,7 +191,9 @@ async function list(companyId, { limit = 50, offset = 0, status, appointmentConf
             c.duration_ms, c.disconnection_reason, c.in_voicemail, c.channel,
             c.call_successful, c.call_summary, c.user_sentiment,
             c.appointment_confirmed, c.reschedule_requested, c.cancellation_requested,
-            c.transcript, c.recording_url, c.created_at, c.updated_at,
+            c.transcript, c.recording_url, c.recording_storage_path,
+            c.recording_purged_at, c.recording_bytes, c.recording_archive_attempts,
+            c.created_at, c.updated_at,
             cu.id          AS customer_id,
             cu.full_name   AS customer_name,
             cu.email       AS customer_email,
@@ -183,6 +223,20 @@ async function list(companyId, { limit = 50, offset = 0, status, appointmentConf
   return result.rows.map(rowToCall);
 }
 
+/**
+ * Derive the recording's lifecycle state. Order matters: a purged recording may
+ * still carry Retell's URL, and that URL must NOT make it look available again
+ * — we deleted our copy on purpose, and Retell's own retention is not something
+ * this product promises anything about.
+ */
+function recordingState(row) {
+  if (row.recording_purged_at) return "purged";
+  if (row.recording_storage_path) return "available";
+  if (row.recording_url) return "available";
+  if ((row.channel ?? "voice") === "voice" && row.status === "analyzed") return "pending";
+  return "none";
+}
+
 function rowToCall(row) {
   const customerAddress = [row.address_line1, row.city, row.state, row.zipcode].filter(Boolean).join(", ") || null;
   return {
@@ -206,7 +260,20 @@ function rowToCall(row) {
     transcript:              row.transcript,
     // A boolean, never the URL itself — see getRecordingUrl. The portal plays
     // it through GET /calls/:id/recording instead.
-    has_recording:           !!row.recording_url,
+    has_recording:           recordingState(row) === "available",
+    // WHY a state and not just the boolean: with a retention window, "no audio"
+    // has two very different meanings the UI must not conflate — not archived
+    // YET (comes back on its own) versus deleted at end of retention (never
+    // comes back). A bare boolean would render both as a broken player.
+    //   available — playable right now
+    //   pending   — voice call whose audio has not been captured yet
+    //   purged    — deleted after the retention window; permanently gone
+    //   none      — no recording exists (a chat, or a call that never had one)
+    recording_state:         recordingState(row),
+    // Where a playable recording would be served from. Ops/debug only — the
+    // player uses recording_stream_url regardless.
+    recording_source:        row.recording_storage_path ? "archive" : (row.recording_url ? "retell" : null),
+    recording_bytes:         row.recording_bytes != null ? Number(row.recording_bytes) : null,
     location_name:           row.location_name ?? null,
     // Manual vs swept, and who clicked. A manually-dialled call and a
     // scheduler-dialled one were indistinguishable in the logs before this.
@@ -252,4 +319,5 @@ async function getById(id, companyId) {
 
 module.exports = {
   searchClause, upsertStub, upsertAnalyzed, list, getById,
-  getRecordingUrl, getRecordingUrlByRetellId, setRecordingUrl };
+  getRecordingUrl, getRecordingUrlByRetellId, setRecordingUrl,
+  getRecordingSource, getRecordingSourceByRetellId, recordingState };

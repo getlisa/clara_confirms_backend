@@ -2,6 +2,7 @@ const express = require("express");
 const callsDb = require("../db/calls");
 const { authenticate, getCompanyId } = require("../auth");
 const streamToken = require("../engines/core/token");
+const { openRecording } = require("../services/call-recording-archive");
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localizeRows, localizeFields } = require("../utils/timezone");
 
@@ -21,6 +22,11 @@ const CALL_TZ_FIELDS = ["created_at", "updated_at"];
  * The point of proxying rather than handing the frontend Retell's own URL is
  * that the URL is unauthenticated — anyone holding it can replay a customer
  * conversation. It never leaves this process.
+ *
+ * Served from OUR archived copy when we have one, falling back to Retell only
+ * while the archive sweep has not caught up yet (see
+ * services/call-recording-archive.js). Once a call is archived, playback no
+ * longer depends on Retell at all.
  */
 router.get("/:id/recording", async (req, res) => {
   const callId = Number(req.params.id);
@@ -31,20 +37,37 @@ router.get("/:id/recording", async (req, res) => {
   }
 
   try {
-    const url = await callsDb.getRecordingUrl(callId, claim.companyId);
-    if (!url) return res.status(404).json({ error: "No recording for this call" });
+    const src = await callsDb.getRecordingSource(callId, claim.companyId);
+    if (!src) return res.status(404).json({ error: "Call not found" });
+
+    // A purged recording is answered distinctly from a missing one: it is gone
+    // for good, and the UI should say so rather than show a retry affordance.
+    if (src.purgedAt && !src.storagePath) {
+      return res.status(410).json({
+        error: "This recording has been deleted under the retention policy",
+        recording_state: "purged",
+        purged_at: src.purgedAt,
+      });
+    }
+    if (!src.storagePath && !src.retellUrl) {
+      return res.status(404).json({ error: "No recording for this call", recording_state: "pending" });
+    }
 
     // Range is forwarded so the browser can seek rather than re-downloading.
-    const upstream = await fetch(url, {
-      headers: req.headers.range ? { Range: req.headers.range } : {},
-      signal: AbortSignal.timeout(30000),
+    const { source, response: upstream, abort } = await openRecording({
+      storagePath: src.storagePath,
+      retellUrl: src.retellUrl,
+      purgedAt: src.purgedAt,
+      range: req.headers.range || null,
     });
-    if (!upstream.ok && upstream.status !== 206) {
-      logger.warn("GET /calls/:id/recording: upstream refused", { callId, status: upstream.status });
+    if (!upstream) {
+      logger.warn("GET /calls/:id/recording: no source could be opened", { callId });
       return res.status(502).json({ error: "Recording is not available right now" });
     }
 
     res.status(upstream.status);
+    // Lets ops see whether playback came from our bucket or still leans on Retell.
+    res.setHeader("X-Recording-Source", source);
     res.setHeader("Content-Type", upstream.headers.get("content-type") || "audio/wav");
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Cache-Control", "private, max-age=3600");
@@ -53,9 +76,39 @@ router.get("/:id/recording", async (req, res) => {
       if (value) res.setHeader(header, value);
     }
 
-    // Node 18+ can consume a web ReadableStream directly via Readable.fromWeb.
-    const { Readable } = require("stream");
-    Readable.fromWeb(upstream.body).pipe(res);
+    // A listener who closes the tab or skips to another call leaves the upstream
+    // transfer running otherwise — each one holding a socket and, on Retell's
+    // side, bandwidth we are paying for.
+    res.on("close", () => { if (!res.writableEnded) abort(); });
+
+    // `pipeline`, NOT `source.pipe(res)`.
+    //
+    // This is the line that crashed the server. A bare .pipe() leaves the source
+    // stream's 'error' event unhandled, and Node throws on an unhandled 'error'
+    // — taking the whole process down rather than failing one request:
+    //
+    //   DOMException [TimeoutError]: The operation was aborted due to timeout
+    //   Emitted 'error' event on Readable instance at: ...
+    //
+    // pipeline() routes errors to its callback and destroys both ends, so a
+    // failed transfer stays a failed transfer. The timeout that triggered it is
+    // fixed separately in utils/streaming-fetch.js.
+    const { pipeline, Readable } = require("stream");
+    pipeline(Readable.fromWeb(upstream.body), res, (err) => {
+      if (!err) return;
+      // Expected and uninteresting: the client went away mid-stream, which is
+      // exactly what happens every time someone pauses or navigates.
+      const clientGone = ["ERR_STREAM_PREMATURE_CLOSE", "ECONNRESET", "EPIPE", "ABORT_ERR"].includes(err.code);
+      if (clientGone) {
+        logger.debug("GET /calls/:id/recording: client disconnected mid-stream", { callId, code: err.code });
+        return;
+      }
+      logger.error("GET /calls/:id/recording: stream failed", { callId, source, error: err.message, code: err.code });
+      // Headers are long gone by now, so there is no status left to send —
+      // destroying the socket is the only honest signal of a truncated body.
+      if (!res.headersSent) res.status(502).json({ error: "Recording stream failed" });
+      else res.destroy(err);
+    });
   } catch (err) {
     logger.error("GET /calls/:id/recording failed", { callId, error: err.message });
     if (!res.headersSent) res.status(500).json({ error: "Failed to stream recording" });
