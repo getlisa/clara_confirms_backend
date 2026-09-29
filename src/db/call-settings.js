@@ -22,6 +22,9 @@ const DEFAULTS = {
   sms_on_callback_enabled: false,
   chat_link_delivery_method: "email",
   job_confirmation_inference_enabled: false,
+  // Master switch for the per-conversation notification email (migration 107).
+  // Off by default: it mails real inboxes on every call/chat.
+  call_notification_enabled: false,
   // Contact types whose contacts become the default confirmation recipients.
   // Empty = off (today's behaviour). See migration 087.
   confirmation_contact_types: [],
@@ -40,6 +43,7 @@ function rowToSettings(row) {
     sms_on_callback_enabled: row.sms_on_callback_enabled ?? false,
     chat_link_delivery_method: row.chat_link_delivery_method ?? "email",
     job_confirmation_inference_enabled: row.job_confirmation_inference_enabled ?? false,
+    call_notification_enabled: row.call_notification_enabled ?? false,
     confirmation_contact_types: row.confirmation_contact_types ?? [],
   };
 }
@@ -52,6 +56,7 @@ const SELECT_COLS = `
   crm_comment_writeback_enabled, service_link_enabled,
   channel_strategy, sms_on_callback_enabled, chat_link_delivery_method,
   job_confirmation_inference_enabled,
+  call_notification_enabled,
   confirmation_contact_types
 `;
 
@@ -88,6 +93,10 @@ async function upsert(companyId, fields) {
     "crm_comment_writeback_enabled", "service_link_enabled",
     "channel_strategy", "sms_on_callback_enabled", "chat_link_delivery_method",
     "job_confirmation_inference_enabled",
+    // Written only via PATCH /call-notifications, never PATCH /call-settings —
+    // that route whitelists by explicit destructuring, so leaving it out there
+    // keeps one write path for a live mailing list. Readable via GET either way.
+    "call_notification_enabled",
     // TEXT[] — node-postgres serialises the JS array directly, so it needs no
     // special case in the generic parameter builder below (a jsonb column
     // would have; see migration 087).

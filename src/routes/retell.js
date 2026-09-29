@@ -12,6 +12,7 @@ const db = require("../db");
 const { getNextWindowStart } = require("../services/scheduler");
 const { parseCallbackTime } = require("../services/callback-time");
 const { resolveOutboundChannel } = require("../services/channel-resolver");
+const { enqueueForConversation } = require("../services/call-notification");
 const logger = require("../utils/logger");
 
 const isDev = process.env.NODE_ENV === "development";
@@ -248,6 +249,7 @@ async function handleCallAnalyzed(callData) {
   const {
     call_id, metadata, duration_ms, disconnection_reason,
     transcript, transcript_with_tool_calls, call_analysis, call_cost,
+    recording_url, public_log_url,
   } = callData;
   const companyId = metadata?.company_id;
 
@@ -298,6 +300,11 @@ async function handleCallAnalyzed(callData) {
     transcriptWithToolCalls: transcript_with_tool_calls,
     callCost: call_cost,
     rawAnalysis: call_analysis,
+    // Retell types recording_url as optional and its S3 object can lag this
+    // webhook. Stored when present; the notification drain looks it up again
+    // later when it is not (see services/call-notification/drain.js).
+    recordingUrl: recording_url ?? null,
+    publicLogUrl: public_log_url ?? null,
     ...outcome,
   });
 
@@ -452,6 +459,20 @@ async function handleCallAnalyzed(callData) {
     costCents: call_cost?.combined_cost ?? null,
     ...outcome,
   });
+
+  // ── Notification emails (CMAP-224 / CMAP-226) ─────────────────────────────
+  // Queue only — no network work here. The drain cron fetches the recording and
+  // sends, which is what lets a recording that is not yet attached be retried
+  // instead of silently missing from the email. AWAITED for the same reason the
+  // CRM write-backs above are: Vercel freezes this function once we respond.
+  await enqueueForConversation({
+    companyId, retellCallId: call_id, callId, channel: metadata?.channel || "voice",
+    inVoicemail, isNoAnswer, disconnectionReason: disconnection_reason,
+    appointmentConfirmed: outcome.appointmentConfirmed,
+    rescheduleRequested: outcome.rescheduleRequested,
+    cancellationRequested: outcome.cancellationRequested,
+    customerOutcome: custom.customer_outcome ?? null,
+  }).catch((err) => logger.error("call notification enqueue failed", { error: err.message, callId: call_id }));
 
   // ── Retry / Callback scheduling (production only) ─────────────────────────
   // In dev, is_test=true calls skip this — no retry spam during testing.
@@ -651,6 +672,19 @@ async function handleChatAnalyzed(chatData) {
     activeSubagent: activeSubagent?.node_name ?? null,
     ...outcome,
   });
+
+  // ── Notification emails (CMAP-224 / CMAP-226) ─────────────────────────────
+  // isNoAnswer carries the synthetic 'sms_no_reply' the handler derived above,
+  // which is why an unanswered chat lands on 'not_picked' — deriveTodoType's own
+  // no-answer set does not know that reason. See services/call-notification/event.js.
+  await enqueueForConversation({
+    companyId, retellCallId: chat_id, callId, channel: metadata?.channel || "sms",
+    inVoicemail: false, isNoAnswer, disconnectionReason,
+    appointmentConfirmed: outcome.appointmentConfirmed,
+    rescheduleRequested: outcome.rescheduleRequested,
+    cancellationRequested: outcome.cancellationRequested,
+    customerOutcome: custom.customer_outcome ?? null,
+  }).catch((err) => logger.error("chat notification enqueue failed", { error: err.message, chatId: chat_id }));
 
   // ── Retry / Callback scheduling (production only) ─────────────────────────
   if (!isDev && !isTest) {

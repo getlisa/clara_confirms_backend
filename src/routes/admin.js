@@ -23,6 +23,7 @@ const webhooksDb = require("../db/servicetrade-webhooks");
 const chatLinksDb = require("../db/chat-links");
 const csvImportsDb = require("../db/csv-imports");
 const { runSweep: runDailyReportSweep } = require("../services/daily-report/send");
+const { runSweep: runCallNotificationSweep } = require("../services/call-notification/drain");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -294,6 +295,27 @@ router.all("/reports/daily-sweep", async (req, res) => {
     return res.json({ ok: true, ...result });
   } catch (err) {
     logger.error("Admin reports/daily-sweep failed", { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/call-notifications/drain — send the per-conversation
+// notification emails queued by the Retell webhook (migration 107).
+//
+// Wired to a one-minute cron. The webhook only ENQUEUES: the recording is
+// fetched here instead, because Retell types recording_url as optional and its
+// S3 object can lag the call_analyzed event — fetching inline would cost the
+// audio on that email permanently, whereas a sweep simply tries again. Rows
+// carry their own attempt counter and backoff, so repeated and late runs are
+// both safe, and claimDueBatch's FOR UPDATE SKIP LOCKED means two overlapping
+// invocations cannot double-send.
+router.all("/call-notifications/drain", async (req, res) => {
+  if (!verifyCronSecret(req, res)) return;
+  try {
+    const result = await runCallNotificationSweep();
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error("Admin call-notifications/drain failed", { error: err.message });
     return res.status(500).json({ error: err.message });
   }
 });
