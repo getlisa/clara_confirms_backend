@@ -332,7 +332,9 @@ test("the subject is filterable against inbound and flags test calls", async () 
   await runSweep();
   assert.ok(sent[0].subject.includes("Outbound"), sent[0].subject);
   assert.ok(sent[0].subject.includes("Confirmed"));
-  assert.ok(sent[0].subject.includes("Ultimate Fire"));
+  // baseCall carries BOTH a location and a customer, and the site wins — see
+  // "the site wins over the billing-account name" below for why.
+  assert.ok(sent[0].subject.includes("Columbus Park"), sent[0].subject);
 
   reset();
   call = baseCall({ is_test: true });
@@ -504,4 +506,63 @@ test("a purged recording sends immediately without audio — never held waiting"
   assert.equal(sent[0].attachments.length, 1, "transcript only");
   assert.equal(marks.sent[0].recordingAttached, false);
   assert.ok(/retention policy/i.test(sent[0].html), "and the email explains why");
+});
+
+// ── who the conversation is "about" ──────────────────────────────────────────
+
+test("the site name identifies the call, not the phone number", async () => {
+  reset();
+  // The real shape that prompted this: the customers join matches on phone and
+  // missed, so customer is null — but the location is perfectly good.
+  call = baseCall({ customer: null, location_name: "LaGuardia Community College" });
+  dueRows = [row()];
+
+  await runSweep();
+
+  assert.ok(sent[0].subject.includes("LaGuardia Community College"), sent[0].subject);
+  assert.ok(!sent[0].subject.includes("+1940"), "a raw phone number is never the identity");
+  assert.ok(sent[0].html.includes("LaGuardia Community College"));
+});
+
+test("the site wins over the billing-account name", async () => {
+  reset();
+  // customers.full_name is often the billing account ("VareCo"), not anywhere a
+  // dispatcher would recognise — the site is the useful label.
+  call = baseCall({ customer: { name: "VareCo" }, location_name: "123 California Ave" });
+  dueRows = [row()];
+
+  await runSweep();
+  assert.ok(sent[0].subject.includes("123 California Ave"), sent[0].subject);
+  assert.ok(!sent[0].subject.includes("VareCo"));
+});
+
+test("with no site, it falls back through customer then job, and only then the number", async () => {
+  reset();
+  call = baseCall({ customer: { name: "Ultimate Fire" }, location_name: null });
+  dueRows = [row()];
+  await runSweep();
+  assert.ok(sent[0].subject.includes("Ultimate Fire"), sent[0].subject);
+
+  reset();
+  call = baseCall({ customer: null, location_name: null, job_name: "Annual Sprinkler" });
+  dueRows = [row()];
+  await runSweep();
+  assert.ok(sent[0].subject.includes("Annual Sprinkler"), sent[0].subject);
+
+  reset();
+  call = baseCall({ customer: null, location_name: null, job_name: null });
+  dueRows = [row()];
+  await runSweep();
+  assert.ok(sent[0].subject.includes("+19402324304"), "the number is the last resort, not a preference");
+});
+
+test("the Site row is not repeated when it is already the Customer label", async () => {
+  reset();
+  call = baseCall({ customer: null, location_name: "Columbus Park" });
+  dueRows = [row()];
+  await runSweep();
+
+  const siteRows = (sent[0].html.match(/>Site</g) || []).length;
+  assert.equal(siteRows, 0, "two identical rows would read as a rendering bug");
+  assert.ok(sent[0].html.includes("Columbus Park"));
 });

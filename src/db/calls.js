@@ -305,12 +305,28 @@ async function getById(id, companyId) {
             cu.full_name   AS customer_name,
             cu.email       AS customer_email,
             cu.address_line1, cu.city, cu.state, cu.zipcode,
-            sc.call_type, sc.job_id, sc.job_name, sc.appointment_id
+            sc.call_type, sc.job_id, sc.job_name, sc.appointment_id,
+            l.name AS location_name
      FROM calls c
      LEFT JOIN customers cu
        ON cu.company_id = c.company_id AND cu.phone = c.to_number
      LEFT JOIN scheduled_calls sc
        ON sc.retell_call_id = c.retell_call_id
+     -- The same jobs -> locations hop list() does, and for the same reason:
+     -- the site name is usually the ONLY human-readable identity a call has.
+     -- The customers join above matches on phone and misses constantly (both
+     -- of the calls that prompted this had customer_name NULL but a real
+     -- location), and InspectPoint links work to a BUILDING with no Account at
+     -- all. Without this join getById returned location_name undefined, so the
+     -- notification email fell through to the raw phone number.
+     --
+     -- scheduled_calls.job_id is VARCHAR and can hold non-numeric refs like
+     -- TEST-SO-1, so it is stripped to digits and NULLIF-ed before the cast —
+     -- a bare sc.job_id::int throws on the first such row.
+     LEFT JOIN jobs j
+       ON j.company_id = c.company_id
+      AND j.id = NULLIF(regexp_replace(COALESCE(sc.job_id, ''), '[^0-9]', '', 'g'), '')::int
+     LEFT JOIN locations l ON l.id = j.location_id
      WHERE c.id = $1 AND c.company_id = $2`,
     [id, companyId]
   );
