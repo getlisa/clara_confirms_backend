@@ -197,3 +197,20 @@ test("remove reports whether anything was actually deleted", async () => {
   queryImpl = async () => ({ rows: [], rowCount: 1 });
   assert.equal(await recipients.remove(8, 1), true);
 });
+
+// ── the join the email depends on ────────────────────────────────────────────
+
+test("getById joins locations, or the email has no site name to use", () => {
+  const fs = require("node:fs");
+  const src = fs.readFileSync(require.resolve("../src/db/calls.js"), "utf8");
+  const fn = src.slice(src.indexOf("async function getById"));
+  const body = fn.slice(0, fn.indexOf("\n}"));
+
+  // This was the bug: only list() had the jobs -> locations hop, so the
+  // notification email (which reads through getById) always saw location_name
+  // undefined and fell through to the raw phone number.
+  assert.ok(/LEFT JOIN locations l/.test(body), "getById reaches locations");
+  assert.ok(/l\.name AS location_name/.test(body), "and selects the name");
+  assert.ok(/NULLIF\(regexp_replace/.test(body),
+    "via the digits-only cast, since scheduled_calls.job_id can hold non-numeric refs");
+});

@@ -121,6 +121,31 @@ function detailTableHtml(rows) {
 }
 
 /**
+ * Who this conversation was ABOUT, for the subject line and the Customer row.
+ *
+ * The SITE comes first, deliberately. Two reasons, both from real data:
+ *
+ *  - `customers.full_name` on this platform is frequently the billing account
+ *    ("VareCo") rather than anywhere a technician would recognise — the same
+ *    caveat services/chat-link-email.js already records for its greeting. The
+ *    site is what a dispatcher reading the email actually needs.
+ *  - The customers join matches on phone number and misses constantly. Both
+ *    calls that prompted this had customer_name NULL and a perfectly good
+ *    location ("LaGuardia Community College").
+ *
+ * The phone number is the LAST resort, never a preference: a subject line
+ * reading "Outbound call — +919625694975 — Confirmed" is unreadable and
+ * unsearchable, which is what this function exists to prevent.
+ */
+function resolveCustomerLabel(call) {
+  return call.location_name
+    || call.customer?.name
+    || call.job_name
+    || call.to_number
+    || "Unknown contact";
+}
+
+/**
  * @param {object} args
  * @param {object} args.call            the calls row (rowToCall shape)
  * @param {string} args.event           notification event key
@@ -137,7 +162,7 @@ function buildNotificationEmail({
 }) {
   const isChat = (call.channel || "voice") === "sms";
   const medium = isChat ? "chat" : "call";
-  const customer = call.customer?.name || call.location_name || call.to_number || "Unknown contact";
+  const customer = resolveCustomerLabel(call);
   const outcome = eventLabel(event);
 
   // "Outbound" is load-bearing — see the file header.
@@ -147,7 +172,9 @@ function buildNotificationEmail({
   const details = detailTableHtml([
     ["Outcome",  outcome],
     ["Customer", customer],
-    ["Site",     call.location_name],
+    // Suppressed when the label above already IS the site, which is now the
+    // common case — two identical rows reads like a rendering bug.
+    ["Site",     call.location_name && call.location_name !== customer ? call.location_name : null],
     ["Job",      call.job_name],
     ["Phone",    call.to_number],
     ["When",     whenLabel],
