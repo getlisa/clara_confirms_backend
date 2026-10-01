@@ -101,6 +101,39 @@ function mapAccountRow(a) {
   return { inspectpointId: a.id, is_active: a.active !== false, payload: a, ipUpdatedAt: a.updated_at || null };
 }
 
+/**
+ * A deficiency row for the raw mirror.
+ *
+ * `building.id` is the whole reason this uses the DEPRECATED v1 endpoint: the
+ * current v2 one exposes only `inspection_id`, and measured against the live
+ * tenant that linked just 8 of 439 rows to a location (2%) because almost every
+ * deficiency-bearing inspection is older than our sync window. v1 carries a
+ * populated `building` on 100% of rows. See migration 110's header.
+ *
+ * inspection.id is kept for provenance only — never for linkage.
+ */
+function mapDeficiencyRow(d) {
+  return {
+    inspectpointId: d.id,
+    inspectpoint_location_id: d.building?.id ?? null,
+    inspectpoint_inspection_id: d.inspection?.id ?? null,
+    deficiency_status: d.deficiency_status ?? null,
+    // The flat `resolution_status` string is null on every row in the live
+    // tenant, while the nested object carries the real value ("New"). Prefer
+    // the object and fall back, rather than trusting the documented field.
+    resolution_status: d.deficiency_resolution_status?.type_name ?? d.resolution_status ?? null,
+    is_resolved: d.is_resolved ?? null,
+    date_opened: d.date_opened ?? null,
+    date_resolved: d.date_resolved ?? null,
+    reference_number: d.reference_number ?? null,
+    unique_id: d.unique_id ?? null,
+    display_name: d.display_name ?? null,
+    notes: d.notes ?? null,
+    payload: d,
+    ipUpdatedAt: d.updated_at || null,
+  };
+}
+
 function mapBuildingRow(b) {
   return { inspectpointId: b.id, inspectpoint_customer_id: b.account_id ?? null, payload: b, ipUpdatedAt: b.updated_at || null };
 }
@@ -262,6 +295,40 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
     await syncDb.upsertRawBatch("inspectpoint_technicians", ["is_active"], companyId, technicians.rows.map(mapTechnicianRow));
     counts.technicians = technicians.rows.length;
     if (engine) await engine.emit("fetched", { entity: "technicians", count: counts.technicians });
+
+    // ── Deficiencies ────────────────────────────────────────────────────────
+    // Ordered AFTER buildings (they link to inspectpoint_locations via
+    // building.id) but independent of inspections — the v1 payload carries the
+    // building itself, so there is no join and no dependency on the inspection
+    // sync window. No incremental filter exists on this endpoint; full pull.
+    //
+    // DEPRECATION GUARD: v1 /deficiencies is marked deprecated in the spec and
+    // used anyway, because v2 cannot link a deficiency to a site (see
+    // mapDeficiencyRow). If it is ever withdrawn this must SHOUT rather than
+    // record zero — a silent zero is indistinguishable from "this tenant has no
+    // deficiencies", which is exactly the failure worth engineering against.
+    if (engine) await engine.transition("fetching_deficiencies", {});
+    const deficienciesFetch = await ip.fetchAllPages(
+      companyId, "/external/api/v1/deficiencies", {}, credentials, (d) => d.deficiencies
+    );
+    if (!deficienciesFetch.complete) {
+      logger.error(
+        "inspectpoint: /v1/deficiencies did not complete — the endpoint is DEPRECATED and may have been withdrawn. " +
+        "Deficiencies will be stale; see migrations/110 for the v2 migration path.",
+        { companyId, fetched: deficienciesFetch.rows.length }
+      );
+    }
+    const deficiencies = validateIds(deficienciesFetch.rows, "/v1/deficiencies");
+    complete.deficiencies = deficienciesFetch.complete && deficiencies.complete;
+    await syncDb.upsertRawBatch(
+      "inspectpoint_deficiencies",
+      ["inspectpoint_location_id", "inspectpoint_inspection_id", "deficiency_status",
+       "resolution_status", "is_resolved", "date_opened", "date_resolved",
+       "reference_number", "unique_id", "display_name", "notes"],
+      companyId, deficiencies.rows.map(mapDeficiencyRow)
+    );
+    counts.deficiencies = deficiencies.rows.length;
+    if (engine) await engine.emit("fetched", { entity: "deficiencies", count: counts.deficiencies });
 
     // ── Inspections — two passes, unioned. Pass A catches edits anywhere in
     // time via the cursor; Pass B unconditionally re-covers the operational

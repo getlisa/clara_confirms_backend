@@ -24,6 +24,11 @@
 --     history survives with its job/customer reference nulled out. That is
 --     intended: the ledger is the platform's record, not the CRM's.
 --
+-- UPDATED for migration 110 (deficiencies). The original version of this script
+-- predated it and would have left 439 canonical deficiencies, 439 raw rows and
+-- the derived service_lines behind — data that looks live to both the API and
+-- the confirmation agent. Additions are marked NEW below.
+--
 -- Run inside the transaction below so a RESTRICT violation rolls everything
 -- back rather than leaving a half-deleted graph.
 
@@ -41,6 +46,18 @@ DELETE FROM jobs WHERE company_id = 11 AND source = 'inspectpoint';
 --    locations.primary_contact_id and jobs.primary_contact_id.
 DELETE FROM contacts WHERE company_id = 11 AND source = 'inspectpoint';
 
+-- 3b. NEW — canonical deficiencies, BEFORE locations.
+--      deficiencies.location_id references locations ON DELETE CASCADE, so
+--      running this after step 4 would delete nothing and silently report
+--      success. Deleting first makes the row count real, and also catches any
+--      row whose location_id is NULL (none today, but the column is nullable)
+--      which a cascade would leave orphaned forever.
+--
+--      appointment_services rows with kind='deficiency_repair' need no
+--      statement of their own: they CASCADE from appointments in step 1,
+--      exactly like real services do.
+DELETE FROM deficiencies WHERE company_id = 11 AND source = 'inspectpoint';
+
 -- 4. Locations. Cascades location_offices/location_tags and any remaining
 --    contact_locations rows.
 DELETE FROM locations WHERE company_id = 11 AND source = 'inspectpoint';
@@ -53,6 +70,12 @@ DELETE FROM technicians WHERE company_id = 11 AND source = 'inspectpoint';
 --    satisfied once everything above is gone.
 DELETE FROM customers WHERE company_id = 11 AND source = 'inspectpoint';
 
+-- 6c. NEW — service lines. Missing from the original script: InspectPoint has
+--     no service-line endpoint, so these are DERIVED from inspection types
+--     during normalize. Left behind they become a stale catalog that the next
+--     sync neither refreshes nor removes.
+DELETE FROM service_lines WHERE company_id = 11 AND source = 'inspectpoint';
+
 -- 7. Raw mirror tables (InspectPoint-only by definition, so company_id alone).
 DELETE FROM inspectpoint_appointments WHERE company_id = 11;
 DELETE FROM inspectpoint_jobs         WHERE company_id = 11;
@@ -60,6 +83,7 @@ DELETE FROM inspectpoint_contacts     WHERE company_id = 11;
 DELETE FROM inspectpoint_locations    WHERE company_id = 11;
 DELETE FROM inspectpoint_technicians  WHERE company_id = 11;
 DELETE FROM inspectpoint_customers    WHERE company_id = 11;
+DELETE FROM inspectpoint_deficiencies WHERE company_id = 11;   -- NEW (migration 110)
 
 -- 8. Sync cursors/watermarks, so the next run starts clean instead of
 --    incrementally skipping everything it already "synced".
@@ -84,5 +108,9 @@ UNION ALL SELECT 'raw_contacts',     count(*) FROM inspectpoint_contacts     WHE
 UNION ALL SELECT 'raw_locations',    count(*) FROM inspectpoint_locations    WHERE company_id = 11
 UNION ALL SELECT 'raw_technicians',  count(*) FROM inspectpoint_technicians  WHERE company_id = 11
 UNION ALL SELECT 'raw_customers',    count(*) FROM inspectpoint_customers    WHERE company_id = 11
+UNION ALL SELECT 'deficiencies',     count(*) FROM deficiencies  WHERE company_id = 11 AND source = 'inspectpoint'
+UNION ALL SELECT 'service_lines',    count(*) FROM service_lines WHERE company_id = 11 AND source = 'inspectpoint'
+UNION ALL SELECT 'raw_deficiencies', count(*) FROM inspectpoint_deficiencies WHERE company_id = 11
+UNION ALL SELECT 'repair_rows',      count(*) FROM appointment_services WHERE company_id = 11 AND kind = 'deficiency_repair' 
 UNION ALL SELECT 'sync_state',       count(*) FROM inspectpoint_sync_state   WHERE company_id = 11
 ORDER BY 1;

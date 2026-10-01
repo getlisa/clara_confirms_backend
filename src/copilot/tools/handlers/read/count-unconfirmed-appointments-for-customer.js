@@ -25,7 +25,9 @@ async function run({ customer_id }, config) {
      JOIN jobs j ON j.id = a.job_id
      WHERE j.company_id = $1
        AND j.customer_id = $2
-       AND a.status NOT IN ('cancelled', 'completed', 'no_show')
+       -- Mirrors find-call-targets: an 'unknown'-status appointment is not a
+       -- confirmation candidate, so it must not be counted as one either.
+       AND a.status NOT IN ('cancelled', 'completed', 'no_show', 'unknown')
        AND a.customer_confirmed IS NOT TRUE
      ORDER BY a.scheduled_start ASC NULLS LAST`,
     [companyId, customer_id]

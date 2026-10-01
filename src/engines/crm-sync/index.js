@@ -5,7 +5,8 @@
  * State machine (as actually emitted by the ServiceTrade provider):
  *   started → authenticating → fetching_jobs → fetching_job_details
  *           → fetching_appointments → fetching_job_comments
- *           → fetching_service_requests → normalizing → done | failed
+ *           → fetching_service_requests → fetching_deficiencies
+ *           → normalizing → done | failed
  *
  * Customers/locations/contacts/users/projects arrive inside the
  * `fetching_jobs` stage (one paged pass), so they have no state of their own —

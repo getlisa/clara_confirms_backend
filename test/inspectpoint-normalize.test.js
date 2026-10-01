@@ -103,24 +103,57 @@ test("mapJobStatus: 'processing' and 'error' are flagged ambiguous, not silently
   }
 });
 
-test("mapJobStatus: a genuinely unrecognized code defaults to open with a distinct warning code", () => {
-  const { status, warning } = mapJobStatus("totally_made_up");
-  assert.equal(status, "open");
-  assert.equal(warning.code, "unmapped_status_code");
+test("mapJobStatus: a genuinely unrecognized code becomes 'unknown', not live work", () => {
+  // It warned before but still defaulted to `open` — which MEANS live work, so
+  // the sweeps would pick the job up and the agent would call about an
+  // inspection whose real state we could not read. `unknown` (migration 111) is
+  // outside those sweeps: visible to a human, inert to the dispatcher.
+  const r = mapJobStatus("teleported");
+  assert.equal(r.status, "unknown");
+  assert.equal(r.warning.code, "unmapped_status_code");
+  assert.match(r.warning.message, /teleported/);
+});
+
+test("mapJobStatus: an AMBIGUOUS code still defaults to open — it is known plumbing, not an unread state", () => {
+  // The two codes normalize.js names as integration plumbing. Listed here
+  // rather than imported, so the test does not widen the module's exports.
+  for (const code of ["processing", "error"]) {
+    const r = mapJobStatus(code);
+    assert.equal(r.status, "open", `${code} stays open`);
+    assert.equal(r.warning.code, "ambiguous_status_code");
+  }
 });
 
 // ── mapVisitStatus ───────────────────────────────────────────────────────────
 
-test("mapVisitStatus maps the four real values, with 'started' collapsing to 'scheduled' (no in_progress on appointments)", () => {
-  assert.equal(mapVisitStatus("scheduled"), "scheduled");
-  assert.equal(mapVisitStatus("started"), "scheduled");
-  assert.equal(mapVisitStatus("complete"), "completed");
-  assert.equal(mapVisitStatus("cancelled"), "cancelled");
+test("mapVisitStatus maps the four real values, 'started' now faithfully to in_progress", () => {
+  // Migration 111 added in_progress to the appointments CHECK. Before that,
+  // `started` was collapsed to `scheduled` only because no such value existed.
+  assert.equal(mapVisitStatus("scheduled").status, "scheduled");
+  assert.equal(mapVisitStatus("started").status, "in_progress");
+  assert.equal(mapVisitStatus("complete").status, "completed");
+  assert.equal(mapVisitStatus("cancelled").status, "cancelled");
+  for (const v of ["scheduled", "started", "complete", "cancelled"]) {
+    assert.equal(mapVisitStatus(v).warning, null, `${v} is a known value — no warning`);
+  }
 });
 
-test("mapVisitStatus defaults a missing/null status to 'scheduled'", () => {
-  assert.equal(mapVisitStatus(null), "scheduled");
-  assert.equal(mapVisitStatus(undefined), "scheduled");
+test("mapVisitStatus treats a MISSING status as scheduled, but an UNRECOGNIZED one as unknown", () => {
+  // Absent is not the same as unrecognized: InspectPoint leaves visit_status
+  // null on unscheduled visits, which migration 104 documents as valid.
+  assert.equal(mapVisitStatus(null).status, "scheduled");
+  assert.equal(mapVisitStatus(undefined).status, "scheduled");
+  assert.equal(mapVisitStatus("").status, "scheduled");
+  assert.equal(mapVisitStatus(null).warning, null);
+
+  // A value we have never seen must NOT become a scheduled appointment. This
+  // used to default silently to "scheduled", which the dispatcher would pick up
+  // and the agent would call a real customer about.
+  const unknown = mapVisitStatus("awaiting_parts");
+  assert.equal(unknown.status, "unknown");
+  assert.equal(unknown.warning.code, "unmapped_visit_status");
+  assert.match(unknown.warning.message, /awaiting_parts/, "the raw value is in the warning");
+  assert.match(unknown.warning.message, /cannot be dispatched/i);
 });
 
 // ── normalizeCustomer ────────────────────────────────────────────────────────
@@ -455,10 +488,19 @@ test("mapJobStatus: only `pending` becomes 'pending' — the other pre-schedulin
   assert.equal(mapJobStatus("proposal_approved").status, "open");
 });
 
-test("mapJobStatus: an unknown or ambiguous code still falls back to `open`, never to 'pending'", () => {
-  // `open` remains the safe catch-all; 'pending' is a positive assertion about
-  // a specific upstream state, not a guess.
+test("mapJobStatus: ambiguous stays `open`, unrecognized becomes `unknown`, and neither ever becomes 'pending'", () => {
+  // The split matters. AMBIGUOUS codes are known integration plumbing, so
+  // `open` is a judgement we can defend. An UNRECOGNIZED code is a state we
+  // could not read at all, and `open` would mean live work the dispatcher acts
+  // on — so migration 111 sends it to `unknown` instead.
+  for (const code of ["processing", "error"]) {
+    assert.equal(mapJobStatus(code).status, "open", `${code} is known plumbing — stays open`);
+  }
+  assert.equal(mapJobStatus("totally_made_up").status, "unknown");
+
+  // The original guarantee this test existed for, unchanged: 'pending' is a
+  // positive assertion about a specific upstream state, never a fallback.
   for (const code of ["processing", "error", "totally_made_up"]) {
-    assert.equal(mapJobStatus(code).status, "open", `${code} must fall back to open`);
+    assert.notEqual(mapJobStatus(code).status, "pending", `${code} must never become pending`);
   }
 });

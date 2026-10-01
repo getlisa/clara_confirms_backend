@@ -147,6 +147,37 @@ function buildInspectionDescription(payload = {}) {
  * Returns null when the inspection names no service line at all (26 of 98 on
  * the live tenant) — the caller skips those rather than creating a placeholder.
  */
+/**
+ * A DEFICIENCY as a service line — the repairable thing.
+ *
+ * service_lines used to be derived from `inspection_type`, which also feeds
+ * jobs.job_type; one field was serving two concepts. Inspection type keeps the
+ * job_type role and the catalog now holds what you would actually perform a
+ * service on.
+ *
+ * One row per UNRESOLVED deficiency (the caller filters), keyed
+ * `deficiency:<ip_id>` so it is stable across syncs.
+ */
+function normalizeDeficiencyServiceLine(row, { companyId }) {
+  if (!row || row.inspectpoint_id == null) return null;
+  if (row.is_resolved === true) return null;
+  const name = buildDeficiencyLabel(row);
+  if (!name) return null;
+  return {
+    companyId,
+    externalRef: `deficiency:${row.inspectpoint_id}`,
+    source: SOURCE,
+    name,
+    // The equipment family, which is the closest thing InspectPoint has to a
+    // trade. Four of its six values are internal jargon, so consumers treat
+    // this as a grouping key, not a label — see SPEAKABLE_ASSET_TYPES in
+    // services/job-confirmation-context.js.
+    trade: deficiencyAssetType(row),
+    abbr: null,
+    icon: null,
+  };
+}
+
 function normalizeServiceLine(payload, { companyId }) {
   const name = deriveServiceLineName(payload);
   const externalRef = deriveServiceLineRef(payload);
@@ -184,7 +215,7 @@ function normalizeAppointmentService(row, { companyId, appointmentId, jobId, ser
     appointmentId,
     jobId,
     serviceLineId,
-    status: mapVisitStatus(row.visit_status),
+    status: mapVisitStatus(row.visit_status).status,
     completion: null,
     description: buildInspectionDescription(jobPayload),
     windowStart,
@@ -225,63 +256,295 @@ const JOB_STATUS_MAP = {
 // silently guessing a real value.
 const AMBIGUOUS_STATUS_CODES = new Set(["processing", "error"]);
 
+/**
+ * Inspection status_code -> job status.
+ *
+ * An UNRECOGNISED code now becomes "unknown", not "open". It warned before, but
+ * "open" means live work: the sweeps would pick the job up and the agent would
+ * call about an inspection whose real state we could not read. "unknown"
+ * (migration 111) is deliberately outside those sweeps — see mapVisitStatus for
+ * the same reasoning, and migration 104 for why the raw status_code is kept
+ * verbatim so a corrected mapping needs no re-fetch.
+ *
+ * AMBIGUOUS codes keep defaulting to "open": those are known integration
+ * plumbing rather than states we failed to recognise, and treating a known
+ * quantity as unknown would hide real work.
+ */
 function mapJobStatus(statusCode) {
   const mapped = JOB_STATUS_MAP[statusCode];
   if (mapped) return { status: mapped, warning: null };
-  const isAmbiguous = AMBIGUOUS_STATUS_CODES.has(statusCode);
+
+  if (AMBIGUOUS_STATUS_CODES.has(statusCode)) {
+    return {
+      status: "open",
+      warning: {
+        code: "ambiguous_status_code",
+        message: `InspectPoint status_code "${statusCode}" is integration plumbing, not a business state — defaulted to open.`,
+      },
+    };
+  }
   return {
-    status: "open",
+    status: "unknown",
     warning: {
-      code: isAmbiguous ? "ambiguous_status_code" : "unmapped_status_code",
-      message: isAmbiguous
-        ? `InspectPoint status_code "${statusCode}" is integration plumbing, not a business state — defaulted to open.`
-        : `Unrecognized InspectPoint status_code "${statusCode}" — defaulted to open.`,
+      code: "unmapped_status_code",
+      message: `Unrecognized InspectPoint status_code "${statusCode}" — stored as unknown so it cannot be dispatched. Raw value kept on the raw row.`,
     },
   };
 }
 
 const VISIT_STATUS_MAP = {
   scheduled: "scheduled",
-  started: "scheduled", // appointments' CHECK has no in_progress value
+  // Faithful now that migration 111 added the value. This used to be mapped to
+  // "scheduled" purely because the appointments CHECK had no in_progress.
+  started: "in_progress",
   complete: "completed",
   cancelled: "cancelled",
 };
 
+/**
+ * Visit status -> appointment status.
+ *
+ * WHY THIS RETURNS "unknown" RATHER THAN A DEFAULT. This used to be
+ * `VISIT_STATUS_MAP[visitStatus] || "scheduled"` with no warning, which meant a
+ * visit status we had never seen silently became a SCHEDULED APPOINTMENT — a row
+ * the dispatcher picks up and the agent then calls a real customer about. An
+ * unrecognised upstream state is the last thing that should trigger outbound
+ * contact.
+ *
+ * "unknown" (migration 111) is visible and INERT: it is not in the sweeps that
+ * pick work up, so the row surfaces for a human instead of acting on its own.
+ * The raw value survives in inspectpoint_appointments.visit_status, so a better
+ * mapping can be re-run over stored data without re-fetching.
+ *
+ * InspectPoint can add statuses at any time; this is the path that stays safe
+ * when it does.
+ *
+ * @returns {{status: string, warning: object|null}}
+ */
 function mapVisitStatus(visitStatus) {
-  return VISIT_STATUS_MAP[visitStatus] || "scheduled";
+  // A genuinely absent status is not an unknown one: InspectPoint leaves it null
+  // on unscheduled visits, which migration 104 documents as a real, valid row.
+  if (visitStatus == null || visitStatus === "") {
+    return { status: "scheduled", warning: null };
+  }
+  const mapped = VISIT_STATUS_MAP[visitStatus];
+  if (mapped) return { status: mapped, warning: null };
+  return {
+    status: "unknown",
+    warning: {
+      code: "unmapped_visit_status",
+      message: `Unrecognized InspectPoint visit_status "${visitStatus}" — stored as unknown so it cannot be dispatched. Raw value kept on the raw row.`,
+    },
+  };
 }
 
 // ── Normalizers ──────────────────────────────────────────────────────────────
 
 /** inspectpoint_customers -> platform `customers` (from Account) */
-function normalizeCustomer(row, { companyId }) {
+/**
+ * Turn an inspector's checklist item into something that can be spoken.
+ *
+ * `display_name` is the QUESTION the inspector answered, not the problem:
+ * measured on the live tenant, 231 of 436 open rows end in "?" ("Is wiring
+ * waterproof?", "Are the proper nozzle covers in place?") and 23 are empty.
+ * Read aloud verbatim the agent interrogates the customer instead of reporting
+ * a fault.
+ *
+ * This does NOT try to negate the question into a statement — no deterministic
+ * rule turns "Is wiring waterproof?" into "wiring is not waterproof" reliably,
+ * and inventing the negation on a compliance topic is exactly the kind of
+ * guess worth refusing. It strips the question mark so nothing reads as a
+ * question, and the prompt is told these are FAILED checks. Falls back through
+ * notes -> asset type, so a row is never nameless.
+ */
+/**
+ * The best available description of the fault, in priority order.
+ *
+ * `asset_details.Question` + `Answer` is the real content and is present on
+ * 295 of 436 live open rows:
+ *     Question: "Check operation of micro switch"   Answer: "No"
+ *     Question: "Door Inside/Outside"               Answer: "Fail"
+ * That pair states the failure outright, which is why it now outranks
+ * `display_name` — 53% of those are the inspector's QUESTION ("Is wiring
+ * waterproof?") and read aloud verbatim the agent interrogates the customer.
+ *
+ * Still NO invented negation: nothing here turns "Is wiring waterproof?" into
+ * "wiring is not waterproof". `Answer` supplies the failure when we have it,
+ * and when we do not we say the flat thing rather than guess.
+ */
+function buildDeficiencyLabel(row) {
+  const payload = row.payload || {};
+  const asset = payload.asset_details || {};
+
+  const question = String(asset.Question || "").trim().replace(/\s*\?+\s*$/, "");
+  const answer = String(asset.Answer || "").trim();
+  if (question && answer) return `${question} — ${answer}`;
+  if (question) return question;
+
+  const displayName = String(asset["Display Name"] || "").trim();
+  if (displayName) return displayName;
+
+  return cleanDeficiencyLabel(row);
+}
+
+/** Previous behaviour, now the FALLBACK chain behind buildDeficiencyLabel. */
+function cleanDeficiencyLabel(row) {
+  const payload = row.payload || {};
+  const raw = String(row.display_name || payload.display_name || "").trim();
+  if (raw) return raw.replace(/\s*\?+\s*$/, "").trim();
+
+  const notes = String(row.notes || payload.notes || "").trim();
+  if (notes) return notes.split(/\r?\n/)[0].slice(0, 120);
+
+  const asset = payload.asset_details || {};
+  const assetType = asset["Equipment type"] || asset["Asset Type"] || asset["System/Asset Type"];
+  return assetType ? `Unspecified ${String(assetType).toLowerCase()} item` : "Unspecified item";
+}
+
+/**
+ * The equipment family a deficiency sits on — "Fire Suppression", "Equipment".
+ * `System/Asset Type` is the only asset_details key present on 100% of rows
+ * (439/439), which is why the agent's grouping is built on it rather than on
+ * the richer but patchy keys like "Equipment type" (75/439).
+ */
+function deficiencyAssetType(row) {
+  const asset = (row.payload || {}).asset_details || {};
+  const v = asset["System/Asset Type"] || asset["Asset Type"] || asset["Equipment type"] || null;
+  return v ? String(v).trim() : null;
+}
+
+/**
+ * Raw deficiency -> canonical `deficiencies` row.
+ *
+ * `locationId` is resolved by the caller from inspectpoint_location_id, which
+ * the raw layer took straight from the v1 payload's building.id.
+ * `jobId` is usually NULL and that is expected: the inspection that raised a
+ * deficiency is normally older than our inspection sync window (measured: we
+ * hold 2 of the 159 inspections referenced). Location is the reliable link.
+ */
+function normalizeDeficiency(row, { companyId, locationId = null, jobId = null, serviceLineId = null }) {
+  if (!row || row.inspectpoint_id == null) return null;
+  // RESOLVED DEFICIENCIES ARE NOT NORMALIZED AT ALL. A fixed fault is not
+  // something to offer to repair, and carrying it forward would mean the agent
+  // and the UI both had to remember to filter it out everywhere. Dropping it
+  // here makes "only open work" the contract rather than a convention.
+  if (row.is_resolved === true) return null;
+
+  const payload = row.payload || {};
+  const label = buildDeficiencyLabel(row);
+  return {
+    companyId,
+    externalRef: String(row.inspectpoint_id),
+    source: SOURCE,
+    locationId,
+    jobId,
+    refNumber: row.reference_number || payload.reference_number || null,
+    name: label,
+    description: String(row.notes || payload.notes || "").trim() || null,
+    // Captured, but nothing depends on it: null on 436 of 439 live rows.
+    status: row.deficiency_status || null,
+    isResolved: false, // guaranteed by the guard above
+    openedAt: row.date_opened || null,
+    resolvedAt: null,
+    serviceLineId,
+    // The InspectPoint inspection this fault was raised on. Present on 436/436,
+    // but deliberately not an FK — those inspections are Completed / Waiting
+    // for Review and absent from `jobs` by design (see migration 111).
+    externalParentRef: row.inspectpoint_inspection_id != null
+      ? String(row.inspectpoint_inspection_id)
+      : null,
+    // Served to the frontend VERBATIM. Six different asset_details key sets
+    // with no common schema beyond System/Asset Type, so flattening would fit
+    // one shape and misrepresent the other five.
+    detail: {
+      asset_details: payload.asset_details || {},
+      related_device: payload.related_device || null,
+      inspection: payload.inspection || null,
+    },
+    additionalInformation: {
+      inspectpoint_deficiency_id: String(row.inspectpoint_id),
+      asset_type: deficiencyAssetType(row),
+      resolution_status: row.resolution_status || null,
+      unique_id: row.unique_id || null,
+      inspection_id: row.inspectpoint_inspection_id ?? null,
+    },
+  };
+}
+
+/**
+ * A BUILDING becomes the customer — not the Account.
+ *
+ * ── Why this changed ───────────────────────────────────────────────────────
+ * Every InspectPoint Account structurally has no phone and no email field at
+ * all, on 100% of rows. The Building is where `phone_number` lives. So the
+ * entity we actually call was never the one stored as the customer, and the
+ * confirmation email had to fall back to the location name to avoid reading a
+ * raw phone number aloud as the customer's name.
+ *
+ * A Building now normalizes into BOTH `customers` (here) and `locations`
+ * (normalizeLocation), sharing one external_ref. That is safe because each
+ * table has its own (company_id, external_ref, source) unique index — and it
+ * keeps `jobs.location_id` populated, which the confirmation email's site name
+ * and the location deficiency panel both depend on.
+ *
+ * The Account is not lost: its name and billing address are carried in
+ * additional_information.inspectpoint_account for anything that needs the
+ * billing entity.
+ *
+ * @param {object} row               an `inspectpoint_locations` (Building) raw row
+ * @param {object|null} accountRow   the Building's `inspectpoint_customers`
+ *                                   (Account) row, when we hold it — reference only
+ */
+function normalizeCustomer(row, { companyId, accountRow = null }) {
   if (!row) return null;
   const p = row.payload || {};
-  // Every InspectPoint Account structurally has no phone/email field at all —
-  // this warning fires on 100% of rows, not as a data-quality signal but as a
-  // permanent fact worth recording once per row for downstream visibility.
-  const warnings = [{ code: "missing_phone", message: "InspectPoint accounts have no phone field — recipient resolution must use a contact, not the customer record." }];
-  if (!p.name) warnings.push({ code: "missing_name", message: "Customer has no name." });
+  const account = accountRow?.payload || {};
+
+  const warnings = [];
+  if (!p.name) warnings.push({ code: "missing_name", message: "Building has no name." });
+  // Worth recording per row, because recipient resolution still prefers a
+  // contact where one exists — but unlike the Account this is now the
+  // exception rather than every single row.
+  if (!p.phone_number) {
+    warnings.push({ code: "missing_phone", message: "Building has no phone number — recipient resolution must fall back to a contact." });
+  }
+
   return {
     companyId,
     externalRef: String(row.inspectpoint_id),
     source: SOURCE,
     fullName: p.name || null,
     email: null,
-    phone: null,
-    addressLine1: p.billing_address1 || null,
-    city: p.billing_city || null,
-    state: p.billing_state || null,
-    zipcode: p.billing_zip || null,
+    // The whole point of the re-map: a callable customer record.
+    phone: toE164(p.phone_number),
+    // The SITE address, not the Account's billing address — this is the
+    // customer the agent talks to about a visit.
+    addressLine1: p.address1 || null,
+    city: p.city || null,
+    state: p.state || null,
+    zipcode: p.zip || null,
     country: "US",
     isActive: row.is_active !== false,
     additionalInformation: {
-      inspectpoint_account_id: row.inspectpoint_id,
+      inspectpoint_building_id: row.inspectpoint_id,
       reference_number: p.reference_number || null,
       external_id: p.external_id || null,
-      billing_address2: p.billing_address2 || null,
+      site_identification: p.site_identification || null,
       tags: p.tags || null,
       custom_fields: p.custom_fields || null,
+      // The billing entity, preserved rather than discarded.
+      inspectpoint_account: accountRow
+        ? {
+            id: accountRow.inspectpoint_id,
+            name: account.name || null,
+            billing_address1: account.billing_address1 || null,
+            billing_address2: account.billing_address2 || null,
+            billing_city: account.billing_city || null,
+            billing_state: account.billing_state || null,
+            billing_zip: account.billing_zip || null,
+            reference_number: account.reference_number || null,
+          }
+        : null,
       warnings,
     },
   };
@@ -485,13 +748,19 @@ function normalizeAppointment(row, { companyId, jobId, technicianId }) {
   }
   const durationMins = p.duration_mins ?? null;
   const scheduledStart = row.scheduled_date || null;
+  // Resolved once so the warning can travel with the row: an unrecognised visit
+  // status lands as "unknown" and must be visible, not swallowed. Pushed onto
+  // the SAME warnings array the missing-scheduled-date case already uses, so
+  // every normalize concern for this row surfaces in one place.
+  const visitStatus = mapVisitStatus(row.visit_status);
+  if (visitStatus.warning) warnings.push(visitStatus.warning);
   return {
     companyId,
     externalRef: String(row.inspectpoint_id),
     source: SOURCE,
     jobId,
     technicianId,
-    status: mapVisitStatus(row.visit_status),
+    status: visitStatus.status,
     scheduledStart,
     // Derived from the visit's OWN duration_mins, not a guessed default. This
     // is InspectPoint's stated planned length for the visit, so it is real
@@ -515,6 +784,8 @@ function normalizeAppointment(row, { companyId, jobId, technicianId }) {
 }
 
 module.exports = {
+  normalizeDeficiency, normalizeDeficiencyServiceLine,
+  buildDeficiencyLabel, cleanDeficiencyLabel, deficiencyAssetType,
   splitPersonName,
   tenantLocalDatePrefix,
   addMinutes,

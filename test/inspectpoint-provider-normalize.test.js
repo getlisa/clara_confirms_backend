@@ -28,6 +28,9 @@ function tableOf(name) {
   return junctionTables.get(name);
 }
 
+// Reconciliation deletes, captured so tests can assert they are scoped.
+const reconcileDeletes = [];
+
 function runDelete(sql, params) {
   const table = sql.match(/DELETE FROM (\w+)/)[1];
   const [parents, flatA, flatB] = params;
@@ -49,7 +52,16 @@ function runInsert(sql, params) {
 
 stub("db", {
   query: async (sql, params) => {
-    if (/^\s*DELETE FROM/.test(sql)) return runDelete(sql, params);
+    // Only the JUNCTION deletes have the (parents, flatA, flatB) shape
+    // runDelete expects. The reconciliation deletes added for the re-map
+    // (stale service_lines / resolved deficiencies) pass
+    // (companyId, source, keep[]) instead, and routing those into runDelete
+    // made it try flatA.map on the source string.
+    if (/^\s*DELETE FROM (contact_locations|contact_companies)\b/.test(sql)) return runDelete(sql, params);
+    if (/^\s*DELETE FROM/.test(sql)) {
+      reconcileDeletes.push({ sql: sql.replace(/\s+/g, " ").trim(), params });
+      return { rows: [], rowCount: 0 };
+    }
     if (/^\s*INSERT INTO/.test(sql)) return runInsert(sql, params);
     if (/SELECT id, primary_contact_id FROM locations/.test(sql)) return { rows: locationRowsForJobPass };
     return { rows: [] };
@@ -70,6 +82,7 @@ const provider = require("../src/services/crm/inspectpoint/provider");
 function reset() {
   junctionTables.clear();
   upsertCalls.length = 0;
+  reconcileDeletes.length = 0;
   rawRows = {};
   refMaps = {};
   locationRowsForJobPass = [];
@@ -126,18 +139,81 @@ function seed() {
 
 // ── Ordering & FK resolution ─────────────────────────────────────────────────
 
-test("normalizeAll: upsert order satisfies every FK dependency, ending with appointment_services", async () => {
+test("normalizeAll: upsert order satisfies every FK dependency, ending with deficiencies", async () => {
   reset();
   seed();
   await provider.normalizeAll(9);
   const order = upsertCalls.map((c) => c.table);
-  assert.deepEqual(order, ["customers", "contacts", "technicians", "locations", "service_lines", "jobs", "appointments", "appointment_services"]);
-  // The two load-bearing constraints, asserted by meaning rather than by the
-  // literal list above so a future reorder fails for a readable reason:
-  // appointment_services needs appointment ids, job ids AND service line ids.
-  assert.ok(order.indexOf("service_lines") < order.indexOf("appointment_services"));
+  // No `service_lines` here, and that is correct: service lines are DEFICIENCIES
+  // now (migration 111 / the re-map), the inspection type having moved to
+  // jobs.job_type. This fixture seeds no deficiencies, and the pass skips the
+  // upsert entirely rather than issuing an empty statement.
+  assert.deepEqual(order, ["customers", "contacts", "technicians", "locations", "jobs", "appointments", "appointment_services", "deficiencies"]);
+
+  // Deficiencies land AFTER appointment_services: they need locations to link
+  // to, and the repair projection that follows needs appointments to hang on.
+  assert.ok(order.indexOf("locations") < order.indexOf("deficiencies"));
+  assert.ok(order.indexOf("appointments") < order.indexOf("deficiencies"));
+  // Asserted by meaning rather than by the literal list, so a future reorder
+  // fails for a readable reason.
   assert.ok(order.indexOf("appointments") < order.indexOf("appointment_services"));
   assert.ok(order.indexOf("jobs") < order.indexOf("appointments"));
+});
+
+test("normalizeAll: with deficiencies present, service_lines lands BEFORE them", async () => {
+  reset();
+  seed();
+  // A deficiency needs its own service_lines row to exist first — the canonical
+  // row carries service_line_id, resolved from the `deficiency:<id>` ref.
+  rawRows.inspectpoint_deficiencies = [{
+    inspectpoint_id: 900, inspectpoint_location_id: 1, inspectpoint_inspection_id: 50,
+    is_resolved: false, display_name: "Is wiring waterproof?",
+    payload: { asset_details: { "System/Asset Type": "Asset", Question: "Check micro switch", Answer: "No" } },
+  }];
+  await provider.normalizeAll(9);
+  const order = upsertCalls.map((c) => c.table);
+  assert.ok(order.includes("service_lines"), "a deficiency produces a service line");
+  assert.ok(order.indexOf("service_lines") < order.indexOf("deficiencies"),
+    "service_lines must precede deficiencies, which reference them");
+});
+
+test("normalizeAll: reconciliation deletes are scoped to company AND source", async () => {
+  reset();
+  seed();
+  rawRows.inspectpoint_deficiencies = [{
+    inspectpoint_id: 900, inspectpoint_location_id: 1, inspectpoint_inspection_id: 50,
+    is_resolved: false, display_name: "Is wiring waterproof?",
+    payload: { asset_details: { "System/Asset Type": "Asset", Question: "Check micro switch", Answer: "No" } },
+  }];
+  await provider.normalizeAll(9);
+
+  // These statements DELETE rows, so the WHERE clause is the whole safety
+  // story: unscoped, they would take another CRM's data or another tenant's.
+  const reconciles = reconcileDeletes.filter((d) => /FROM (deficiencies|service_lines)/.test(d.sql));
+  assert.ok(reconciles.length >= 2, "both passes reconcile");
+  for (const d of reconciles) {
+    assert.match(d.sql, /company_id = \$1/, `company-scoped: ${d.sql.slice(0, 70)}`);
+    assert.match(d.sql, /source = \$2/, `source-scoped: ${d.sql.slice(0, 70)}`);
+    assert.equal(d.params[0], 9);
+    assert.equal(d.params[1], "inspectpoint", "never touches ServiceTrade's rows");
+    assert.ok(Array.isArray(d.params[2]), "the keep-list is an array");
+  }
+});
+
+test("normalizeAll: an EMPTY keep-list does not delete everything", async () => {
+  reset();
+  seed();
+  rawRows.inspectpoint_deficiencies = []; // nothing unresolved upstream
+  await provider.normalizeAll(9);
+
+  // The guard is `$3::text[] = '{}' OR NOT (external_ref = ANY($3))`. With an
+  // empty array, `NOT (x = ANY('{}'))` is TRUE for every row — so without the
+  // explicit empty check this would wipe the table rather than no-op. Assert
+  // the guard is present rather than trusting the array-comparison semantics.
+  const reconciles = reconcileDeletes.filter((d) => /FROM (deficiencies|service_lines)/.test(d.sql));
+  for (const d of reconciles) {
+    assert.match(d.sql, /\$3::text\[\] = '\{\}'/, "empty keep-list short-circuits the delete");
+  }
 });
 
 test("normalizeAll: resolves customer_id/location_id/technician_id on jobs via the external-ref maps", async () => {

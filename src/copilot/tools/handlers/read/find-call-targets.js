@@ -53,7 +53,12 @@ async function run({ customer_id, include_past }, config) {
      FROM appointments a
      JOIN jobs j ON j.id = a.job_id
      WHERE j.company_id = $1 AND j.customer_id = $2
-       AND a.status NOT IN ('cancelled', 'completed', 'no_show')
+       -- 'unknown' excluded deliberately (migration 111): it means we could not
+       -- read the CRM's real state for this appointment. Proposing a
+       -- confirmation call about a visit whose status we do not understand is
+       -- exactly what that status exists to prevent. The normalize warning is
+       -- how a human finds it instead.
+       AND a.status NOT IN ('cancelled', 'completed', 'no_show', 'unknown')
        ${includePast ? "" : "AND a.scheduled_start >= NOW()"}
      ORDER BY a.scheduled_start ASC NULLS LAST`,
     [companyId, customer_id]
