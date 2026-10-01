@@ -289,7 +289,7 @@ class InspectPointProvider extends CrmProvider {
    * jobs before appointments.
    */
   async normalizeAll(companyId, engine = null) {
-    const counts = { customers: 0, contacts: 0, technicians: 0, locations: 0, jobs: 0, appointments: 0 };
+    const counts = { customers: 0, contacts: 0, technicians: 0, locations: 0, jobs: 0, appointments: 0, deficiencies: 0, deficiencyRepairs: 0 };
     const emit = (entity, count) => engine && engine.emit("entity_done", { entity, count });
 
     counts.customers = await this._normalizeCustomers(companyId);
@@ -313,11 +313,10 @@ class InspectPointProvider extends CrmProvider {
     // fetchAllByCompanyChunked's chunking exists to avoid.
     const rawJobs = await db.fetchAllByCompanyChunked(companyId, "inspectpoint_jobs");
 
-    // Service lines are derived from the inspections themselves (InspectPoint
-    // has no service-line endpoint), so they must land before appointment
-    // services can reference them — but they don't depend on jobs, so the
-    // order relative to _normalizeJobs is free.
-    counts.serviceLines = await this._normalizeServiceLines(companyId, rawJobs);
+    // Service lines are DEFICIENCIES now, not inspection types. Inspection type
+    // keeps feeding jobs.job_type (deriveInspectionLabel); one field was serving
+    // two concepts. They must land before the deficiencies that reference them.
+    counts.serviceLines = await this._normalizeDeficiencyServiceLines(companyId);
     emit("service_lines", counts.serviceLines);
     counts.jobs = await this._normalizeJobs(companyId, rawJobs);
     emit("jobs", counts.jobs);
@@ -327,12 +326,215 @@ class InspectPointProvider extends CrmProvider {
     counts.appointmentServices = await this._normalizeAppointmentServices(companyId, rawJobs);
     emit("appointment_services", counts.appointmentServices);
 
+    // Deficiencies need locations (already done above). The projection that
+    // follows additionally needs appointments, so both run after them.
+    counts.deficiencies = await this._normalizeDeficiencies(companyId);
+    emit("deficiencies", counts.deficiencies);
+    counts.deficiencyRepairs = await this._projectDeficiencyRepairs(companyId);
+    emit("deficiency_repairs", counts.deficiencyRepairs);
+
     return counts;
   }
 
+  /** One service_lines row per UNRESOLVED deficiency. */
+  async _normalizeDeficiencyServiceLines(companyId) {
+    const raw = await db.fetchAllByCompanyChunked(companyId, "inspectpoint_deficiencies");
+    const argsList = raw
+      .map((row) => normalize.normalizeDeficiencyServiceLine(row, { companyId }))
+      .filter(Boolean);
+    if (argsList.length) {
+      await db.bulkUpsertByExternalRef("service_lines", SERVICE_LINE_FIELDS, argsList);
+    }
+
+    // Drop catalog rows that no longer correspond to an unresolved deficiency.
+    // Two things land here: a deficiency since resolved, and the legacy
+    // `type:<id>` rows from when service_lines was derived from inspection types
+    // (that moved to jobs.job_type). Left behind, they are a stale catalog no
+    // future sync refreshes or removes.
+    //
+    // A real service row pointing at a deleted line gets service_line_id = NULL
+    // (ON DELETE SET NULL), and the agent falls back to the job TITLE, which
+    // carries the same inspection label — see normalizeJob, where title and
+    // jobType are both deriveInspectionLabel.
+    const keep = argsList.map((a) => a.externalRef);
+    const { rowCount: removed } = await db.query(
+      `DELETE FROM service_lines
+        WHERE company_id = $1 AND source = $2
+          AND ($3::text[] = '{}' OR NOT (external_ref = ANY($3::text[])))`,
+      [companyId, SOURCE, keep]
+    );
+    if (removed) {
+      logger.info("inspectpoint: removed stale service lines (resolved deficiencies or legacy inspection types)", { companyId, removed });
+    }
+    return argsList.length;
+  }
+
+  async _normalizeDeficiencies(companyId) {
+    const raw = await db.fetchAllByCompanyChunked(companyId, "inspectpoint_deficiencies");
+    const [locationsMap, serviceLinesMap] = await Promise.all([
+      refMap(companyId, "locations"),
+      refMap(companyId, "service_lines"),
+    ]);
+    const argsList = raw
+      .map((row) => {
+        const locationId = row.inspectpoint_location_id != null
+          ? locationsMap.get(String(row.inspectpoint_location_id)) ?? null
+          : null;
+        // Its own service line, written by _normalizeDeficiencyServiceLines
+        // immediately above using the same `deficiency:<id>` ref.
+        const serviceLineId = serviceLinesMap.get(`deficiency:${row.inspectpoint_id}`) ?? null;
+        // jobId stays null: the inspection that raised a deficiency is normally
+        // older than our inspection sync window (we hold 2 of the 159
+        // referenced), so location is the only reliable link.
+        return normalize.normalizeDeficiency(row, { companyId, locationId, jobId: null, serviceLineId });
+      })
+      .filter(Boolean);
+    await db.bulkUpsertByExternalRef("deficiencies", DEFICIENCY_FIELDS, argsList);
+
+    const unlinked = argsList.filter((a) => a.locationId == null).length;
+    if (unlinked) {
+      logger.warn("inspectpoint: deficiencies normalized without a location", {
+        companyId, unlinked, total: argsList.length,
+      });
+    }
+
+    // RECONCILE. bulkUpsertByExternalRef only ever inserts or updates, and
+    // normalizeDeficiency returns null for a resolved row — so a deficiency
+    // fixed upstream is neither refreshed NOR removed, and would sit in our
+    // table as open forever. Anything no longer in the unresolved set goes,
+    // which also clears rows from before the resolved-filter existed.
+    //
+    // Scoped to this source, so ServiceTrade's own deficiency rows are
+    // untouched. The appointment_services repair rows referencing a deleted
+    // deficiency cascade away via deficiency_id (migration 110).
+    const keep = argsList.map((a) => a.externalRef);
+    const { rowCount: removed } = await db.query(
+      `DELETE FROM deficiencies
+        WHERE company_id = $1 AND source = $2
+          AND ($3::text[] = '{}' OR NOT (external_ref = ANY($3::text[])))`,
+      [companyId, SOURCE, keep]
+    );
+    if (removed) {
+      logger.info("inspectpoint: removed deficiencies that are resolved or gone upstream", { companyId, removed });
+    }
+    return argsList.length;
+  }
+
+  /**
+   * Project each location's OPEN deficiencies onto its NEXT upcoming
+   * appointment as `appointment_services` rows with kind='deficiency_repair',
+   * so the confirmation agent sees them through the existing service path.
+   *
+   * ── Why only the NEXT appointment ──────────────────────────────────────
+   * Two constraints force it, both measured:
+   *   1. `appointment_services_external_ref_uq` is UNIQUE (company_id,
+   *      external_ref, source). With ref `deficiency:<id>` a deficiency can
+   *      exist exactly ONCE company-wide, so it cannot sit on several visits.
+   *   2. Every one of the 80 locations that has deficiencies AND an upcoming
+   *      visit has MORE than one upcoming visit. Fanning out would offer the
+   *      same repair on every call.
+   * Pinning to the soonest visit satisfies both, and the row re-points on the
+   * next sync once that visit passes.
+   *
+   * 11 locations have open deficiencies and NO upcoming appointment. They get
+   * no row at all — which is exactly why the canonical `deficiencies` table
+   * stays the source of truth for the UI rather than these projections.
+   */
+  async _projectDeficiencyRepairs(companyId) {
+    // The next upcoming appointment per location, plus that location's open
+    // deficiencies — resolved in one statement rather than per location.
+    const { rows } = await db.query(
+      `WITH next_appt AS (
+         SELECT DISTINCT ON (j.location_id)
+                j.location_id, a.id AS appointment_id, a.job_id, a.scheduled_start
+           FROM appointments a
+           JOIN jobs j ON j.id = a.job_id
+          WHERE a.company_id = $1
+            AND j.location_id IS NOT NULL
+            AND a.scheduled_start > now()
+            AND COALESCE(a.status, '') NOT IN ('cancelled', 'canceled')
+          ORDER BY j.location_id, a.scheduled_start
+       )
+       -- DISTINCT ON collapses the same problem re-reported by successive
+       -- inspections. Measured on the live tenant: 60 of 436 open rows are a
+       -- repeated display_name at the same site, and without this the agent
+       -- reads the identical item out twice in one breath ("Yokai fire marshal
+       -- form... Yokai fire marshal form"). Oldest-opened wins, so the id the
+       -- office has been looking at longest is the one referenced.
+       SELECT DISTINCT ON (d.location_id, lower(btrim(d.name)))
+              d.id AS deficiency_id, d.name, d.description, d.additional_information,
+              d.service_line_id,
+              n.appointment_id, n.job_id
+         FROM deficiencies d
+         JOIN next_appt n ON n.location_id = d.location_id
+        WHERE d.company_id = $1 AND d.source = $2 AND d.is_resolved = false
+        ORDER BY d.location_id, lower(btrim(d.name)), d.opened_at NULLS LAST, d.id`,
+      [companyId, SOURCE]
+    );
+
+    const argsList = rows.map((r) => ({
+      companyId,
+      externalRef: `deficiency:${r.deficiency_id}`,
+      source: SOURCE,
+      appointmentId: r.appointment_id,
+      jobId: r.job_id,
+      // The deficiency's OWN service line (a deficiency IS a service line now).
+      // `kind` is still what tells the agent these are offers rather than
+      // booked work — see the partition in job-confirmation-context.
+      serviceLineId: r.service_line_id ?? null,
+      status: "open",
+      completion: null,
+      description: r.name,
+      windowStart: null,
+      windowEnd: null,
+      duration: null,
+      // NEVER a price. CMAP-228 forbids quoting one, and a non-null value here
+      // would put a number in front of the agent.
+      estimatedPrice: null,
+      asset: { asset_type: r.additional_information?.asset_type ?? null },
+      kind: "deficiency_repair",
+      deficiencyId: r.deficiency_id,
+    }));
+
+    // Drop repair rows whose deficiency is now resolved, or whose appointment
+    // has moved on — otherwise the agent offers to fix something already fixed.
+    const keep = argsList.map((a) => a.externalRef);
+    await db.query(
+      `DELETE FROM appointment_services
+        WHERE company_id = $1 AND kind = 'deficiency_repair'
+          AND ($2::text[] = '{}' OR NOT (external_ref = ANY($2::text[])))`,
+      [companyId, keep]
+    );
+
+    if (argsList.length) {
+      await db.bulkUpsertByExternalRef("appointment_services", DEFICIENCY_REPAIR_FIELDS, argsList);
+    }
+    return argsList.length;
+  }
+
+  /**
+   * Customers come from BUILDINGS, not Accounts.
+   *
+   * InspectPoint Accounts have no phone or email on any row; Buildings carry
+   * `phone_number`. See normalizeCustomer's header for the full reasoning. The
+   * Account row is still read, but only so its billing identity can ride along
+   * in additional_information.
+   */
   async _normalizeCustomers(companyId) {
-    const raw = await db.fetchAllByCompanyChunked(companyId, "inspectpoint_customers");
-    const argsList = raw.map((row) => normalize.normalizeCustomer(row, { companyId })).filter(Boolean);
+    const [buildings, accounts] = await Promise.all([
+      db.fetchAllByCompanyChunked(companyId, "inspectpoint_locations"),
+      db.fetchAllByCompanyChunked(companyId, "inspectpoint_customers"),
+    ]);
+    const accountById = new Map(accounts.map((a) => [String(a.inspectpoint_id), a]));
+
+    const argsList = buildings
+      .map((row) => normalize.normalizeCustomer(row, {
+        companyId,
+        accountRow: row.inspectpoint_customer_id != null
+          ? accountById.get(String(row.inspectpoint_customer_id)) ?? null
+          : null,
+      }))
+      .filter(Boolean);
     await db.bulkUpsertByExternalRef("customers", CUSTOMER_FIELDS, argsList);
     return argsList.length;
   }
@@ -366,7 +568,12 @@ class InspectPointProvider extends CrmProvider {
     ]);
     const argsList = raw
       .map((row) => {
-        const customerId = row.inspectpoint_customer_id != null ? customersMap.get(String(row.inspectpoint_customer_id)) ?? null : null;
+        // The location's customer is the one derived from this SAME Building —
+        // both rows share the Building's external_ref — NOT the Account's id,
+        // which no longer keys anything in `customers`. Looking up the Account
+        // id here would silently leave every location_id -> customer_id link
+        // null after the re-map.
+        const customerId = customersMap.get(String(row.inspectpoint_id)) ?? null;
         const primaryExternalRef = primaryByBuilding.get(String(row.inspectpoint_id));
         const primaryContactId = primaryExternalRef != null ? contactsMap.get(primaryExternalRef) ?? null : null;
         return normalize.normalizeLocation(row, { companyId, customerId, primaryContactId });
@@ -615,6 +822,35 @@ const SERVICE_LINE_FIELDS = [
   { column: "icon", key: "icon" },
 ];
 
+const DEFICIENCY_FIELDS = [
+  { column: "location_id", key: "locationId" },
+  { column: "job_id", key: "jobId" },
+  { column: "ref_number", key: "refNumber" },
+  { column: "name", key: "name" },
+  { column: "description", key: "description" },
+  { column: "status", key: "status" },
+  { column: "is_resolved", key: "isResolved" },
+  { column: "opened_at", key: "openedAt" },
+  { column: "resolved_at", key: "resolvedAt" },
+  { column: "service_line_id", key: "serviceLineId" },
+  { column: "external_parent_ref", key: "externalParentRef" },
+  { column: "detail", key: "detail", jsonb: true },
+  // additional_information is appended by bulkUpsertByExternalRef itself —
+  // listing it here makes Postgres see the column twice.
+];
+
+const DEFICIENCY_REPAIR_FIELDS = [
+  { column: "appointment_id", key: "appointmentId" },
+  { column: "job_id", key: "jobId" },
+  { column: "service_line_id", key: "serviceLineId" },
+  { column: "status", key: "status" },
+  { column: "description", key: "description" },
+  { column: "estimated_price", key: "estimatedPrice" },
+  { column: "asset", key: "asset", jsonb: true },
+  { column: "kind", key: "kind" },
+  { column: "deficiency_id", key: "deficiencyId" },
+];
+
 const APPOINTMENT_SERVICE_FIELDS = [
   { column: "appointment_id", key: "appointmentId" },
   { column: "job_id", key: "jobId" },
@@ -633,4 +869,4 @@ module.exports = new InspectPointProvider();
 // Exposed for direct unit testing of the upsert field descriptors (notably
 // APPOINTMENT_FIELDS' confirmation-status-preserving updateExpr) against the
 // real db.bulkUpsertByExternalRef — not part of the CrmProvider interface.
-module.exports.FIELDS = { CUSTOMER_FIELDS, LOCATION_FIELDS, CONTACT_FIELDS, TECHNICIAN_FIELDS, JOB_FIELDS, APPOINTMENT_FIELDS, SERVICE_LINE_FIELDS, APPOINTMENT_SERVICE_FIELDS };
+module.exports.FIELDS = { CUSTOMER_FIELDS, LOCATION_FIELDS, CONTACT_FIELDS, TECHNICIAN_FIELDS, JOB_FIELDS, APPOINTMENT_FIELDS, SERVICE_LINE_FIELDS, APPOINTMENT_SERVICE_FIELDS, DEFICIENCY_FIELDS };

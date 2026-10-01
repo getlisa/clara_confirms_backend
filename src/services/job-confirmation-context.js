@@ -51,6 +51,59 @@ const MAX_PAST_APPOINTMENTS = 5;
 const ARRIVAL_WINDOW_MINUTES = 60;
 
 /** Distinct, non-empty, order-preserving. */
+// One site in the live tenant has 29 open deficiencies; the median is 3.
+// Five is enough to be concrete without turning the call into a list.
+const MAX_SPOKEN_DEFICIENCIES = 5;
+
+/**
+ * InspectPoint's `System/Asset Type` values that are INTERNAL PLUMBING, not
+ * something to say to a customer. Measured across the live tenant's 436 open
+ * deficiencies: "Inspection custom inspection" (183), "Asset" (99),
+ * "Equipment" (75) and "Inspection external form" (66) account for 97% of rows
+ * and mean nothing to the person on the phone. Only "Fire Extinguisher" (8) and
+ * "Fire Exit Sign" (5) are real equipment families.
+ *
+ * So the grouping is opt-IN on recognisable names rather than opt-out on a
+ * denylist that would need updating every time InspectPoint adds an internal
+ * type — an unknown value is far more likely to be plumbing than a real family.
+ */
+const SPEAKABLE_ASSET_TYPES = new Set([
+  "fire extinguisher", "fire exit sign", "fire door", "fire damper", "fire hose",
+  "alarm system", "sprinkler", "back flow", "backflow", "clean agent system",
+  "control panel", "valve", "dry valve", "hose valve", "cylinder",
+  "special hazard", "monitoring system",
+]);
+
+/**
+ * A spoken headline for the open deficiencies: "13 open items from the last
+ * inspection, including 8 on fire extinguishers".
+ *
+ * Severity is NOT used — InspectPoint's deficiency_status is null on 436 of 439
+ * rows in the live tenant. Asset family is used only where it is a real
+ * equipment name (see above); otherwise the count alone is the honest headline,
+ * because "8 on inspection custom inspection" is worse than saying nothing.
+ */
+function summariseDeficiencies(repairs) {
+  if (!repairs.length) return null;
+  const noun = repairs.length === 1 ? "open item" : "open items";
+  const headline = `${repairs.length} ${noun} from the last inspection`;
+
+  const byType = new Map();
+  for (const r of repairs) {
+    const raw = r.asset?.asset_type || r.asset_type || null;
+    if (!raw) continue;
+    const key = String(raw).trim().toLowerCase();
+    if (!SPEAKABLE_ASSET_TYPES.has(key)) continue;
+    byType.set(key, (byType.get(key) || 0) + 1);
+  }
+  if (!byType.size) return headline;
+
+  const parts = [...byType.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([type, n]) => `${n} on ${type}${n === 1 ? "" : "s"}`);
+  return `${headline}, including ${spokenList(parts)}`;
+}
+
 function dedupe(values) {
   return [...new Set(values.filter((v) => v != null && String(v).trim() !== ""))];
 }
@@ -182,10 +235,23 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     jobServiceLines = await jobsDb.fetchJobServiceLines(companyId, numericJobId).catch(() => []);
   }
 
+
   // Built field-by-field, never spread from the DB row: raw ISO timestamps must
   // not reach an agent (it would read them aloud verbatim).
   const shape = (appt, { isNext = false } = {}) => {
-    const svc = Array.isArray(appt.services) ? appt.services : [];
+    const allRows = Array.isArray(appt.services) ? appt.services : [];
+    // PARTITION FIRST, and never let a repair reach the `service_*` fields.
+    //
+    // Open deficiencies are projected onto the visit as appointment_services
+    // rows (kind='deficiency_repair') so they travel this same path — but
+    // `service_lines`, `service_names`, `service_details` AND `service_summary`
+    // below all describe what the visit IS, and `service_summary` feeds the
+    // agent's OPENING LINE. Leaving repairs in that set makes the agent open
+    // with "Backflow, Alarm Systems, and valve tamper switch repair",
+    // announcing unscheduled work as booked. Rows written before migration 110
+    // have kind='service' by default, so this partition is a no-op for them.
+    const svc = allRows.filter((s) => (s.kind || "service") === "service");
+    const repairs = allRows.filter((s) => s.kind === "deficiency_repair");
     // Every service on the visit, not just the first. A single appointment
     // routinely bundles several (job 33276: backflow + fire alarm +
     // extinguisher + sprinkler), and naming only services[0] told the customer
@@ -251,6 +317,29 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     // which is what matches the onsite-expectation entries.
     service_lines: lines.length ? lines : (jobServiceLines[0] ? [jobServiceLines[0]] : []),
     service_names: detail,
+    // ── Open issues at this site (CMAP-228) ───────────────────────────────
+    // Named "issue", not "deficiency": deficiency is InspectPoint's word, and
+    // ServiceTrade has 105 of its own. One prompt serves every CRM only if the
+    // variable it reads is the platform's vocabulary rather than one vendor's.
+    // Deliberately SIBLINGS of the service_* fields, never merged into them:
+    // these are repairs being OFFERED, not work already booked.
+    //
+    // No severity field. InspectPoint's deficiency_status is null on 436 of
+    // 439 rows in the only live tenant, so a "1 critical, 2 non-critical"
+    // variable would be blank almost always — and a variable that is usually
+    // blank teaches the model to ignore it.
+    open_issue_count: repairs.length,
+    // Grouped by equipment family, which IS reliably present, so the agent can
+    // lead with "three items on the fire suppression system" before any detail.
+    open_issue_summary: summariseDeficiencies(repairs),
+    // The specifics, for when the customer asks "like what?". Capped: one site
+    // in the live tenant has 29 open items and reading them all would be
+    // unusable. Oldest first — with severity unavailable, age is the only
+    // honest ordering.
+    open_issue_details: repairs
+      .slice(0, MAX_SPOKEN_DEFICIENCIES)
+      .map((r) => cleanServiceDescription(r.description))
+      .filter(Boolean),
     // [{service_line, description}] — the pairing, for anything that needs to
     // state what the visit covers rather than just list categories.
     service_details: serviceDetails.length
@@ -326,6 +415,13 @@ function truncate(str, max) {
 function toDynamicVariables(ctx) {
   if (!ctx?.ok) return {};
   const { job } = ctx;
+  // Deficiencies are the one appointment-shaped thing that IS safe to bind
+  // here, and the exception is worth stating: they belong to the SITE, not the
+  // visit, and a repair opened months ago does not resolve itself mid-call. The
+  // staleness argument above is about confirmation state, which changes while
+  // the agent is talking; this does not.
+  const next = ctx.appointments?.next || null;
+  const defCount = next?.open_issue_count || 0;
   return {
     job_number: job.job_number || String(job.id),
     job_comments: job.comments.length
@@ -339,6 +435,17 @@ function toDynamicVariables(ctx) {
     ...((job.location_name || job.customer?.name)
       ? { location_name: job.location_name || job.customer.name }
       : {}),
+    // ── Open deficiencies (CMAP-228) ──────────────────────────────────────
+    // Always emitted, including the zero case, so the prompt can branch on
+    // "0" rather than on an undefined variable — a missing variable renders
+    // as the literal "{{open_issue_count}}" in some Retell templates.
+    open_issue_count: String(defCount),
+    open_issue_summary: next?.open_issue_summary || "none",
+    // Pipe-joined rather than a JSON array: dynamic variables are string-only,
+    // and a stringified array reads aloud as punctuation.
+    open_issue_details: defCount && next?.open_issue_details?.length
+      ? truncate(next.open_issue_details.join(" | "), MAX_COMMENT_CHARS)
+      : "none",
   };
 }
 

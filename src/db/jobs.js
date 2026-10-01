@@ -383,6 +383,11 @@ async function fetchServicesByAppointment(companyId, appointmentIds) {
   const { rows } = await db.query(
     `SELECT aps.appointment_id, aps.description, aps.status, aps.completion,
             aps.estimated_price, aps.duration,
+            -- kind separates booked work from OFFERED deficiency repairs
+            -- (migration 110). job-confirmation-context partitions on it; without
+            -- it selected here, repairs fall through as ordinary services and
+            -- land in the agent opening line.
+            aps.kind, aps.asset, aps.deficiency_id,
             sl.name AS service_line_name, sl.trade AS service_line_trade
        FROM appointment_services aps
        LEFT JOIN service_lines sl ON sl.id = aps.service_line_id
@@ -396,6 +401,12 @@ async function fetchServicesByAppointment(companyId, appointmentIds) {
 
     if (!grouped.has(r.appointment_id)) grouped.set(r.appointment_id, []);
     grouped.get(r.appointment_id).push({
+      // Defaulted, not assumed present: rows written before migration 110 and
+      // any caller building this shape by hand have no `kind`, and they are all
+      // real services.
+      kind: r.kind || "service",
+      asset: r.asset || null,
+      deficiency_id: r.deficiency_id ?? null,
       service_line_name: serviceLineName,
       service_line_trade: serviceLineTrade,
       // `service_line` is the NAME, and must keep being emitted: five call
