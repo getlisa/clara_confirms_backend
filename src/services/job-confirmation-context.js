@@ -23,6 +23,7 @@
  */
 
 const jobsDb = require("../db/jobs");
+const jobTypeInstructionsDb = require("../db/job-type-instructions");
 const db = require("../db");
 const { getCompanyTimezone, formatSpokenDateTime, formatSpokenDateOnly, formatArrivalWindow } = require("../utils/timezone");
 const logger = require("../utils/logger");
@@ -224,9 +225,20 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     .sort((a, b) => new Date(a.scheduled_start) - new Date(b.scheduled_start));
   const historyRaw = all.filter((a) => !isUpcoming(a, now));
 
-  const [techsByAppt, { comments, notes }] = await Promise.all([
+  // Pre-visit instructions are keyed on the JOB's type, not the appointment's
+  // service line, so they resolve once per conversation and apply to every
+  // visit on this job — unlike onsite_instructions, which varies per
+  // appointment. Returns [] for a job with no job_type (32 of company 14's
+  // jobs) and for a company that has authored none, which is the normal case.
+  const [techsByAppt, { comments, notes }, previsitInstructions] = await Promise.all([
     fetchTechniciansByAppointment(all.map((a) => a.id)),
     fetchJobComments(companyId, numericJobId),
+    jobTypeInstructionsDb.listForJobType(companyId, job.job_type).catch((err) => {
+      // Never fail a confirmation call because an optional extra could not be
+      // read — the call still has every reason to happen without it.
+      logger.warn("previsit instructions lookup failed", { companyId, jobId: numericJobId, error: err.message });
+      return [];
+    }),
   ]);
 
   // Only used to name the work when an appointment has no appointment_services.
@@ -385,6 +397,11 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
       contacts: opts.includeContacts ? (job.contacts || []) : undefined,
     },
     appointments: { upcoming, next: upcoming[0] || null, history },
+    // Things the CUSTOMER must do before the visit, authored by the company
+    // against this job's type (CMAP-230). Delivered once the visit is actually
+    // confirmed — never in the opening message. Read by toDynamicVariables for
+    // voice and by the chat graph's prompt directly.
+    previsit_instructions: previsitInstructions,
     counts: {
       upcoming: upcoming.length,
       confirmed: upcoming.length - unconfirmed,
@@ -422,6 +439,8 @@ function toDynamicVariables(ctx) {
   // the agent is talking; this does not.
   const next = ctx.appointments?.next || null;
   const defCount = next?.open_issue_count || 0;
+  const previsit = Array.isArray(ctx.previsit_instructions) ? ctx.previsit_instructions : [];
+  const mustAck = previsit.filter((i) => i.requires_acknowledgement === true);
   return {
     job_number: job.job_number || String(job.id),
     job_comments: job.comments.length
@@ -445,6 +464,25 @@ function toDynamicVariables(ctx) {
     // and a stringified array reads aloud as punctuation.
     open_issue_details: defCount && next?.open_issue_details?.length
       ? truncate(next.open_issue_details.join(" | "), MAX_COMMENT_CHARS)
+      : "none",
+    // ── Pre-visit instructions (CMAP-230) ─────────────────────────────────
+    // What the CUSTOMER must do before the technician arrives, authored by the
+    // company against this job's type. Job-level by nature, so unlike
+    // appointment facts these are safe to bind once at call creation.
+    //
+    // Kept rigorously distinct from the open_issue_* variables above: an open
+    // issue is optional repair work being OFFERED, while one of these is a
+    // precondition for the visit happening at all. The prompt must not let the
+    // agent present "turn the fryers off" as something declinable.
+    previsit_instruction_count: String(previsit.length),
+    previsit_instructions: previsit.length
+      ? truncate(previsit.map((i) => i.instruction).join(" | "), MAX_COMMENT_CHARS)
+      : "none",
+    // The subset the agent must WAIT for a yes on, rather than reading past.
+    // Separate variable rather than a flag inside the text, so the prompt can
+    // branch without parsing the instruction string.
+    previsit_must_acknowledge: mustAck.length
+      ? truncate(mustAck.map((i) => i.instruction).join(" | "), MAX_COMMENT_CHARS)
       : "none",
   };
 }

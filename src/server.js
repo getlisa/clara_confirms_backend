@@ -39,6 +39,7 @@ const serviceLinkMessagesRoutes = require("./routes/service-link-messages");
 const chatLinksRoutes = require("./routes/chat-links");
 const reportsRoutes = require("./routes/reports");
 const callNotificationsRoutes = require("./routes/call-notifications");
+const jobTypeInstructionsRoutes = require("./routes/job-type-instructions");
 const copilotRoutes = require("./routes/copilot");
 const servicetradeWebhooksRoutes = require("./routes/servicetrade-webhooks");
 const logsRoutes = require("./routes/logs");
@@ -211,6 +212,11 @@ app.use("/reports", reportsRoutes);
 // Per-conversation notification emails — recipients, per-recipient outcome
 // filters, and the master switch. Delivery itself is the admin drain cron.
 app.use("/call-notifications", callNotificationsRoutes);
+
+// Pre-visit instructions by job type — what the customer must do before the
+// technician arrives. Authoring surface only; the agent reads them from the
+// job confirmation context.
+app.use("/job-type-instructions", jobTypeInstructionsRoutes);
 
 // AI Copilot — embedded assistant. JWT for control endpoints, signed
 // query-string token for the SSE turn stream.

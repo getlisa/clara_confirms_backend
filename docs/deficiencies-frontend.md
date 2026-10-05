@@ -262,6 +262,12 @@ all for ServiceTrade companies.
 **Never show a price.** There is no price field and there must not be one —
 CMAP-228 forbids quoting repair pricing, and the agent is built to the same rule.
 
+**Don't merge this panel with pre-visit instructions**
+(`previsit-instructions-frontend.md`). An open item is optional repair work
+being *offered*; a pre-visit instruction is a *precondition* the customer must
+meet or the visit fails. The agent keeps them apart deliberately, and the UI
+should too.
+
 **Never assume an `asset_details` key exists.** Six shapes, and InspectPoint can
 add a seventh without telling us.
 
