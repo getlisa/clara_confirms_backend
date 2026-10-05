@@ -172,6 +172,11 @@ function derive(ctx, opts) {
     // source is enough; a company with only the new table and none of the
     // old soft-matched descriptions (or vice versa) still gets the section.
     hasOnsiteContent: serviceLineDescriptions.length > 0 || onsiteInstructions.length > 0,
+    // Pre-visit instructions (CMAP-230) — company-authored, keyed by the JOB's
+    // type, so unlike onsiteInstructions above they need no per-appointment
+    // match: they are already resolved for this job by
+    // buildJobConfirmationContext and ride in on ctx.
+    previsitInstructions: Array.isArray(ctx.previsit_instructions) ? ctx.previsit_instructions : [],
     confirmedBy,
     recipientEmail,
     recipientPhone,
@@ -466,6 +471,50 @@ If the visit does NOT involve noise or unit access (standalone extinguishers, st
 `}`;
 
 /**
+ * What the customer has to do before the technician arrives (CMAP-230).
+ *
+ * Deliberately a SEPARATE section from ONSITE_EXPECTATIONS, not a subsection
+ * of it. Onsite expectations describe what will happen during the visit, and
+ * the site-specific instructions there are about conduct on site. These are
+ * preconditions: if they are not done, the visit cannot go ahead. Folding them
+ * together invites the model to deliver a hard requirement in the same
+ * hedged, conversational register as "expect some noise".
+ */
+const PREVISIT_REQUIREMENTS = (d) => `${BAR}
+BEFORE THE VISIT — WHAT THE CUSTOMER MUST DO
+${BAR}
+
+${d.companyName}'s own requirements for this type of work. These are NOT
+findings, NOT repair work, and NOT optional — they are things the site has to
+have done before the technician arrives, or the visit cannot go ahead.
+
+Deliver these LAST, once the visit is settled and after onsite expectations and
+the arrival window — never in the opening message. They are the one thing the
+customer has to act on themselves after this conversation ends, so they are
+what you leave them with.
+
+${d.previsitInstructions.map((i) => `- [${i.requires_acknowledgement ? "ASK — wait for a clear yes" : "STATE"}] ${i.instruction}`).join("\n")}
+
+State these as already decided, not as a request or a favour: "for this type of
+visit, [the instruction] — otherwise the technician won't be able to carry out
+the inspection."
+
+For anything marked ASK: put it as an actual question and wait for a clear yes
+before moving on. Don't read past it, and don't treat a vague reply as
+agreement. Once they answer, call report_customer_intent with the requirement
+and their answer, so staff can see whether the site agreed.
+
+If they say they CAN'T do it: don't argue and don't improvise an exception —
+"that's useful to know, let me flag it so the team can work out the best
+approach before they come out." The visit still stands.
+If they ask WHY: explain it practically — the technician can't do the work
+safely or properly otherwise. Never threaten a fee or imply a penalty.
+
+Say only what is listed above, faithful to its meaning. You may not add,
+soften, drop or extend one, and you must never describe one as optional.
+`;
+
+/**
  * The resolved CRM workflow's must-hit sequence (confirmation-agent/
  * workflows/*.js) — CRM-specific by design (see that directory's header
  * comment for why this prose lives there instead of here). Rendered right
@@ -742,6 +791,9 @@ function build(ctx, opts = {}) {
     // it is used FROM WITHIN that flow now, not as a gate ahead of it.
     d.hasOnsiteContent && ONSITE_EXPECTATIONS(d),
     ARRIVAL_WINDOW(d),
+    // After ARRIVAL WINDOW on purpose: these are delivered last, and a company
+    // that has authored none gets no section at all.
+    d.previsitInstructions.length > 0 && PREVISIT_REQUIREMENTS(d),
     d.showOtherAppointments && OTHER_APPOINTMENTS(d),
     // A CRM with no customer-facing job-tracking link (workflow.capabilities.
     // serviceLink === false) never gets this section — matches

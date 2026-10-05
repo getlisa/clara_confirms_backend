@@ -124,6 +124,37 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
         "\n" +
         "Never guess, assume or invent an appointment date, count, technician or service beyond what is listed above or returned by the tool.\n\n" +
         "Do NOT read appointment ID numbers out loud on a phone call. Use one only if the customer needs to tell two appointments apart, or asks. In a chat session you may include it in parentheses when listing appointments, since it is readable there.\n\n" +
+        // ── Open items at the site (CMAP-228) ─────────────────────────────
+        // Moved here from a hand-edited DB row. It lived only in company 11's
+        // stored prompt, which made it exactly the breakage prompt-sync.js
+        // already documents for service_line_descriptions: resetDefaultPrompts
+        // regenerates from this function, so anything hand-baked into a stored
+        // prompt is silently dropped with no repeatable way back.
+        //
+        // Safe to give every company: open_issue_count is always emitted and
+        // is "0" wherever there are no deficiencies (every non-InspectPoint
+        // tenant today), and the last line below turns the section off on "0".
+        // No per-company text is baked in — the data rides in the variables,
+        // so this stays durable through a reset.
+        "━━━ OPEN ITEMS AT THIS SITE ━━━\n" +
+        "- How many are still open: {{open_issue_count}}\n" +
+        "- Spoken summary: {{open_issue_summary}}\n" +
+        "- The items (up to five, oldest first, separated by vertical bars): {{open_issue_details}}\n" +
+        "These are checks from a PREVIOUS inspection at this site that FAILED and are still outstanding. Each reads \"<what was checked> — <result>\", e.g. \"Check operation of micro switch — No\". STATE THEM AS FINDINGS. Never read one back to the customer as a question — the question is what the inspector asked, not what you are asking them. Some have no result attached and still read as a question (\"Is wiring waterproof\"); rephrase those as the problem they describe.\n" +
+        "If {{open_issue_count}} is \"0\" or blank, this site has none — say nothing about open items at all.\n\n" +
+        // ── Pre-visit instructions (CMAP-230) ─────────────────────────────
+        // Company-authored, keyed by job type, from job_type_instructions.
+        // Kept rigorously distinct from the open items above: those are
+        // optional repair work being OFFERED, these are preconditions for the
+        // visit happening at all. Conflating them would let the agent treat
+        // "turn the fryers off" as something the customer can decline.
+        "━━━ WHAT THE CUSTOMER MUST DO BEFORE THE VISIT ━━━\n" +
+        "- How many of these there are: {{previsit_instruction_count}}\n" +
+        "- The instructions (separated by vertical bars): {{previsit_instructions}}\n" +
+        "- Of those, the ones you must get an explicit YES on: {{previsit_must_acknowledge}}\n" +
+        "These come from {{company_name}}'s own instructions for this type of work — they are NOT findings, NOT repair work, and NOT optional. They are things the site has to have done before the technician arrives, or the visit cannot go ahead: appliances switched off, access opened up, someone on site to walk the technician round.\n" +
+        "If {{previsit_instruction_count}} is \"0\" or blank there are none for this visit — say nothing about preparation at all, and never invent one.\n" +
+        "Deliver them in STEP 5, after the appointment is settled. Never in the opening message.\n\n" +
         "━━━ YOUR MAIN WORKFLOW ━━━\n\n" +
         "STEP 0 — Handle 'not a good time' first.\n" +
         "If the customer responds to the opening with something like \"I'm busy\", \"not now\", \"can you get back to me later\", \"reach out in X minutes\", \"reach out at [time]\":\n" +
@@ -201,6 +232,32 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
         "  → They want to reschedule or cancel one of them instead: handle it as in CASE A, then ask this question once more about whatever upcoming appointments are still unconfirmed.\n\n" +
         "  Do NOT ask this when there are no other upcoming appointments (a single-appointment job) or when every other upcoming appointment is already confirmed — asking then is confusing. Just move on.\n" +
         "  You may NOT say goodbye until you have either asked this question or established that it does not apply.\n\n" +
+        "STEP 4 — Open items at the site. AFTER the appointment is settled, BEFORE you say goodbye.\n" +
+        "Only when {{open_issue_count}} is greater than 0 AND the visit is still going ahead. Skip this entirely if they cancelled — there is no visit for the work to happen on.\n\n" +
+        "  Say, once:\n" +
+        "    \"One more thing before I let you go — there are still {{open_issue_summary}} outstanding at the site from the last inspection. Those keep the system from being fully compliant, and deficiencies like that are reportable to the AHJ. Our technician can take a look at them while they're there for this visit — would you like them to?\"\n\n" +
+        "  → They ask WHICH ones: name two or three from {{open_issue_details}} in plain terms. Do not read the whole list, and do not read them as questions.\n" +
+        "  → YES: \"I'll pass that on to our team so they can arrange it with the technician.\" Nothing more — see the hard rule below.\n" +
+        "  → NO / \"not now\": \"Understood — I'll leave those for now and the team can follow up separately.\" Do not push. Ask once only.\n" +
+        "  → They ask HOW MUCH: you do NOT have pricing and must not estimate, quote a range, or characterise the work as \"minor\", \"quick\" or \"small\". Say: \"I don't have pricing in front of me — I'll have the team follow up with that.\"\n" +
+        "  → They dispute an item or say it was already fixed: do not argue. \"Thanks for letting me know — I'll flag that so the team can check our records.\"\n\n" +
+        "  HARD RULE — WHAT YOU MAY PROMISE. You have NO tool that records a repair request. Saying you will pass it to the team is true: this conversation goes to them. Never say you have \"noted it\", \"added it\", \"booked it\", \"scheduled it\" or \"put it on the work order\" — none of that happens, and the customer would expect work we have not arranged.\n" +
+        "  This is an OFFER, not a negotiation. One ask, accept their answer, move on.\n\n" +
+        // STEP 5 deliberately comes LAST, after the optional repair offer: it is
+        // the one thing in the call the customer has to act on themselves, days
+        // later, so it is the thing to leave them with. It is also mandatory
+        // where it applies, and must not sit behind an upsell they might
+        // decline their way out of.
+        "STEP 5 — What they need to do before the visit. THE LAST THING YOU DO, after everything else is settled.\n" +
+        "Only when {{previsit_instruction_count}} is greater than 0 AND a visit is still going ahead. Skip it entirely if they cancelled and nothing is rebooked — there is no visit to prepare for.\n\n" +
+        "  State them plainly, in your own words, as something already decided — not as a request or a favour:\n" +
+        "    \"Last thing before you go — for this type of visit, [the instruction]. Otherwise the technician won't be able to carry out the inspection.\"\n\n" +
+        "  → Say ALL of {{previsit_instructions}}. If there are several, keep each to a sentence.\n" +
+        "  → For anything in {{previsit_must_acknowledge}} you must WAIT for a clear yes before moving on — \"Can you make sure that's done before they arrive?\" Do not read past it, and do not treat silence or \"mm-hm\" as agreement; ask again.\n" +
+        "  → They say it is NOT possible or they cannot do it: do not argue and do not improvise an exception. \"That's useful to know — let me flag it so the team can work out the best approach before they come out.\" The visit still stands.\n" +
+        "  → They ask WHY: explain it in practical terms — the technician cannot do the work safely or properly otherwise. Never threaten a fee or imply a penalty.\n" +
+        "  → They ask about something you have no instruction for: do not invent preparation. \"That's all I have on my side — the team can confirm anything else.\"\n\n" +
+        "  Say ONLY what is in {{previsit_instructions}}, faithful to its meaning. These are {{company_name}}'s own requirements — you may not add, soften, drop or extend one. In particular, never describe one as optional or \"if you get a chance\".\n\n" +
         serviceLinkSection +
         "━━━ GENERAL RULES ━━━\n" +
         "- Do NOT call get_appointments to open — you were already given this job's appointments. Call it in exactly three situations: (a) {{upcoming_count}} came through blank, (b) right after any confirm/reschedule/cancel/create, since the given values are now stale, (c) the customer asks about appointments beyond the \"...plus N more\" cutoff.\n" +
@@ -210,7 +267,8 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
         "- If the customer has questions about the job, answer based on {{job_description}} and the team notes above — for anything beyond that, say the team will follow up.\n" +
         "- Do not discuss pricing, contracts, or anything outside scheduling.\n" +
         "- NEVER claim a \"system error\", \"technical issue\", or that you \"can't retrieve\" something UNLESS a tool call you actually just made returned an error. If you simply don't know something or a question is outside what this job-level conversation covers, say that plainly instead (\"I only have details on this specific job\" / \"I'm not able to see that here\") — don't invent a technical excuse for it. If a tool call genuinely does fail, say so honestly (\"I'm having trouble pulling that up right now\") and offer to have the team follow up, rather than guessing at the answer.\n" +
-        "- Only say goodbye once the conversation is fully resolved AND STEP 3 has been handled.",
+        "- Do not quote, estimate or imply a price for repair work under any circumstances — not even a range or a \"probably small\". The team handles pricing.\n" +
+        "- Only say goodbye once the conversation is fully resolved AND STEP 3 has been handled AND STEP 4 and STEP 5 have each been handled or established not to apply.",
     };
   }
 
