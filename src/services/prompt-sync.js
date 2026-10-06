@@ -164,6 +164,75 @@ async function syncPromptsForCompany(companyId, types = null) {
 }
 
 /**
+ * The marker that proves a company's stored confirmation prompt can actually
+ * SPEAK a pre-visit instruction (CMAP-230).
+ *
+ * The instruction text itself never goes into the prompt — it rides per-call in
+ * retell_llm_dynamic_variables, so a newly authored instruction is picked up on
+ * the very next call with no Retell write at all. What the prompt must carry is
+ * the SCAFFOLDING: the data block that introduces the variables and the STEP
+ * that delivers them. Without it the variable is bound and then silently
+ * ignored, which is the one failure mode here that looks like nothing is wrong.
+ */
+const PREVISIT_PROMPT_MARKER = "{{previsit_instructions}}";
+
+/**
+ * Make sure this company's agent can speak pre-visit instructions, and repair
+ * it if not. Called after an instruction is authored from the platform.
+ *
+ * Idempotent and cheap in the common case: one indexed read, and no Retell
+ * traffic at all once the scaffolding is in place. It only ever does work the
+ * FIRST time a company authors an instruction (or after its prompt was reset
+ * to a generation older than this feature).
+ *
+ * NOTE ON SCOPE — worth knowing before reading the logs: repairing the prompt
+ * regenerates it wholesale from generateDefaultPrompts, because that is how
+ * prompts are built here. For a company sitting on an older generation that
+ * also brings every other accumulated prompt change forward, not just this
+ * block. That is why it logs at info with `changed: true` rather than quietly.
+ *
+ * Never throws: the instruction row is already committed by the time this
+ * runs, and a Retell outage must not turn a saved setting into a 500.
+ */
+async function ensurePrevisitPromptCurrent(companyId) {
+  try {
+    const { rows } = await db.query(
+      `SELECT general_prompt, is_custom FROM call_type_configs
+        WHERE company_id = $1 AND type = 'customer_confirmation'`,
+      [companyId]
+    );
+
+    if (!rows.length) {
+      // Not provisioned for confirmations at all — nothing to repair, and not
+      // an error: the instruction is stored and becomes live if they are.
+      return { ok: true, changed: false, reason: "no_confirmation_prompt" };
+    }
+
+    const row = rows[0];
+    if (String(row.general_prompt || "").includes(PREVISIT_PROMPT_MARKER)) {
+      return { ok: true, changed: false, reason: "already_current" };
+    }
+
+    if (row.is_custom) {
+      // A hand-written prompt belongs to whoever wrote it — resetDefaultPrompts
+      // deliberately skips is_custom rows, so overriding that here would throw
+      // away their work. Report it instead of silently storing an instruction
+      // the agent will never say.
+      logger.warn("previsit: company has a custom confirmation prompt — instruction will NOT be spoken until it is added by hand", { companyId });
+      return { ok: false, changed: false, reason: "custom_prompt" };
+    }
+
+    await resetDefaultPrompts(companyId, ["customer_confirmation"]);
+    const { updated } = await syncPromptsForCompany(companyId, ["customer_confirmation"]);
+    logger.info("previsit: confirmation prompt brought current and pushed to Retell", { companyId, retellNodesUpdated: updated, changed: true });
+    return { ok: true, changed: true, reason: "synced", retell_nodes_updated: updated };
+  } catch (err) {
+    logger.error("previsit: could not bring the confirmation prompt current", { companyId, error: err.message });
+    return { ok: false, changed: false, reason: "error", error: err.message };
+  }
+}
+
+/**
  * Run for all active companies.
  */
 async function syncPromptsForAllCompanies(types = null) {
@@ -187,4 +256,6 @@ module.exports = {
   resetDefaultPromptsForAllCompanies,
   syncPromptsForCompany,
   syncPromptsForAllCompanies,
+  ensurePrevisitPromptCurrent,
+  PREVISIT_PROMPT_MARKER,
 };
