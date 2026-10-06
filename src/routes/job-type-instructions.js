@@ -12,6 +12,11 @@
  * services/job-confirmation-context.js for the resolution and
  * db/call-type-configs.js for the spoken step.
  *
+ * Writing an instruction also ensures the company's Retell prompt carries the
+ * step that delivers it (prompt-sync.js's ensurePrevisitPromptCurrent) — the
+ * instruction TEXT is never written into the prompt, it rides per-call in
+ * dynamic variables, but the step that speaks it has to be there.
+ *
  * docs/previsit-instructions-frontend.md is the frontend contract: §2 covers
  * the picker (the only safe source of job_type values), §4 the status codes,
  * and §5 what requires_acknowledgement changes about the call.
@@ -20,6 +25,7 @@
 const express = require("express");
 const { authenticate, getCompanyId } = require("../auth");
 const jobTypeInstructionsDb = require("../db/job-type-instructions");
+const { ensurePrevisitPromptCurrent } = require("../services/prompt-sync");
 const logger = require("../utils/logger");
 
 const router = express.Router();
@@ -110,7 +116,13 @@ router.post("/", async (req, res) => {
       sortOrder: body.sort_order ?? 0,
       active: body.active !== false,
     });
-    return res.status(201).json({ instruction });
+
+    // An authored instruction is useless if the agent's prompt has no step
+    // that delivers it — see ensurePrevisitPromptCurrent. Runs AFTER the row is
+    // committed and never throws, so a Retell outage cannot turn a saved
+    // setting into a 500; the outcome is reported instead of swallowed.
+    const promptSync = await ensurePrevisitPromptCurrent(companyId);
+    return res.status(201).json({ instruction, prompt_sync: promptSync });
   } catch (err) {
     if (err.code === "DUPLICATE") return res.status(409).json({ error: err.message });
     logger.error("POST /job-type-instructions failed", { error: err.message });
@@ -129,7 +141,11 @@ router.patch("/:id", async (req, res) => {
 
     const instruction = await jobTypeInstructionsDb.update(companyId, req.params.id, body);
     if (!instruction) return res.status(404).json({ error: "Instruction not found" });
-    return res.json({ instruction });
+
+    // Also here, not just on create: re-activating a row, or editing one that
+    // predates the prompt scaffolding, has to leave the agent able to say it.
+    const promptSync = await ensurePrevisitPromptCurrent(companyId);
+    return res.json({ instruction, prompt_sync: promptSync });
   } catch (err) {
     if (err.code === "DUPLICATE") return res.status(409).json({ error: err.message });
     logger.error("PATCH /job-type-instructions failed", { error: err.message });
