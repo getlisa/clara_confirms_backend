@@ -83,11 +83,16 @@ function toList(value) {
   return String(value).split(",").map((v) => v.trim()).filter(Boolean);
 }
 
+// Sort keys GET /jobs accepts. Only the visit date today; an unknown value
+// falls back to it rather than erroring, so an older or newer frontend never
+// breaks the Jobs page (docs/jobs-sort-backend-request.md).
+const JOB_SORTS = { visit_date: "a.scheduled_start" };
+
 async function listJobs(companyId, {
   status, jobType, customerId, technicianId, locationId,
   scheduledDateFrom, scheduledDateTo, tz,
   dueSoonDays, confirmed,
-  search, limit = 50, offset = 0,
+  search, sort = "visit_date", order = "asc", limit = 50, offset = 0,
 } = {}) {
   const conditions = ["j.company_id = $1"];
   const values = [companyId];
@@ -173,6 +178,15 @@ async function listJobs(companyId, {
 
   const where = conditions.join(" AND ");
 
+  // Sort by the date the Jobs table shows: the active appointment's start
+  // (`a`, the lateral below), not jobs.scheduled_date, which drifts from it
+  // after a reschedule. Both pieces come from fixed whitelists — the raw query
+  // params are never interpolated. NULLS LAST in both directions keeps jobs
+  // with no visit at the bottom of a decreasing list too; j.id as the final
+  // tiebreaker keeps paging stable (no job on two pages, none skipped).
+  const sortColumn = JOB_SORTS[sort] || JOB_SORTS.visit_date;
+  const sortDir = String(order).toLowerCase() === "desc" ? "DESC" : "ASC";
+
   // `values` deliberately does NOT get limit/offset appended — they're spread
   // into the rows query only. The count query has no LIMIT/OFFSET, so sharing
   // a mutated array would leave it with two extra params and throw on every
@@ -211,7 +225,7 @@ async function listJobs(companyId, {
        ORDER BY ap.scheduled_start DESC LIMIT 1
      ) a ON true
      WHERE ${where}
-     ORDER BY j.scheduled_date ASC NULLS LAST, j.created_at DESC
+     ORDER BY ${sortColumn} ${sortDir} NULLS LAST, j.id ${sortDir}
      LIMIT $${i} OFFSET $${i + 1}`,
       [...values, limit, offset]
     ),

@@ -82,7 +82,7 @@ router.get("/", async (req, res) => {
       status, job_type, customer_id, technician_id, location_id,
       scheduled_date_from, scheduled_date_to,
       due_soon, confirmed,
-      search, limit, offset,
+      search, sort, order, limit, offset,
     } = req.query;
 
     // scheduled_date_from/to need the company timezone up front — they filter
@@ -110,6 +110,10 @@ router.get("/", async (req, res) => {
       dueSoonDays:       due_soon != null ? Number(due_soon) : undefined,
       confirmed:         confirmed === "true" ? true : confirmed === "false" ? false : undefined,
       search:            search || undefined,
+      // ?sort=visit_date&order=asc|desc — unknown values fall back to the
+      // default (visit date, increasing) inside listJobs, never a 400.
+      sort:              sort || undefined,
+      order:             order || undefined,
       limit:             limitNum,
       offset:            offsetNum,
     });
