@@ -53,7 +53,16 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
     // company seeding, ad-hoc custom-type creation) omits it, which defaults
     // to today's ServiceTrade-flavored behavior unchanged. See
     // confirmation-agent/workflows/*.js for what a workflow actually is.
-    const hasServiceLink = workflow?.capabilities?.serviceLink !== false;
+    //
+    // The SERVICE LINK section is opt-in: only an explicit
+    // capabilities.serviceLink === true includes it. resetDefaultPrompts passes
+    // the workflow through withServiceLinkSetting, so that is true only when
+    // the CRM supports it AND the company has "Email the service link after
+    // confirmation" (call_settings.service_link_enabled) on. Callers that omit
+    // the workflow (fresh-company seeding) get no section — matching that
+    // setting's default of off; turning it on regenerates the prompt
+    // (prompt-sync.js's ensureServiceLinkPromptCurrent).
+    const hasServiceLink = workflow?.capabilities?.serviceLink === true;
     const cancellationReasonOptional = workflow?.capabilities?.cancellationReason === "optional";
     const serviceLinkSection = !hasServiceLink ? "" :
         "━━━ SERVICE LINK (only AFTER the customer has confirmed at least one appointment) ━━━\n" +

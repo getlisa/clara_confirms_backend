@@ -233,6 +233,15 @@ async function maybeResyncToolsAfterSettingsChange(companyId, changedFieldNames 
   const affected = changedFieldNames.some((f) => TOOL_AFFECTING_SETTINGS.includes(f));
   if (!affected) return;
   try {
+    // service_link_enabled also decides whether the confirmation PROMPT has a
+    // SERVICE LINK section. Regenerate that first and await it: both steps
+    // read-modify-write the same Retell flow's nodes, so running them
+    // concurrently could drop one side's change. Lazy require, same as
+    // retell-flow.js's own cross-require of this module.
+    if (changedFieldNames.includes("service_link_enabled")) {
+      const { ensureServiceLinkPromptCurrent } = require("./prompt-sync");
+      await ensureServiceLinkPromptCurrent(companyId);
+    }
     await registerToolsForCompany(companyId);
   } catch (err) {
     logger.warn("maybeResyncToolsAfterSettingsChange: re-registration failed", { companyId, error: err.message });
