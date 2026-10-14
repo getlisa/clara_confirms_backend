@@ -42,6 +42,30 @@ const BUILTIN_SEEDS = [
 ];
 
 /**
+ * The SERVICE LINK section of the customer_confirmation prompt, as a managed
+ * block. Never stored in call_type_configs.general_prompt: prompt-sync.js
+ * appends it to the text it pushes to Retell when the company's CRM supports a
+ * service link AND call_settings.service_link_enabled ("Email the service link
+ * after confirmation") is on — see composeRetellPrompt there. The prompt editor
+ * shows it read-only for the same reason.
+ */
+const SERVICE_LINK_PROMPT_MARKER = "━━━ SERVICE LINK";
+const SERVICE_LINK_SECTION =
+        "━━━ SERVICE LINK (only AFTER the customer has confirmed at least one appointment) ━━━\n" +
+        "Offer to send them a link to track this job. One link covers the whole job, not a single appointment:\n" +
+        "  → Ask: \"Would you like me to email you a service link where you can follow this job?\"\n" +
+        "  → If NO: skip this section and wrap up.\n" +
+        "  → If YES:\n" +
+        "     1. Read the address back and get an explicit yes. If {{customer_email}} is not empty: \"I have your email as {{customer_email}} — is that the right one to send it to?\" If it IS empty, ask for it and read back what you heard, letter by letter if it is at all unusual.\n" +
+        "     2. ONLY after they say yes (or give you a different address), call resolve_service_link_contact with that email AND email_confirmed=true. Do not ask for their name or role first.\n" +
+        "        • Calling it without email_confirmed=true returns status \"needs_email_confirmation\" and sends nothing — go back and ask.\n" +
+        "        • Never set email_confirmed=true for an address they have not actually agreed to. If no contact matches, this tool CREATES one in our CRM, so a misheard address is not just a misdirected link.\n" +
+        "        • If the result status is \"found\": confirm back with the customer (e.g. \"I found you in our system as [name] — is that right?\") and continue — no further info needed.\n" +
+        "        • If the result status is \"need_more_info\": THEN, and only then, ask who this is for / their role (e.g. management, billing, on-site, scheduling, owner) and their first/last name, then call resolve_service_link_contact again including email, first_name, last_name, and role.\n" +
+        "     3. Do NOT call get_service_link — there's nowhere to display a link on a phone call. resolve_service_link_contact's response includes link_sent (true/false) — check it and phrase accordingly: if link_sent is true, say \"Perfect — I've just sent that to [email].\"; if link_sent is false (the appointment isn't confirmed yet), say \"Perfect — I'll send that to [email] as soon as we wrap up.\" Never say \"right after we finish up\" if link_sent is true — it's already done." +
+        "\n  Do this before you say goodbye, after the steps above are handled.";
+
+/**
  * Generate default begin_message and general_prompt for a call type.
  * Built-in types get tailored prompts; custom types get generic ones derived
  * from the type's name and description.
@@ -54,29 +78,13 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
     // to today's ServiceTrade-flavored behavior unchanged. See
     // confirmation-agent/workflows/*.js for what a workflow actually is.
     //
-    // The SERVICE LINK section is opt-in: only an explicit
-    // capabilities.serviceLink === true includes it. resetDefaultPrompts passes
-    // the workflow through withServiceLinkSetting, so that is true only when
-    // the CRM supports it AND the company has "Email the service link after
-    // confirmation" (call_settings.service_link_enabled) on. Callers that omit
-    // the workflow (fresh-company seeding) get no section — matching that
-    // setting's default of off; turning it on regenerates the prompt
-    // (prompt-sync.js's ensureServiceLinkPromptCurrent).
-    const hasServiceLink = workflow?.capabilities?.serviceLink === true;
+    // The SERVICE LINK section is NOT part of this text. It is a managed block
+    // (SERVICE_LINK_SECTION below) that prompt-sync.js appends when it pushes
+    // the prompt to Retell, only while the company has "Email the service link
+    // after confirmation" on. Keeping it out of the stored prompt is what lets
+    // that toggle work on a prompt the user has edited — flipping it re-pushes,
+    // and never rewrites their text.
     const cancellationReasonOptional = workflow?.capabilities?.cancellationReason === "optional";
-    const serviceLinkSection = !hasServiceLink ? "" :
-        "━━━ SERVICE LINK (only AFTER the customer has confirmed at least one appointment) ━━━\n" +
-        "Offer to send them a link to track this job. One link covers the whole job, not a single appointment:\n" +
-        "  → Ask: \"Would you like me to email you a service link where you can follow this job?\"\n" +
-        "  → If NO: skip this section and wrap up.\n" +
-        "  → If YES:\n" +
-        "     1. Read the address back and get an explicit yes. If {{customer_email}} is not empty: \"I have your email as {{customer_email}} — is that the right one to send it to?\" If it IS empty, ask for it and read back what you heard, letter by letter if it is at all unusual.\n" +
-        "     2. ONLY after they say yes (or give you a different address), call resolve_service_link_contact with that email AND email_confirmed=true. Do not ask for their name or role first.\n" +
-        "        • Calling it without email_confirmed=true returns status \"needs_email_confirmation\" and sends nothing — go back and ask.\n" +
-        "        • Never set email_confirmed=true for an address they have not actually agreed to. If no contact matches, this tool CREATES one in our CRM, so a misheard address is not just a misdirected link.\n" +
-        "        • If the result status is \"found\": confirm back with the customer (e.g. \"I found you in our system as [name] — is that right?\") and continue — no further info needed.\n" +
-        "        • If the result status is \"need_more_info\": THEN, and only then, ask who this is for / their role (e.g. management, billing, on-site, scheduling, owner) and their first/last name, then call resolve_service_link_contact again including email, first_name, last_name, and role.\n" +
-        "     3. Do NOT call get_service_link — there's nowhere to display a link on a phone call. resolve_service_link_contact's response includes link_sent (true/false) — check it and phrase accordingly: if link_sent is true, say \"Perfect — I've just sent that to [email].\"; if link_sent is false (the appointment isn't confirmed yet), say \"Perfect — I'll send that to [email] as soon as we wrap up.\" Never say \"right after we finish up\" if link_sent is true — it's already done.\n\n";
     return {
       begin_message:
         "Hi {{location_name}}, this is {{representative_name}} calling from {{company_name}}. " +
@@ -212,9 +220,7 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
         "── CASE B: every upcoming appointment is already confirmed (all_upcoming_confirmed = true) ──\n" +
         "Do NOT ask for confirmation as though nothing is on file.\n" +
         "  → Say: \"Good news — everything on this job is already confirmed on our side. The next visit is [date] for [service]. I just wanted to make sure that still works for you.\"\n" +
-        (hasServiceLink
-          ? "  → If it still works: thank them and go to the SERVICE LINK section. No tool call needed.\n"
-          : "  → If it still works: thank them and wrap up. No tool call needed.\n") +
+        "  → If it still works: thank them. If these instructions include a SERVICE LINK section, go to it now; otherwise wrap up. No tool call needed.\n" +
         "  → If it doesn't: handle it as a reschedule or cancellation exactly as in CASE A.\n" +
         "  → SKIP STEP 3 — there is nothing left to confirm.\n\n" +
         "── CASE C: no upcoming appointments ({{upcoming_count}} is 0) ──\n" +
@@ -260,7 +266,6 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
         "  → They ask WHY: explain it in practical terms — the technician cannot do the work safely or properly otherwise. Never threaten a fee or imply a penalty.\n" +
         "  → They ask about something you have no instruction for: do not invent preparation. \"That's all I have on my side — the team can confirm anything else.\"\n\n" +
         "  Say ONLY what is in {{previsit_instructions}}, faithful to its meaning. These are {{company_name}}'s own requirements — you may not add, soften, drop or extend one. In particular, never describe one as optional or \"if you get a chance\".\n\n" +
-        serviceLinkSection +
         "━━━ GENERAL RULES ━━━\n" +
         "- Do NOT call get_appointments to open — you were already given this job's appointments. Call it in exactly three situations: (a) {{upcoming_count}} came through blank, (b) right after any confirm/reschedule/cancel/create, since the given values are now stale, (c) the customer asks about appointments beyond the \"...plus N more\" cutoff.\n" +
         "- Talk about the JOB and its visits — never as if the job were a single appointment.\n" +
@@ -498,6 +503,13 @@ function slugify(name) {
     .replace(/^_+|_+$/g, "");
 }
 
+// Every read of a call type returns the same shape — the prompt editor needs
+// the version (for its 409 check), whether the prompt is the user's own, and
+// whether Retell actually has the latest save.
+const SELECT_COLS =
+  "type, name, description, is_custom, enabled, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id, " +
+  "retell_subagent_node_id, prompt_customized, prompt_version, prompt_updated_at, prompt_updated_by, retell_synced_at, retell_sync_error";
+
 function rowToObject(row) {
   return {
     type:              row.type,
@@ -508,6 +520,13 @@ function rowToObject(row) {
     begin_message:     row.begin_message ?? null,
     general_prompt:    row.general_prompt ?? null,
     voicemail_message: row.voicemail_message ?? generateDefaultVoicemailMessage(row.type),
+    prompt_customized: row.prompt_customized ?? false,
+    prompt_version:    row.prompt_version ?? 1,
+    prompt_updated_at: row.prompt_updated_at ?? null,
+    prompt_updated_by: row.prompt_updated_by != null ? Number(row.prompt_updated_by) : null,
+    retell_provisioned: !!(row.retell_llm_id && row.retell_subagent_node_id),
+    retell_synced_at:  row.retell_synced_at ?? null,
+    retell_sync_error: row.retell_sync_error ?? null,
   };
 }
 
@@ -535,7 +554,7 @@ async function seedBuiltins(companyId, client) {
  */
 async function getAllByCompanyId(companyId) {
   const result = await db.query(
-    `SELECT type, name, description, is_custom, enabled, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id
+    `SELECT ${SELECT_COLS}
      FROM call_type_configs
      WHERE company_id = $1
      ORDER BY is_custom ASC, created_at ASC`,
@@ -565,7 +584,7 @@ async function create(companyId, { name, description }) {
     `INSERT INTO call_type_configs
        (company_id, type, name, description, is_custom, enabled, begin_message, general_prompt)
      VALUES ($1, $2, $3, $4, true, false, $5, $6)
-     RETURNING type, name, description, is_custom, enabled, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id`,
+     RETURNING ${SELECT_COLS}`,
     [companyId, slug, name, description ?? "", begin_message, general_prompt]
   );
   return rowToObject(result.rows[0]);
@@ -576,7 +595,7 @@ async function create(companyId, { name, description }) {
  */
 async function getByType(companyId, type) {
   const result = await db.query(
-    `SELECT type, name, description, is_custom, enabled, begin_message, general_prompt, voicemail_message, retell_llm_id, retell_agent_id
+    `SELECT ${SELECT_COLS}
      FROM call_type_configs WHERE company_id = $1 AND type = $2`,
     [companyId, type]
   );
@@ -616,10 +635,105 @@ async function upsert(companyId, type, fields) {
   const result = await db.query(
     `UPDATE call_type_configs SET ${setClauses}, updated_at = NOW()
      WHERE company_id = $1 AND type = $2
-     RETURNING type, name, description, is_custom, enabled, begin_message, general_prompt`,
+     RETURNING ${SELECT_COLS}`,
     values
   );
   return result.rows[0] ? rowToObject(result.rows[0]) : null;
+}
+
+/**
+ * Save a new general_prompt for a call type from the prompt editor (or a
+ * reset/restore), atomically with its revision row.
+ *
+ * Optimistic concurrency: when `expectedVersion` is given and the stored
+ * prompt_version has moved on, nothing is written and a 409 error carrying the
+ * current row is thrown — a teammate saved in between, and overwriting them
+ * silently is exactly what the editor must not do.
+ *
+ * `customized` is what prompt_customized becomes: true for a user edit (every
+ * automatic reset will now skip this prompt), false for "reset to default".
+ * Returns the updated row, or null when the call type does not exist.
+ */
+async function savePrompt(companyId, type, { generalPrompt, expectedVersion = null, userId = null, source = "edit", customized = true }) {
+  return db.transaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT ${SELECT_COLS} FROM call_type_configs WHERE company_id = $1 AND type = $2 FOR UPDATE`,
+      [companyId, type]
+    );
+    if (!rows[0]) return null;
+    const current = rows[0];
+    if (expectedVersion != null && Number(expectedVersion) !== Number(current.prompt_version)) {
+      const err = new Error("This prompt was changed by someone else since you opened it");
+      err.status = 409;
+      err.current = rowToObject(current);
+      throw err;
+    }
+    const { rows: updated } = await client.query(
+      `UPDATE call_type_configs
+          SET general_prompt    = $3,
+              prompt_customized = $4,
+              prompt_version    = prompt_version + 1,
+              prompt_updated_at = NOW(),
+              prompt_updated_by = $5,
+              updated_at        = NOW()
+        WHERE company_id = $1 AND type = $2
+        RETURNING ${SELECT_COLS}`,
+      [companyId, type, generalPrompt, customized, userId]
+    );
+    const row = updated[0];
+    await client.query(
+      `INSERT INTO call_type_prompt_revisions
+         (company_id, type, version, general_prompt, prompt_customized, source, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [companyId, type, row.prompt_version, generalPrompt, customized, source, userId]
+    );
+    return rowToObject(row);
+  });
+}
+
+/** Record the outcome of pushing a call type's prompt to Retell. */
+async function markRetellSync(companyId, type, { ok, error = null }) {
+  await db.query(
+    ok
+      ? `UPDATE call_type_configs SET retell_synced_at = NOW(), retell_sync_error = NULL WHERE company_id = $1 AND type = $2`
+      : `UPDATE call_type_configs SET retell_sync_error = $3 WHERE company_id = $1 AND type = $2`,
+    ok ? [companyId, type] : [companyId, type, String(error || "Unknown error").slice(0, 1000)]
+  );
+}
+
+const REVISION_COLS = "id, type, version, general_prompt, prompt_customized, source, created_by, created_at";
+
+function revisionToObject(r) {
+  return {
+    id: Number(r.id),
+    type: r.type,
+    version: r.version,
+    general_prompt: r.general_prompt,
+    prompt_customized: r.prompt_customized,
+    source: r.source,
+    created_by: r.created_by != null ? Number(r.created_by) : null,
+    created_at: r.created_at,
+  };
+}
+
+/** Saved versions of a call type's prompt, newest first. */
+async function listRevisions(companyId, type, limit = 50) {
+  const { rows } = await db.query(
+    `SELECT ${REVISION_COLS} FROM call_type_prompt_revisions
+      WHERE company_id = $1 AND type = $2
+      ORDER BY created_at DESC, id DESC
+      LIMIT $3`,
+    [companyId, type, Math.min(Math.max(Number(limit) || 50, 1), 200)]
+  );
+  return rows.map(revisionToObject);
+}
+
+async function getRevision(companyId, type, revisionId) {
+  const { rows } = await db.query(
+    `SELECT ${REVISION_COLS} FROM call_type_prompt_revisions WHERE company_id = $1 AND type = $2 AND id = $3`,
+    [companyId, type, revisionId]
+  );
+  return rows[0] ? revisionToObject(rows[0]) : null;
 }
 
 /**
@@ -654,4 +768,4 @@ async function nameExists(companyId, name, excludeType) {
   return result.rowCount > 0;
 }
 
-module.exports = { BUILTIN_TYPES, BUILTIN_SEEDS, generateDefaultPrompts, generateDefaultVoicemailMessage, seedBuiltins, getAllByCompanyId, create, getByType, upsert, remove, nameExists };
+module.exports = { BUILTIN_TYPES, BUILTIN_SEEDS, SERVICE_LINK_SECTION, SERVICE_LINK_PROMPT_MARKER, generateDefaultPrompts, savePrompt, markRetellSync, listRevisions, getRevision, generateDefaultVoicemailMessage, seedBuiltins, getAllByCompanyId, create, getByType, upsert, remove, nameExists };

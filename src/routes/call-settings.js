@@ -153,19 +153,20 @@ router.patch("/", async (req, res) => {
       syncVoicemailToRetell(companyId, settings).catch(() => {});
     }
 
-    // Re-register Retell tools when a tool-affecting setting changes
-    // (agent_can_make_changes, service_link_enabled, …) — adds/removes the
-    // matching tools from the live agent. See TOOL_AFFECTING_SETTINGS.
+    // Update the live Retell agent when a tool-affecting setting changes
+    // (agent_can_make_changes, service_link_enabled, …): adds/removes the
+    // matching tools and, for service_link_enabled, the SERVICE LINK block of
+    // the confirmation prompt. Awaited, not fire-and-forget — on serverless
+    // the function can be frozen once the response is sent, and the UI needs
+    // to know whether the agent really changed. See TOOL_AFFECTING_SETTINGS.
     const { maybeResyncToolsAfterSettingsChange } = require("../services/retell-tools");
-    maybeResyncToolsAfterSettingsChange(companyId, Object.keys(fields)).catch((err) => {
-      logger.warn("Tool re-registration failed after call-settings update", { error: err.message });
-    });
+    const retellSync = await maybeResyncToolsAfterSettingsChange(companyId, Object.keys(fields));
 
     // No side effect needed for crm_comment_writeback_enabled — it's read live
     // per-company at call-analyzed time by the write-back service.
 
     const tz = await getCompanyTimezone(companyId);
-    return res.json({ call_settings: localizeFields(settings, tz, CALL_SETTINGS_TZ_FIELDS) });
+    return res.json({ call_settings: localizeFields(settings, tz, CALL_SETTINGS_TZ_FIELDS), retell_sync: retellSync });
   } catch (err) {
     logger.error("PATCH /call-settings failed", { error: err.message });
     return res.status(500).json({ error: "Failed to update call settings" });

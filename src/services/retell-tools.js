@@ -84,6 +84,13 @@ function applyWorkflowCapabilities(settings, workflow) {
   };
 }
 
+// Appended to every node's prompt when agent_can_make_changes is off. A managed
+// block like the SERVICE LINK one: never part of the user-editable prompt, and
+// shown read-only in the prompt editor (services/prompt-editor.js).
+const READ_ONLY_NOTE =
+  "\n\n[IMPORTANT: You are in read-only mode. Do NOT confirm, reschedule, or create appointments. " +
+  "Collect the customer's intent and preferences, let them know a team member will follow up, then end the call politely.]";
+
 /**
  * Push tools from tool_definitions DB → each subagent node in the company's
  * conversation flow. Respects agent_can_make_changes: when false, write tools
@@ -146,10 +153,7 @@ async function registerToolsForCompany(companyId) {
   const flow = await client.conversationFlow.retrieve(flowId);
   const nodes = flow.nodes ?? [];
 
-  const changeNote = canMakeChanges
-    ? ""
-    : "\n\n[IMPORTANT: You are in read-only mode. Do NOT confirm, reschedule, or create appointments. " +
-      "Collect the customer's intent and preferences, let them know a team member will follow up, then end the call politely.]";
+  const changeNote = canMakeChanges ? "" : READ_ONLY_NOTE;
 
   let updated = 0;
   for (const row of callTypeRows) {
@@ -223,28 +227,35 @@ const TOOL_AFFECTING_SETTINGS = ["agent_can_make_changes", "service_link_enabled
 /**
  * Re-register a company's Retell tools if any changed field affects tool
  * attachment (agent_can_make_changes, or a gated_by_setting column like
- * service_link_enabled). Best-effort — logs and swallows errors, since a
- * failed re-registration should never fail the settings update itself.
+ * service_link_enabled). Never throws — a failed Retell update must not fail
+ * the settings write itself — but RETURNS what happened, so callers can await
+ * it and tell the user whether the live agent actually changed. Callers should
+ * await it: on serverless (Vercel) work left running after the response is
+ * sent can be frozen before it reaches Retell.
  *
  * @param {number|string} companyId
  * @param {string[]} changedFieldNames — keys actually written by the update
+ * @returns {Promise<{status: "skipped"|"synced"|"failed", error?: string}>}
  */
 async function maybeResyncToolsAfterSettingsChange(companyId, changedFieldNames = []) {
   const affected = changedFieldNames.some((f) => TOOL_AFFECTING_SETTINGS.includes(f));
-  if (!affected) return;
+  if (!affected) return { status: "skipped" };
   try {
-    // service_link_enabled also decides whether the confirmation PROMPT has a
-    // SERVICE LINK section. Regenerate that first and await it: both steps
+    // service_link_enabled also decides whether the confirmation PROMPT gets
+    // its SERVICE LINK block. Push that first and await it: both steps
     // read-modify-write the same Retell flow's nodes, so running them
     // concurrently could drop one side's change. Lazy require, same as
     // retell-flow.js's own cross-require of this module.
     if (changedFieldNames.includes("service_link_enabled")) {
       const { ensureServiceLinkPromptCurrent } = require("./prompt-sync");
-      await ensureServiceLinkPromptCurrent(companyId);
+      const prompt = await ensureServiceLinkPromptCurrent(companyId);
+      if (!prompt.ok) throw new Error(prompt.error || "Could not update the agent prompt");
     }
     await registerToolsForCompany(companyId);
+    return { status: "synced" };
   } catch (err) {
-    logger.warn("maybeResyncToolsAfterSettingsChange: re-registration failed", { companyId, error: err.message });
+    logger.warn("maybeResyncToolsAfterSettingsChange: Retell update failed", { companyId, error: err.message });
+    return { status: "failed", error: err.message };
   }
 }
 
@@ -253,6 +264,7 @@ module.exports = {
   registerToolsForAllCompanies,
   maybeResyncToolsAfterSettingsChange,
   TOOL_AFFECTING_SETTINGS,
+  READ_ONLY_NOTE,
   getBaseUrl,
   applyWorkflowCapabilities,
 };
