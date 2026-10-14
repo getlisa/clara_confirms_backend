@@ -63,7 +63,7 @@ router.patch("/", async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
-    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled, crm_comment_writeback_enabled, service_link_enabled, channel_strategy, sms_on_callback_enabled, chat_link_delivery_method, confirmation_contact_types } = req.body;
+    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled, crm_comment_writeback_enabled, service_link_enabled, channel_strategy, sms_on_callback_enabled, chat_link_delivery_method, confirmation_contact_types, job_confirmation_inference_enabled } = req.body;
     const fields = {};
     if (business_hours_start !== undefined) fields.business_hours_start = business_hours_start;
     if (business_hours_end   !== undefined) fields.business_hours_end   = business_hours_end;
@@ -109,6 +109,11 @@ router.patch("/", async (req, res) => {
       if (typeof crm_comment_writeback_enabled !== "boolean")
         return res.status(400).json({ error: "crm_comment_writeback_enabled must be a boolean" });
       fields.crm_comment_writeback_enabled = crm_comment_writeback_enabled;
+    }
+    if (job_confirmation_inference_enabled !== undefined) {
+      if (typeof job_confirmation_inference_enabled !== "boolean")
+        return res.status(400).json({ error: "job_confirmation_inference_enabled must be a boolean" });
+      fields.job_confirmation_inference_enabled = job_confirmation_inference_enabled;
     }
     if (service_link_enabled !== undefined) {
       if (typeof service_link_enabled !== "boolean")
