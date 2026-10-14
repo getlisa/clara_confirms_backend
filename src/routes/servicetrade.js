@@ -26,7 +26,10 @@ router.use(authenticate);
 
 /**
  * POST /integrations/servicetrade/credentials
- * Log in to ServiceTrade with username/password (password not stored), save auth_code and connect.
+ * Log in to ServiceTrade with username/password, save the session (auth_code)
+ * and the password ENCRYPTED, so the backend can renew the session by itself
+ * forever after (services/servicetrade.js reauthenticate). The password is
+ * never returned or logged.
  * Body: { username, password, metadata? } — on reconnect, metadata is merged with existing.
  */
 router.post("/credentials", async (req, res) => {
@@ -48,11 +51,13 @@ router.post("/credentials", async (req, res) => {
       });
     }
     // Store the full Cookie header value (e.g. "PHPSESSID=abc") in auth_code.
-    // This survives indefinitely until ServiceTrade invalidates the session.
+    // ServiceTrade ends sessions on its own schedule; the encrypted password
+    // saved below is what lets us renew it without the user.
     // Also capture the ServiceTrade user id — needed to mint a service-link
     // token via GET /api/token?jobId=&userId= (see chat-links get_service_link tool).
     const mergedMetadata = { ...(metadata || {}), servicetrade_user_id: result.user?.id ?? null };
     await credentialsDb.upsert(companyId, username.trim(), result.cookie, mergedMetadata);
+    const autoReconnect = await credentialsDb.savePassword(companyId, password);
 
     // Best-effort: adopt the CRM's own timezone as this company's default_timezone
     // so all scheduling/dispatch calculations use it. Never fails the connect request.
@@ -63,6 +68,7 @@ router.post("/credentials", async (req, res) => {
     return res.json({
       connected: true,
       user: result.user,
+      auto_reconnect: autoReconnect,
       message: "Connected to ServiceTrade",
     });
   } catch (err) {
@@ -76,12 +82,27 @@ router.post("/credentials", async (req, res) => {
 
 /**
  * POST /integrations/servicetrade/login
- * Cannot re-login without password; password is not stored. Use POST /credentials with username and password to connect.
+ * Renew the ServiceTrade session now using the stored (encrypted) password.
+ * Normally unnecessary — every request and the keep-alive cron renew it on
+ * their own — but useful as a manual "reconnect" button.
  */
 router.post("/login", async (req, res) => {
-  return res.status(400).json({
-    error: "Password is not stored. Use POST /credentials with username and password to connect.",
-  });
+  const companyId = req.user.companyId;
+  try {
+    const cookie = await servicetrade.reauthenticate(companyId, null, null);
+    const health = await credentialsDb.getAuthHealth(companyId);
+    if (!cookie) {
+      return res.status(409).json({
+        connected: false,
+        needs_reconnect: true,
+        error: health.auth_error || "Could not renew the ServiceTrade session. Connect again with username and password.",
+      });
+    }
+    return res.json({ connected: true, auto_reconnect: health.auto_reconnect, message: "ServiceTrade session renewed" });
+  } catch (err) {
+    logger.error("ServiceTrade manual re-login error", { error: err.message });
+    return res.status(502).json({ connected: false, error: "ServiceTrade request failed" });
+  }
 });
 
 /**
@@ -163,12 +184,21 @@ router.get("/status", async (req, res) => {
       });
     }
 
-    const session = await servicetrade.getSession(companyId, creds.authCode);
+    let session = await servicetrade.getSession(companyId, creds.authCode);
+    if (!session) {
+      // Expired: renew it from the stored password before reporting anything.
+      const fresh = await servicetrade.reauthenticate(companyId, creds, creds.authCode);
+      if (fresh) session = await servicetrade.getSession(companyId, fresh);
+    }
+    const health = await credentialsDb.getAuthHealth(companyId);
     if (session) {
       return res.json({
         connected: true,
         user: session.user,
         hasCredentials: true,
+        auto_reconnect: health.auto_reconnect,
+        last_login_at: health.last_login_at,
+        needs_reconnect: false,
         sync: await buildSyncStatus(companyId),
       });
     }
@@ -176,7 +206,11 @@ router.get("/status", async (req, res) => {
     return res.json({
       connected: false,
       hasCredentials: false,
-      message: "Session expired or invalid. Connect again with username and password.",
+      auto_reconnect: health.auto_reconnect,
+      needs_reconnect: true,
+      auth_error: health.auth_error,
+      auth_error_at: health.auth_error_at,
+      message: health.auth_error || "Session expired or invalid. Connect again with username and password.",
     });
   } catch (err) {
     logger.error("ServiceTrade status error", { error: err.message });
