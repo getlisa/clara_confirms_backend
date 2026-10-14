@@ -19,7 +19,7 @@ stub("utils/logger", silentLogger());
 const queries = [];
 stub("db", { query: async (sql, params) => { queries.push({ sql, params }); return { rows: [] }; } });
 stub("services/retell", {});
-stub("services/retell-flow", { syncFlowForCompany: async () => {}, CHAT_SESSION_INSTRUCTION: "chat instruction" });
+stub("services/retell-flow", { syncFlowForCompany: async () => {} });
 stub("db/service-line-descriptions", { listByCompany: async () => [] });
 
 let resolvedCompanyId = null;
@@ -30,11 +30,17 @@ stub("services/crm", {
   },
 });
 
+let serviceLinkEnabled = true;
+stub("db/call-settings", { getByCompanyId: async () => ({ service_link_enabled: serviceLinkEnabled }) });
+
 let workflowPassedToGetWorkflow = null;
+let crmSupportsServiceLink = false;
+const { withServiceLinkSetting } = require("../src/confirmation-agent/workflows");
 stub("confirmation-agent/workflows", {
+  withServiceLinkSetting,
   getWorkflow: (slug) => {
     workflowPassedToGetWorkflow = slug;
-    return { slug, capabilities: { serviceLink: false, slotSuggestion: true, cancellationReason: "optional" } };
+    return { slug, capabilities: { serviceLink: crmSupportsServiceLink, slotSuggestion: true, cancellationReason: "optional" } };
   },
 });
 
@@ -65,4 +71,29 @@ test("the UPDATE actually written carries the workflow-shaped prompt (no SERVICE
   assert.ok(update, "expected an UPDATE call_type_configs query");
   const [, generalPrompt] = update.params;
   assert.doesNotMatch(generalPrompt, /SERVICE LINK/);
+});
+
+// ── the company's "Email the service link after confirmation" setting ──────
+
+async function writtenPrompt() {
+  queries.length = 0;
+  await resetDefaultPrompts(4242);
+  return queries.find((q) => /UPDATE call_type_configs/.test(q.sql)).params[1];
+}
+
+test("CRM supports the service link AND the setting is on → SERVICE LINK section is written", async () => {
+  crmSupportsServiceLink = true; serviceLinkEnabled = true;
+  assert.match(await writtenPrompt(), /━━━ SERVICE LINK/);
+});
+
+test("CRM supports the service link but the setting is off → no SERVICE LINK section", async () => {
+  crmSupportsServiceLink = true; serviceLinkEnabled = false;
+  const p = await writtenPrompt();
+  assert.doesNotMatch(p, /SERVICE LINK/);
+  assert.doesNotMatch(p, /resolve_service_link_contact/);
+});
+
+test("setting on but the CRM has no service link (InspectPoint) → still no SERVICE LINK section", async () => {
+  crmSupportsServiceLink = false; serviceLinkEnabled = true;
+  assert.doesNotMatch(await writtenPrompt(), /SERVICE LINK/);
 });

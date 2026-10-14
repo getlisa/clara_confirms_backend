@@ -36,9 +36,27 @@ function getWorkflow(slug) {
   return workflows.get(slug) || workflows.get(servicetrade.slug);
 }
 
+/**
+ * The workflow as THIS company actually runs it: the CRM decides whether a
+ * service link can exist at all, the company's call_settings.service_link_enabled
+ * ("Email the service link after confirmation") decides whether it is used.
+ * Both must be true. Every surface that offers the link — voice prompt
+ * (prompt-sync.js), chat prompt + tools (graph/build.js), chat bootstrap
+ * capabilities (chat-links.js) — reads it through here, so the prompt, the
+ * tools and the widget can never disagree about it. Same rule
+ * services/retell-tools.js's applyWorkflowCapabilities applies to voice tools.
+ */
+function withServiceLinkSetting(workflow, serviceLinkEnabled) {
+  const crmSupports = workflow.capabilities?.serviceLink !== false;
+  return {
+    ...workflow,
+    capabilities: { ...workflow.capabilities, serviceLink: crmSupports && serviceLinkEnabled === true },
+  };
+}
+
 register(servicetrade);
 register(inspectpoint);
 register(csv);
 register(zentrades);
 
-module.exports = { register, getWorkflow };
+module.exports = { register, getWorkflow, withServiceLinkSetting };

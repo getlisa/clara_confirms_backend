@@ -15,6 +15,7 @@
  */
 
 const chatLinksDb = require("../db/chat-links");
+const callSettingsDb = require("../db/call-settings");
 const { HYDRATORS } = require("./call-hydration");
 const db = require("../db");
 const confirmationAgent = require("../confirmation-agent");
@@ -26,7 +27,7 @@ const { buildAppointmentCards } = require("../confirmation-agent/appointment-car
 const onsiteInstructionsDb = require("../db/onsite-instructions");
 const serviceLinkMessagesDb = require("../db/service-link-messages");
 const { resolveSlugForCompany } = require("./crm");
-const { getWorkflow } = require("../confirmation-agent/workflows");
+const { getWorkflow, withServiceLinkSetting } = require("../confirmation-agent/workflows");
 
 /**
  * The job's service-link status/url for THIS conversation (service_link_messages
@@ -371,7 +372,14 @@ async function resolveChatLink(token) {
   // routes/chat-links.js stops requiring `args.reason` on a cancel trigger for
   // those CRMs, and without this flag the widget has no way to know it can let
   // the customer skip it (see docs/inspectpoint-integration-frontend.md §4.11).
-  const workflow = getWorkflow(await resolveSlugForCompany(link.company_id));
+  // service_link additionally needs the company's own "Email the service
+  // link after confirmation" setting — the agent only offers it then (see
+  // withServiceLinkSetting), so the widget must not show it otherwise.
+  const linkSettings = await callSettingsDb.getByCompanyId(link.company_id);
+  const workflow = withServiceLinkSetting(
+    getWorkflow(await resolveSlugForCompany(link.company_id)),
+    linkSettings?.service_link_enabled
+  );
 
   return {
     ok: true,

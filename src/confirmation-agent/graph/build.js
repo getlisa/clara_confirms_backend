@@ -36,7 +36,8 @@ const { logCall } = require("../../db/llm-call-logs");
 const serviceLineDescriptionsDb = require("../../db/service-line-descriptions");
 const onsiteInstructionsDb = require("../../db/onsite-instructions");
 const { resolveSlugForCompany } = require("../../services/crm");
-const { getWorkflow } = require("../workflows");
+const { getWorkflow, withServiceLinkSetting } = require("../workflows");
+const callSettingsDb = require("../../db/call-settings");
 const db = require("../../db");
 const { PROPOSE_REMAINING_TRIGGER, parseCardTrigger } = require("../actions");
 const logger = require("../../utils/logger");
@@ -64,6 +65,11 @@ const ConfirmationState = Annotation.Root({
   // shapes this turn's prompt/tool surface. Refreshed alongside jobCtx
   // (cheap, and a company could in principle switch CRMs mid-conversation).
   workflowSlug: Annotation({ reducer: (_prev, next) => next ?? _prev, default: () => "servicetrade" }),
+  // call_settings.service_link_enabled ("Email the service link after
+  // confirmation"). Narrows the workflow's serviceLink capability so the
+  // SERVICE LINK prompt section and its tools only appear when the company
+  // has it on. Refreshed with the rest of the context every turn.
+  serviceLinkEnabled: Annotation({ reducer: (_prev, next) => next ?? _prev, default: () => false }),
 });
 
 function phaseFromContext(ctx) {
@@ -113,14 +119,15 @@ async function buildGraph() {
     const { companyId, jobId, threadId, linkAppointmentId } = config?.configurable?.ctx || {};
     // None of these three depend on each other's result — run concurrently
     // rather than paying for three sequential round trips on every turn.
-    const [ctx, confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug] = await Promise.all([
+    const [ctx, confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug, callSettings] = await Promise.all([
       buildJobConfirmationContext(companyId, jobId),
       resolveConfirmedByOther(companyId, linkAppointmentId, threadId),
       serviceLineDescriptionsDb.listByCompany(companyId),
       onsiteInstructionsDb.listByCompany(companyId),
       resolveSlugForCompany(companyId),
+      callSettingsDb.getByCompanyId(companyId),
     ]);
-    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug };
+    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug, serviceLinkEnabled: callSettings?.service_link_enabled === true };
   }
 
   async function agentNode(state, config) {
@@ -159,7 +166,9 @@ async function buildGraph() {
     // turn. Falls back to ServiceTrade if somehow unset (getWorkflow's own
     // fallback), never to an error — a workflow lookup must never be able
     // to break a live turn.
-    const workflow = getWorkflow(state.workflowSlug);
+    // Narrowed by the company's service-link setting, so the prompt and the
+    // bound tools agree on whether the service link is offered at all.
+    const workflow = withServiceLinkSetting(getWorkflow(state.workflowSlug), state.serviceLinkEnabled);
 
     const tools = getToolsForPhase(state.phase, { isOpeningTurn, exclusiveTool, workflow });
     // state.jobCtx (buildJobConfirmationContext's raw result) has no `phase`
@@ -265,14 +274,15 @@ async function buildGraph() {
 
   async function recomputeContext(_state, config) {
     const { companyId, jobId, threadId, linkAppointmentId } = config?.configurable?.ctx || {};
-    const [ctx, confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug] = await Promise.all([
+    const [ctx, confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug, callSettings] = await Promise.all([
       buildJobConfirmationContext(companyId, jobId),
       resolveConfirmedByOther(companyId, linkAppointmentId, threadId),
       serviceLineDescriptionsDb.listByCompany(companyId),
       onsiteInstructionsDb.listByCompany(companyId),
       resolveSlugForCompany(companyId),
+      callSettingsDb.getByCompanyId(companyId),
     ]);
-    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug };
+    return { jobCtx: ctx, phase: phaseFromContext(ctx), confirmedByOtherLabel, serviceLineDescriptions, onsiteInstructions, workflowSlug, serviceLinkEnabled: callSettings?.service_link_enabled === true };
   }
 
   const checkpointer = await getCheckpointer();

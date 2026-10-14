@@ -17,8 +17,12 @@ stub("db/onsite-instructions", { listByCompany: async () => [] });
 stub("db/service-link-messages", { getByRetellCallId: async () => null });
 
 let slug = "servicetrade";
+let serviceLinkEnabled = true;
+stub("db/call-settings", { getByCompanyId: async () => ({ service_link_enabled: serviceLinkEnabled }) });
 stub("services/crm", { resolveSlugForCompany: async () => slug });
+const { withServiceLinkSetting } = require("../src/confirmation-agent/workflows");
 stub("confirmation-agent/workflows", {
+  withServiceLinkSetting,
   getWorkflow: (s) => s === "inspectpoint"
     ? { slug: "inspectpoint", capabilities: { serviceLink: false, slotSuggestion: true, cancellationReason: "optional" } }
     : { slug: "servicetrade", capabilities: { serviceLink: true, slotSuggestion: false } },
@@ -28,13 +32,22 @@ const svc = require("../src/services/chat-links");
 
 test("bootstrap exposes ServiceTrade capabilities: reason required, service link on", async () => {
   slug = "servicetrade";
+  serviceLinkEnabled = true;
   const r = await svc.resolveChatLink("t");
   assert.equal(r.crm, "servicetrade");
   assert.deepEqual(r.capabilities, { service_link: true, slot_suggestion: false, cancellation_reason: "required" });
 });
 
+test("ServiceTrade company with \"Email the service link after confirmation\" off: widget must not offer the service link", async () => {
+  slug = "servicetrade";
+  serviceLinkEnabled = false;
+  const r = await svc.resolveChatLink("t");
+  assert.equal(r.capabilities.service_link, false);
+});
+
 test("bootstrap exposes InspectPoint capabilities — the flag the widget needs to allow an empty cancel reason", async () => {
   slug = "inspectpoint";
+  serviceLinkEnabled = true; // the CRM can't do it, so the setting can't turn it on
   const r = await svc.resolveChatLink("t");
   assert.equal(r.crm, "inspectpoint");
   assert.deepEqual(r.capabilities, { service_link: false, slot_suggestion: true, cancellation_reason: "optional" });
