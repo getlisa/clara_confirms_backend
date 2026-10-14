@@ -8,11 +8,11 @@
  * carry no dangling reference to it, and cancellation-reason phrasing softens
  * when the workflow marks it optional.
  *
- * The SERVICE LINK section is opt-in: only capabilities.serviceLink === true
- * includes it. prompt-sync.js sets that from the CRM AND the company's
- * call_settings.service_link_enabled ("Email the service link after
- * confirmation"), via withServiceLinkSetting. Omitting `workflow` (fresh-company
- * seeding) therefore means no section — the setting defaults to off.
+ * The SERVICE LINK section is never part of the generated (user-editable)
+ * prompt, for any workflow: it is the managed SERVICE_LINK_SECTION block that
+ * prompt-sync.js's composeRetellPrompt appends at push time, only while the
+ * company has "Email the service link after confirmation" on. CASE B therefore
+ * refers to it conditionally.
  */
 
 const test = require("node:test");
@@ -34,37 +34,34 @@ const INSPECTPOINT_WORKFLOW = {
   capabilities: { serviceLink: false, slotSuggestion: true, cancellationReason: "optional" },
 };
 
-test("no workflow argument (fresh-company seeding) omits the SERVICE LINK section — the setting defaults to off", () => {
-  const result = generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc");
-  assert.doesNotMatch(result.general_prompt, /SERVICE LINK/);
-  assert.doesNotMatch(result.general_prompt, /resolve_service_link_contact|get_service_link/);
-  assert.match(result.general_prompt, /thank them and wrap up/);
-  assert.match(result.general_prompt, /Can I ask why you'd like to cancel/);
+const MARKER = "━━━ SERVICE LINK";
+const { SERVICE_LINK_SECTION, SERVICE_LINK_PROMPT_MARKER } = require("../src/db/call-type-configs");
+
+test("the generated prompt never contains the SERVICE LINK section, whatever the workflow", () => {
+  for (const wf of [undefined, SERVICETRADE_WORKFLOW, INSPECTPOINT_WORKFLOW]) {
+    const { general_prompt } = generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc", wf);
+    assert.ok(!general_prompt.includes(MARKER), `section leaked for ${wf?.slug || "no workflow"}`);
+    assert.doesNotMatch(general_prompt, /resolve_service_link_contact/);
+  }
 });
 
-test("serviceLink:true (CRM supports it AND the company enabled it) includes the SERVICE LINK section", () => {
-  const result = generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc", SERVICETRADE_WORKFLOW);
-  assert.match(result.general_prompt, /━━━ SERVICE LINK/);
-  assert.match(result.general_prompt, /go to the SERVICE LINK section/);
-  assert.match(result.general_prompt, /resolve_service_link_contact/);
+test("CASE B points at the SERVICE LINK section only if it is present, else wraps up", () => {
+  const { general_prompt } = generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc", SERVICETRADE_WORKFLOW);
+  assert.match(general_prompt, /If these instructions include a SERVICE LINK section, go to it now; otherwise wrap up/);
 });
 
-test("ServiceTrade with the setting off produces the same prompt as no workflow, byte for byte", () => {
-  const off = generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc",
-    { ...SERVICETRADE_WORKFLOW, capabilities: { ...SERVICETRADE_WORKFLOW.capabilities, serviceLink: false } });
-  const seeded = generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc");
-  assert.deepEqual(off, seeded);
+test("the managed SERVICE_LINK_SECTION block carries the full service-link flow and its marker", () => {
+  assert.ok(SERVICE_LINK_SECTION.startsWith(SERVICE_LINK_PROMPT_MARKER));
+  assert.match(SERVICE_LINK_SECTION, /resolve_service_link_contact/);
+  assert.match(SERVICE_LINK_SECTION, /email_confirmed=true/);
+  assert.match(SERVICE_LINK_SECTION, /Do NOT call get_service_link/);
 });
 
-test("serviceLink:false (InspectPoint) omits the SERVICE LINK section entirely", () => {
-  const result = generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc", INSPECTPOINT_WORKFLOW);
-  assert.doesNotMatch(result.general_prompt, /SERVICE LINK/);
-});
-
-test("serviceLink:false (InspectPoint) leaves no dangling CASE B reference to the omitted section", () => {
-  const result = generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc", INSPECTPOINT_WORKFLOW);
-  assert.doesNotMatch(result.general_prompt, /go to the SERVICE LINK section/);
-  assert.match(result.general_prompt, /thank them and wrap up/);
+test("ServiceTrade and no-workflow defaults are identical (only cancellation phrasing is workflow-shaped)", () => {
+  assert.deepEqual(
+    generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc", SERVICETRADE_WORKFLOW),
+    generateDefaultPrompts("customer_confirmation", "Customer Confirmation", "desc"),
+  );
 });
 
 test("cancellationReason:optional (InspectPoint) softens the cancel-reason ask", () => {

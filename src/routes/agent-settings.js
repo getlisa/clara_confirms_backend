@@ -3,6 +3,7 @@ const agentSettingsDb = require("../db/agent-settings");
 const callTypeConfigsDb = require("../db/call-type-configs");
 const { authenticate, getCompanyId } = require("../auth");
 const { syncFlowForCompany } = require("../services/retell-flow");
+const promptEditor = require("../services/prompt-editor");
 const retell = require("../services/retell");
 const logger = require("../utils/logger");
 
@@ -194,24 +195,48 @@ router.post("/call-types", async (req, res) => {
   }
 });
 
+// Prompt edits change what the live agent says on every call, so they are
+// admin-only. Other call-type fields keep their existing (any-user) access.
+function requireAdminForPrompt(req, res) {
+  if (req.user?.role !== "admin") {
+    res.status(403).json({ error: "Only admins can edit the agent prompt" });
+    return false;
+  }
+  return true;
+}
+
+// Errors from services/prompt-editor.js carry an HTTP status; 409 also carries
+// the current row so the editor can show what changed.
+function sendPromptError(res, err, label) {
+  if (err.status === 409) {
+    return res.status(409).json({ error: err.message, code: "version_conflict", current: err.current });
+  }
+  if (err.status === 400) {
+    return res.status(400).json({ error: err.message, code: "invalid_prompt", validation: err.validation });
+  }
+  if (err.status === 404) return res.status(404).json({ error: err.message });
+  logger.error(`${label} failed`, { error: err.message });
+  return res.status(500).json({ error: "Failed to update the agent prompt" });
+}
+
 router.patch("/call-types/:type", async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
     const { type } = req.params;
-    const { enabled, begin_message, general_prompt, name, description } = req.body;
+    const { enabled, begin_message, general_prompt, name, description, expected_version } = req.body;
     const fields = {};
 
     if (enabled !== undefined) fields.enabled = Boolean(enabled);
     if (begin_message !== undefined) fields.begin_message = begin_message;
-    if (general_prompt !== undefined) fields.general_prompt = general_prompt;
     if (name !== undefined) fields.name = String(name).trim();
     if (description !== undefined) fields.description = String(description).trim();
 
-    if (Object.keys(fields).length === 0) {
+    if (Object.keys(fields).length === 0 && general_prompt === undefined) {
       return res.status(400).json({ error: "No fields to update" });
     }
+    if (general_prompt !== undefined && !requireAdminForPrompt(req, res)) return;
 
     if (fields.name && !callTypeConfigsDb.BUILTIN_TYPES.includes(type)) {
       if (await callTypeConfigsDb.nameExists(companyId, fields.name, type)) {
@@ -219,22 +244,146 @@ router.patch("/call-types/:type", async (req, res) => {
       }
     }
 
-    const call_type = await callTypeConfigsDb.upsert(companyId, type, fields);
-    if (!call_type) return res.status(404).json({ error: "Call type not found" });
-
-    // Sync flow whenever prompt or structure changes
-    const promptChanged = fields.begin_message !== undefined || fields.general_prompt !== undefined;
-    const structureChanged = fields.name !== undefined || fields.enabled !== undefined;
-    if (promptChanged || structureChanged) {
-      syncFlowForCompany(companyId).catch((err) =>
-        logger.error("Retell flow sync failed after call-type update", { companyId, type, error: err.message })
-      );
+    let call_type = null;
+    if (Object.keys(fields).length) {
+      call_type = await callTypeConfigsDb.upsert(companyId, type, fields);
+      if (!call_type) return res.status(404).json({ error: "Call type not found" });
     }
 
-    return res.json({ call_type });
+    // The prompt itself: validated, version-checked, revisioned, pushed to
+    // Retell and awaited (services/prompt-editor.js).
+    let retell_sync = null;
+    let warnings = [];
+    if (general_prompt !== undefined) {
+      const result = await promptEditor.savePromptAndSync(companyId, type, {
+        generalPrompt: general_prompt,
+        expectedVersion: expected_version ?? null,
+        userId: req.user?.userId ?? null,
+      });
+      ({ call_type, retell_sync, warnings } = result);
+    }
+
+    // Name/enabled change the flow's STRUCTURE (nodes, router), which only a
+    // full flow sync rebuilds. Awaited: on serverless, work left running after
+    // the response can be frozen before it reaches Retell.
+    const structureChanged = fields.name !== undefined || fields.enabled !== undefined;
+    if (structureChanged) {
+      try {
+        await syncFlowForCompany(companyId);
+        retell_sync = { status: "synced" };
+      } catch (err) {
+        logger.error("Retell flow sync failed after call-type update", { companyId, type, error: err.message });
+        retell_sync = { status: "failed", error: err.message };
+      }
+      call_type = await callTypeConfigsDb.getByType(companyId, type);
+    }
+
+    return res.json({ call_type, retell_sync, warnings });
   } catch (err) {
-    logger.error("PATCH /agent-settings/call-types/:type failed", { error: err.message });
-    return res.status(500).json({ error: "Failed to update call type config" });
+    return sendPromptError(res, err, "PATCH /agent-settings/call-types/:type");
+  }
+});
+
+// ── Prompt editor ─────────────────────────────────────────────────────────────
+
+// Everything the editor screen needs: the prompt, its default, the managed
+// blocks appended at push time, and the exact text Retell gets.
+router.get("/call-types/:type/prompt", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    return res.json(await promptEditor.getEditorView(companyId, req.params.type));
+  } catch (err) {
+    return sendPromptError(res, err, "GET /agent-settings/call-types/:type/prompt");
+  }
+});
+
+// Dry-run validation while the user types. Saves nothing.
+router.post("/call-types/:type/prompt/validate", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    if (!(await callTypeConfigsDb.getByType(companyId, req.params.type))) {
+      return res.status(404).json({ error: "Call type not found" });
+    }
+    return res.json(await promptEditor.validatePrompt(companyId, req.params.type, req.body?.general_prompt));
+  } catch (err) {
+    return sendPromptError(res, err, "POST /agent-settings/call-types/:type/prompt/validate");
+  }
+});
+
+router.put("/call-types/:type/prompt", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    if (!requireAdminForPrompt(req, res)) return;
+    const { general_prompt, expected_version } = req.body || {};
+    if (general_prompt === undefined) return res.status(400).json({ error: "general_prompt is required", code: "invalid_prompt" });
+    return res.json(await promptEditor.savePromptAndSync(companyId, req.params.type, {
+      generalPrompt: general_prompt,
+      expectedVersion: expected_version ?? null,
+      userId: req.user?.userId ?? null,
+    }));
+  } catch (err) {
+    return sendPromptError(res, err, "PUT /agent-settings/call-types/:type/prompt");
+  }
+});
+
+router.post("/call-types/:type/prompt/reset", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    if (!requireAdminForPrompt(req, res)) return;
+    return res.json(await promptEditor.resetToDefault(companyId, req.params.type, {
+      expectedVersion: req.body?.expected_version ?? null,
+      userId: req.user?.userId ?? null,
+    }));
+  } catch (err) {
+    return sendPromptError(res, err, "POST /agent-settings/call-types/:type/prompt/reset");
+  }
+});
+
+// Retry pushing the stored prompt to Retell (after a failed sync).
+router.post("/call-types/:type/prompt/sync", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    if (!requireAdminForPrompt(req, res)) return;
+    if (!(await callTypeConfigsDb.getByType(companyId, req.params.type))) {
+      return res.status(404).json({ error: "Call type not found" });
+    }
+    const retell_sync = await promptEditor.syncToRetell(companyId, req.params.type);
+    const call_type = await callTypeConfigsDb.getByType(companyId, req.params.type);
+    return res.json({ call_type, retell_sync });
+  } catch (err) {
+    return sendPromptError(res, err, "POST /agent-settings/call-types/:type/prompt/sync");
+  }
+});
+
+router.get("/call-types/:type/prompt/revisions", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    const revisions = await callTypeConfigsDb.listRevisions(companyId, req.params.type, req.query.limit);
+    return res.json({ revisions });
+  } catch (err) {
+    return sendPromptError(res, err, "GET /agent-settings/call-types/:type/prompt/revisions");
+  }
+});
+
+router.post("/call-types/:type/prompt/revisions/:revisionId/restore", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    if (!requireAdminForPrompt(req, res)) return;
+    const revisionId = Number(req.params.revisionId);
+    if (!Number.isInteger(revisionId) || revisionId <= 0) return res.status(400).json({ error: "Invalid revision id" });
+    return res.json(await promptEditor.restoreRevision(companyId, req.params.type, revisionId, {
+      expectedVersion: req.body?.expected_version ?? null,
+      userId: req.user?.userId ?? null,
+    }));
+  } catch (err) {
+    return sendPromptError(res, err, "POST /agent-settings/call-types/:type/prompt/revisions/:revisionId/restore");
   }
 });
 

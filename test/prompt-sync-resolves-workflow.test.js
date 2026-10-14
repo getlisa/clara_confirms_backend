@@ -70,30 +70,25 @@ test("the UPDATE actually written carries the workflow-shaped prompt (no SERVICE
   const update = queries.find((q) => /UPDATE call_type_configs/.test(q.sql));
   assert.ok(update, "expected an UPDATE call_type_configs query");
   const [, generalPrompt] = update.params;
-  assert.doesNotMatch(generalPrompt, /SERVICE LINK/);
+  assert.ok(!generalPrompt.includes("━━━ SERVICE LINK"));
 });
 
-// ── the company's "Email the service link after confirmation" setting ──────
+// ── never the SERVICE LINK section; never an edited prompt ─────────────────
 
-async function writtenPrompt() {
+async function writtenUpdate() {
   queries.length = 0;
   await resetDefaultPrompts(4242);
-  return queries.find((q) => /UPDATE call_type_configs/.test(q.sql)).params[1];
+  return queries.find((q) => /UPDATE call_type_configs/.test(q.sql));
 }
 
-test("CRM supports the service link AND the setting is on → SERVICE LINK section is written", async () => {
+test("reset never writes the SERVICE LINK section, even with the CRM supporting it and the setting on", async () => {
   crmSupportsServiceLink = true; serviceLinkEnabled = true;
-  assert.match(await writtenPrompt(), /━━━ SERVICE LINK/);
+  const update = await writtenUpdate();
+  assert.ok(!update.params[1].includes("━━━ SERVICE LINK"));
 });
 
-test("CRM supports the service link but the setting is off → no SERVICE LINK section", async () => {
-  crmSupportsServiceLink = true; serviceLinkEnabled = false;
-  const p = await writtenPrompt();
-  assert.doesNotMatch(p, /SERVICE LINK/);
-  assert.doesNotMatch(p, /resolve_service_link_contact/);
-});
-
-test("setting on but the CRM has no service link (InspectPoint) → still no SERVICE LINK section", async () => {
-  crmSupportsServiceLink = false; serviceLinkEnabled = true;
-  assert.doesNotMatch(await writtenPrompt(), /SERVICE LINK/);
+test("reset skips prompts the user edited (prompt_customized) and bumps the version it does write", async () => {
+  const update = await writtenUpdate();
+  assert.match(update.sql, /prompt_customized = false/);
+  assert.match(update.sql, /prompt_version = prompt_version \+ 1/);
 });

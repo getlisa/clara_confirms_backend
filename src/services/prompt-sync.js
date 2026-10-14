@@ -45,40 +45,58 @@ async function buildOnsiteExpectationsBlock(companyId) {
 }
 
 /**
+ * The default prompt this company would get for a call type right now — what
+ * "Reset to default" writes, and what the editor diffs against.
+ *
+ * Built-in types: the code default for the company's CRM workflow, plus (for
+ * customer_confirmation) its onsite-expectation notes. Appending those here,
+ * rather than at push time, keeps the stored prompt the source of truth, so
+ * every path that pushes it carries the block without knowing about it.
+ * User-created types: the generic default derived from their name/description.
+ * The SERVICE LINK block is never part of it — composeRetellPrompt adds that
+ * at push time.
+ */
+async function buildDefaultPromptForCompany(companyId, type) {
+  const seed = callTypeConfigsDb.BUILTIN_SEEDS.find((s) => s.type === type);
+  if (!seed) {
+    const { rows } = await db.query(
+      `SELECT name, description FROM call_type_configs WHERE company_id = $1 AND type = $2`,
+      [companyId, type]
+    );
+    if (!rows[0]) return null;
+    return callTypeConfigsDb.generateDefaultPrompts(type, rows[0].name, rows[0].description || "");
+  }
+  const workflow = getWorkflow(await resolveSlugForCompany(companyId));
+  const { begin_message, general_prompt } = callTypeConfigsDb.generateDefaultPrompts(
+    seed.type, seed.name, seed.description, workflow
+  );
+  const extra = type === "customer_confirmation" ? await buildOnsiteExpectationsBlock(companyId) : "";
+  return { begin_message, general_prompt: general_prompt + extra };
+}
+
+/**
  * Reset DB prompts for all built-in call types for a company back to the
  * current defaults from generateDefaultPrompts().
- * Only overwrites is_custom = false rows.
+ * Only overwrites is_custom = false rows, and never a prompt the user edited
+ * (prompt_customized) — automatic resets must not erase their work; only the
+ * editor's explicit "Reset to default" (routes/agent-settings.js) clears that.
+ * Bumps prompt_version so an editor open on the old text gets a 409 on save
+ * instead of silently overwriting the regenerated prompt.
  */
 async function resetDefaultPrompts(companyId, types = null) {
   const seeds = callTypeConfigsDb.BUILTIN_SEEDS.filter(
     s => !types || types.includes(s.type)
   );
-  // The CRM's workflow, narrowed by the company's own "Email the service link
-  // after confirmation" toggle — the SERVICE LINK section is generated only
-  // when both allow it (see withServiceLinkSetting).
-  const settings = await callSettingsDb.getByCompanyId(companyId);
-  const workflow = withServiceLinkSetting(
-    getWorkflow(await resolveSlugForCompany(companyId)),
-    settings?.service_link_enabled
-  );
   let updated = 0;
   for (const seed of seeds) {
-    const { begin_message, general_prompt } = callTypeConfigsDb.generateDefaultPrompts(
-      seed.type, seed.name, seed.description, workflow
-    );
-    // Only the confirmation prompt carries onsite expectations, and only for
-    // companies that have any. Appending here (rather than at push time) keeps
-    // the stored prompt the source of truth, so every path that pushes it —
-    // prompt-sync and retell-flow — carries the block without knowing about it.
-    const extra = seed.type === "customer_confirmation"
-      ? await buildOnsiteExpectationsBlock(companyId)
-      : "";
+    const { begin_message, general_prompt } = await buildDefaultPromptForCompany(companyId, seed.type);
 
     const result = await db.query(
       `UPDATE call_type_configs
-       SET begin_message = $1, general_prompt = $2, updated_at = NOW()
-       WHERE company_id = $3 AND type = $4 AND is_custom = false`,
-      [begin_message, general_prompt + extra, companyId, seed.type]
+       SET begin_message = $1, general_prompt = $2, prompt_version = prompt_version + 1, updated_at = NOW()
+       WHERE company_id = $3 AND type = $4 AND is_custom = false AND prompt_customized = false
+         AND (general_prompt IS DISTINCT FROM $2 OR begin_message IS DISTINCT FROM $1)`,
+      [begin_message, general_prompt, companyId, seed.type]
     );
     if (result.rowCount > 0) {
       updated++;
@@ -112,6 +130,40 @@ async function resetDefaultPromptsForAllCompanies(types = null) {
  * @param {number} companyId
  * @param {string[]} [types]  — limit to specific call types (default: all)
  */
+/**
+ * Whether this company's confirmation prompt gets the SERVICE LINK block:
+ * its CRM must support a service link AND "Email the service link after
+ * confirmation" (call_settings.service_link_enabled) must be on.
+ */
+async function isServiceLinkOn(companyId) {
+  const settings = await callSettingsDb.getByCompanyId(companyId);
+  const workflow = withServiceLinkSetting(getWorkflow(await resolveSlugForCompany(companyId)), settings?.service_link_enabled);
+  return workflow.capabilities.serviceLink === true;
+}
+
+/**
+ * The exact instruction text a call type's Retell node should carry: the
+ * stored (user-editable) general_prompt, then the system-managed blocks.
+ *
+ *  - SERVICE LINK (customer_confirmation only, when serviceLinkOn) — appended
+ *    here rather than stored, so toggling the setting never touches the
+ *    user's text. Skipped if the stored prompt already carries the section
+ *    itself, so a pasted-in copy never doubles up.
+ *  - The read-only note (registerToolsForCompany owns it) is preserved by the
+ *    caller from the node's current text, as before.
+ *
+ * Exported for the prompt editor's "what the agent will actually get" view.
+ */
+function composeRetellPrompt(type, generalPrompt, { serviceLinkOn = false, readOnlyNote = "" } = {}) {
+  let text = generalPrompt || "";
+  if (type === "customer_confirmation" && serviceLinkOn && !text.includes(callTypeConfigsDb.SERVICE_LINK_PROMPT_MARKER)) {
+    text += `\n\n${callTypeConfigsDb.SERVICE_LINK_SECTION}`;
+  }
+  return text + (readOnlyNote || "");
+}
+
+const READ_ONLY_NOTE_RE = /\n\n\[IMPORTANT: You are in read-only mode[\s\S]*?\]/;
+
 async function syncPromptsForCompany(companyId, types = null) {
   // Fetch call type configs with Retell node IDs
   const { rows } = await db.query(
@@ -132,10 +184,19 @@ async function syncPromptsForCompany(companyId, types = null) {
 
   const flowId = rows[0].retell_llm_id;
   const client = retell.getClient();
-  const flow = await client.conversationFlow.retrieve(flowId);
+  const serviceLinkOn = rows.some((r) => r.type === "customer_confirmation") ? await isServiceLinkOn(companyId) : false;
+
+  let flow;
+  try {
+    flow = await client.conversationFlow.retrieve(flowId);
+  } catch (err) {
+    await Promise.all(rows.map((r) => callTypeConfigsDb.markRetellSync(companyId, r.type, { ok: false, error: err.message }).catch(() => {})));
+    throw err;
+  }
   const nodes = flow.nodes ?? [];
 
   let updated = 0;
+  const pushed = [];
   for (const row of rows) {
     const nodeIdx = nodes.findIndex(n => n.id === row.retell_subagent_node_id);
     if (nodeIdx === -1) {
@@ -144,9 +205,13 @@ async function syncPromptsForCompany(companyId, types = null) {
     }
 
     const current = nodes[nodeIdx].instruction?.text || "";
+    pushed.push(row.type);
     // Preserve any read-only mode note appended by registerToolsForCompany
-    const readOnlyMatch = current.match(/\n\n\[IMPORTANT: You are in read-only mode[\s\S]*?\]/);
-    const newText = row.general_prompt + (readOnlyMatch ? readOnlyMatch[0] : "");
+    const readOnlyMatch = current.match(READ_ONLY_NOTE_RE);
+    const newText = composeRetellPrompt(row.type, row.general_prompt, {
+      serviceLinkOn,
+      readOnlyNote: readOnlyMatch ? readOnlyMatch[0] : "",
+    });
 
     if (newText === current) {
       logger.info("syncPrompts: no change", { type: row.type });
@@ -159,11 +224,18 @@ async function syncPromptsForCompany(companyId, types = null) {
   }
 
   if (updated > 0) {
-    await client.conversationFlow.update(flowId, { nodes });
+    try {
+      await client.conversationFlow.update(flowId, { nodes });
+    } catch (err) {
+      await Promise.all(pushed.map((t) => callTypeConfigsDb.markRetellSync(companyId, t, { ok: false, error: err.message }).catch(() => {})));
+      throw err;
+    }
     logger.info("syncPrompts: flow saved", { companyId, flowId, updated });
   }
+  // Retell now holds exactly what is stored (changed or already identical).
+  await Promise.all(pushed.map((t) => callTypeConfigsDb.markRetellSync(companyId, t, { ok: true }).catch(() => {})));
 
-  return { updated };
+  return { updated, synced_types: pushed };
 }
 
 /**
@@ -200,7 +272,7 @@ const PREVISIT_PROMPT_MARKER = "{{previsit_instructions}}";
 async function ensurePrevisitPromptCurrent(companyId) {
   try {
     const { rows } = await db.query(
-      `SELECT general_prompt, is_custom FROM call_type_configs
+      `SELECT general_prompt, is_custom, prompt_customized FROM call_type_configs
         WHERE company_id = $1 AND type = 'customer_confirmation'`,
       [companyId]
     );
@@ -216,7 +288,7 @@ async function ensurePrevisitPromptCurrent(companyId) {
       return { ok: true, changed: false, reason: "already_current" };
     }
 
-    if (row.is_custom) {
+    if (row.is_custom || row.prompt_customized) {
       // A hand-written prompt belongs to whoever wrote it — resetDefaultPrompts
       // deliberately skips is_custom rows, so overriding that here would throw
       // away their work. Report it instead of silently storing an instruction
@@ -235,50 +307,26 @@ async function ensurePrevisitPromptCurrent(companyId) {
   }
 }
 
-// Present in the confirmation prompt exactly when its SERVICE LINK section is.
-const SERVICE_LINK_PROMPT_MARKER = "━━━ SERVICE LINK";
-
 /**
- * Make the confirmation prompt's SERVICE LINK section match the company's
- * "Email the service link after confirmation" setting (plus its CRM's
- * capability), and push it to Retell if it had to change. Called after
- * call_settings.service_link_enabled is written — see
- * retell-tools.js's maybeResyncToolsAfterSettingsChange, which runs this
+ * Push the confirmation prompt to Retell so its SERVICE LINK block matches the
+ * company's "Email the service link after confirmation" setting right now.
+ * Called after call_settings.service_link_enabled is written — see
+ * retell-tools.js's maybeResyncToolsAfterSettingsChange, which awaits this
  * BEFORE re-registering tools so the two flow updates never race.
  *
- * Same shape and caveats as ensurePrevisitPromptCurrent above: a no-op when
- * the prompt already agrees, never touches an is_custom prompt (reports it
- * instead), regenerates the prompt wholesale when it does act, never throws.
+ * The block is composed at push time (composeRetellPrompt), so this never
+ * regenerates or rewrites the stored prompt — an edited prompt keeps every
+ * word, and gains or loses only the managed block. Idempotent: no Retell
+ * write when the node already matches. Never throws.
  */
 async function ensureServiceLinkPromptCurrent(companyId) {
   try {
-    const { rows } = await db.query(
-      `SELECT general_prompt, is_custom FROM call_type_configs
-        WHERE company_id = $1 AND type = 'customer_confirmation'`,
-      [companyId]
-    );
-    if (!rows.length) return { ok: true, changed: false, reason: "no_confirmation_prompt" };
-
-    const settings = await callSettingsDb.getByCompanyId(companyId);
-    const workflow = withServiceLinkSetting(
-      getWorkflow(await resolveSlugForCompany(companyId)),
-      settings?.service_link_enabled
-    );
-    const wanted = workflow.capabilities.serviceLink === true;
-    const has = String(rows[0].general_prompt || "").includes(SERVICE_LINK_PROMPT_MARKER);
-    if (wanted === has) return { ok: true, changed: false, reason: "already_current" };
-
-    if (rows[0].is_custom) {
-      logger.warn("service-link: company has a custom confirmation prompt — its service-link instructions were NOT changed; edit it by hand", { companyId, wanted });
-      return { ok: false, changed: false, reason: "custom_prompt" };
-    }
-
-    await resetDefaultPrompts(companyId, ["customer_confirmation"]);
-    const { updated } = await syncPromptsForCompany(companyId, ["customer_confirmation"]);
-    logger.info("service-link: confirmation prompt regenerated and pushed to Retell", { companyId, serviceLink: wanted, retellNodesUpdated: updated, changed: true });
-    return { ok: true, changed: true, reason: "synced", retell_nodes_updated: updated };
+    const { updated, synced_types: synced = [] } = await syncPromptsForCompany(companyId, ["customer_confirmation"]);
+    if (!synced.length) return { ok: true, changed: false, reason: "not_provisioned" };
+    logger.info("service-link: confirmation prompt pushed to Retell", { companyId, changed: updated > 0 });
+    return { ok: true, changed: updated > 0, reason: updated > 0 ? "synced" : "already_current" };
   } catch (err) {
-    logger.error("service-link: could not bring the confirmation prompt current", { companyId, error: err.message });
+    logger.error("service-link: could not push the confirmation prompt to Retell", { companyId, error: err.message });
     return { ok: false, changed: false, reason: "error", error: err.message };
   }
 }
@@ -309,5 +357,8 @@ module.exports = {
   syncPromptsForAllCompanies,
   ensurePrevisitPromptCurrent,
   ensureServiceLinkPromptCurrent,
+  composeRetellPrompt,
+  buildDefaultPromptForCompany,
+  isServiceLinkOn,
   PREVISIT_PROMPT_MARKER,
 };
