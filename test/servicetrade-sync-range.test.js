@@ -15,7 +15,7 @@
  *      window that changed since the last real sync. Same invariant the
  *      targeted (webhook) path has, arrived at for the same reason.
  *
- *   2. The route. The 31-day cap and the YYYY-MM-DD parsing, including the
+ *   2. The route. The 92-day cap and the YYYY-MM-DD parsing, including the
  *      company-timezone resolution — a range is a range of LOCAL days, so the
  *      epochs it produces have to move with DST.
  */
@@ -191,16 +191,16 @@ test("the same range in winter lands an hour later in UTC — the days are LOCAL
   assert.equal(new Date(startCalls[0].scheduleDateFrom * 1000).toISOString(), "2026-01-01T05:00:00.000Z");
 });
 
-test("exactly 31 days is allowed, so any calendar month works", async () => {
-  const [status] = await sync("?startDate=2026-07-01&endDate=2026-07-31");
+test("exactly 92 days is allowed, so any three calendar months work", async () => {
+  const [status] = await sync("?startDate=2026-07-01&endDate=2026-09-30");
   assert.equal(status, 200);
 });
 
-test("32 days is rejected rather than quietly truncated", async () => {
+test("93 days is rejected rather than quietly truncated", async () => {
   startCalls.length = 0;
-  const [status, body] = await sync("?startDate=2026-07-01&endDate=2026-08-01");
+  const [status, body] = await sync("?startDate=2026-07-01&endDate=2026-10-01");
   assert.equal(status, 400);
-  assert.equal(body.error, "Date range cannot exceed 31 days");
+  assert.equal(body.error, "Date range cannot exceed 92 days");
   assert.equal(startCalls.length, 0, "nothing must have been started");
 });
 

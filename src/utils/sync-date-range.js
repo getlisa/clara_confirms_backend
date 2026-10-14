@@ -10,11 +10,12 @@
  */
 
 /**
- * Longest custom sync window accepted, in inclusive days. 31 so that any
- * single calendar month is always a valid range (2026-07-01..2026-07-31),
- * while a wider pull still has to go through full=true.
+ * Longest custom sync window accepted, in inclusive days. 92 so that any
+ * three consecutive calendar months — a quarter — is always a valid range
+ * (the longest, Jul–Sep, is 31+31+30 = 92: 2026-07-01..2026-09-30), while a
+ * wider pull still has to go through full=true.
  */
-const MAX_SYNC_RANGE_DAYS = 31;
+const MAX_SYNC_RANGE_DAYS = 92;
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 

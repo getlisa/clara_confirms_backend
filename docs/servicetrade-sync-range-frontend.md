@@ -20,9 +20,10 @@ month's jobs, or jobs scheduled past the end of this month, short of `full=true`
 Give it a window and it syncs every job scheduled inside that window — a
 backfill of July, a look-ahead into next month, whatever the user picks.
 
-**The window is capped at 31 inclusive days.** 31 rather than 30 so that *any*
-calendar month is a legal range (`2026-07-01 → 2026-07-31` is fine;
-`2026-07-01 → 2026-08-01` is 32 days and rejected).
+**The window is capped at 92 inclusive days** (raised from 31 on 2026-10-15).
+92 so that *any* three consecutive calendar months is a legal range — the
+longest, July–September, is exactly 92 days (`2026-07-01 → 2026-09-30` is fine;
+`2026-07-01 → 2026-10-01` is 93 days and rejected).
 
 ---
 
@@ -83,7 +84,7 @@ the only five:
 | only one of the two dates sent | `startDate and endDate must be provided together` |
 | not `YYYY-MM-DD`, or not a real date (`2026-02-30`) | `Invalid date: expected YYYY-MM-DD` |
 | `endDate` before `startDate` | `endDate must be on or after startDate` |
-| window wider than 31 days | `Date range cannot exceed 31 days` |
+| window wider than 92 days | `Date range cannot exceed 92 days` |
 | `full=true` sent alongside a range | `full=true cannot be combined with a custom date range` |
 
 **`400`** is also returned when the sync itself fails: `{ "error": "<reason>" }`.
@@ -95,8 +96,8 @@ the only five:
 
 - **Default the picker to the current month.** That matches what the endpoint
   does with no params, so the default view stays honest.
-- **Mirror the 31-day cap client-side.** Once `startDate` is chosen, disable any
-  `endDate` more than 30 days after it (and vice versa). The `400`s are a
+- **Mirror the 92-day cap client-side.** Once `startDate` is chosen, disable any
+  `endDate` more than 91 days after it (and vice versa). The `400`s are a
   backstop, not the primary UX.
 - **Dates are the company's local days**, not the browser's. Send the raw
   `YYYY-MM-DD` the user picked — do **not** convert to UTC or to an ISO

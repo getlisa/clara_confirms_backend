@@ -276,7 +276,7 @@ async function resolveSyncRange(companyId, { startDate, endDate, full }) {
  * range controls the /servicerequest fetch window (default month).
  *
  * startDate/endDate (both or neither, company-local dates, inclusive, at most
- * 31 days apart) replace the default current-calendar-month job window — e.g.
+ * 92 days apart) replace the default current-calendar-month job window — e.g.
  * backfilling a past month. A custom window re-pulls that whole window rather
  * than only what changed since the last sync, and deliberately leaves the
  * incremental cursors and last_sync_at untouched (see runSync). Mutually

@@ -270,7 +270,7 @@ Same contract as `integration-document.md` §4.4. **Always pass `stream: true`.*
 ```
 
 **Custom range** (e.g. backfilling a past month): pass `startDate`/`endDate` together —
-both required if either is given, at most 31 days apart, mutually exclusive with
+both required if either is given, at most 92 days apart, mutually exclusive with
 `full=true`. A bad range 400s immediately (`{ error: "..." }`) before any run
 starts — same five validation messages as ServiceTrade's. Unlike ServiceTrade's
 version, there's no company-timezone conversion here — InspectPoint's own date
@@ -546,7 +546,7 @@ description as the fallback, not the job number.
 - [ ] Reuse the existing SSE subscription / "importing, don't show empty state" logic wholesale — it's provider-agnostic already
 
 ### Sync range (§4.4)
-- [ ] Optional: date-range picker on the sync button (`startDate`/`endDate`, both or neither, ≤31 days, not with `full=true`) for backfilling a past month
+- [ ] Optional: date-range picker on the sync button (`startDate`/`endDate`, both or neither, ≤92 days, not with `full=true`) for backfilling a past month
 - [ ] Surface the 400 message verbatim — the five validation errors are written to be shown to a user
 
 ### Shipped since Phase 2 (§8) — the only real code change is the first
