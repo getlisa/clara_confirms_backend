@@ -1,8 +1,16 @@
 /**
- * Per-company ServiceTrade: store auth_code (session token) only. Passwords are never stored.
+ * Per-company ServiceTrade connection: username, auth_code (the PHPSESSID
+ * session), and the password ENCRYPTED (password_encrypted, AES-256-GCM via
+ * utils/credential-crypto.js) so the backend can log in again by itself when
+ * ServiceTrade ends a session — see services/servicetrade.js's reauthenticate.
+ *
+ * The password is never returned by getByCompanyId; only getPasswordForReauth
+ * decrypts it, and only the re-login path calls that. Never log it.
  */
 
 const db = require("./index");
+const credentialCrypto = require("../utils/credential-crypto");
+const logger = require("../utils/logger");
 
 /**
  * Get stored auth code for a company (only active, not deleted, with non-empty auth_code)
@@ -59,13 +67,99 @@ async function upsert(companyId, username, authCode, metadata = null) {
 }
 
 /**
+ * Persist the encrypted password + mark a fresh login. Called right after a
+ * successful interactive connect. Returns whether the password was stored —
+ * false means automatic renewal is off for this company.
+ */
+async function savePassword(companyId, password) {
+  if (!password) return false;
+  let encrypted;
+  try {
+    encrypted = credentialCrypto.encrypt(password);
+  } catch (err) {
+    logger.error("ServiceTrade: password NOT stored — sessions cannot be renewed automatically", { companyId, error: err.message });
+    return false;
+  }
+  await db.query(
+    `UPDATE servicetrade_integration
+        SET password_encrypted = $2, last_login_at = NOW(), auth_error = NULL, auth_error_at = NULL
+      WHERE company_id = $1`,
+    [companyId, encrypted]
+  );
+  return true;
+}
+
+/**
+ * Username + decrypted password for an automatic re-login, or null when the
+ * company has none stored (connected before auto-renewal existed) or it
+ * cannot be decrypted.
+ */
+async function getPasswordForReauth(companyId) {
+  const { rows } = await db.query(
+    `SELECT username, password_encrypted FROM servicetrade_integration
+      WHERE company_id = $1 AND is_active = TRUE AND is_deleted = FALSE
+        AND password_encrypted IS NOT NULL AND username IS NOT NULL AND username != ''`,
+    [companyId]
+  );
+  if (!rows[0]) return null;
+  try {
+    return { username: rows[0].username, password: credentialCrypto.decrypt(rows[0].password_encrypted) };
+  } catch (err) {
+    logger.error("ServiceTrade: stored password could not be decrypted", { companyId, error: err.message });
+    return null;
+  }
+}
+
+/** Store the session from an automatic re-login and clear any auth error. */
+async function updateSession(companyId, authCode) {
+  await db.query(
+    `UPDATE servicetrade_integration
+        SET auth_code = $2, last_login_at = NOW(), auth_error = NULL, auth_error_at = NULL, updated_at = NOW()
+      WHERE company_id = $1`,
+    [companyId, authCode]
+  );
+}
+
+/** Record that the session could not be renewed (the case a human must fix). */
+async function markAuthError(companyId, message) {
+  await db.query(
+    `UPDATE servicetrade_integration
+        SET auth_error = $2, auth_error_at = COALESCE(auth_error_at, NOW())
+      WHERE company_id = $1`,
+    [companyId, String(message || "Unknown error").slice(0, 500)]
+  );
+}
+
+/** Connection health for the status endpoint. */
+async function getAuthHealth(companyId) {
+  const { rows } = await db.query(
+    `SELECT password_encrypted IS NOT NULL AS auto_reconnect, last_login_at, auth_error, auth_error_at
+       FROM servicetrade_integration WHERE company_id = $1`,
+    [companyId]
+  );
+  return rows[0] || { auto_reconnect: false, last_login_at: null, auth_error: null, auth_error_at: null };
+}
+
+/** Every company with a live ServiceTrade connection — for the keep-alive cron. */
+async function listActiveCompanyIds() {
+  const { rows } = await db.query(
+    `SELECT company_id FROM servicetrade_integration
+      WHERE is_active = TRUE AND is_deleted = FALSE
+        AND ((auth_code IS NOT NULL AND auth_code != '') OR password_encrypted IS NOT NULL)
+      ORDER BY company_id`
+  );
+  return rows.map((r) => r.company_id);
+}
+
+/**
  * Clear username and auth_code on disconnect; preserve metadata.
  * @param {string|number} companyId
  */
 async function clearCredentials(companyId) {
   await db.query(
     `UPDATE servicetrade_integration
-     SET username = '', auth_code = NULL, is_active = FALSE, updated_at = NOW()
+     SET username = '', auth_code = NULL, password_encrypted = NULL, auth_error = NULL, auth_error_at = NULL,
+         is_active = FALSE, updated_at = NOW()
      WHERE company_id = $1`,
     [companyId]
   );
@@ -89,6 +183,12 @@ async function hasCredentials(companyId) {
 module.exports = {
   getByCompanyId,
   upsert,
+  savePassword,
+  getPasswordForReauth,
+  updateSession,
+  markAuthError,
+  getAuthHealth,
+  listActiveCompanyIds,
   clearCredentials,
   hasCredentials,
 };

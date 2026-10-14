@@ -279,12 +279,18 @@ Check the current connection state. Returns whether credentials exist, whether t
   }
 }
 
-// Response — has credentials but session expired
+// Response — could not renew the session (password changed, or connected
+// before auto-renewal existed). Superseded 2026-10-15: sessions now renew
+// automatically, and the old example here (hasCredentials: true + username)
+// never matched the code. Full shape + UI: servicetrade-auto-reconnect-frontend.md
 {
   "connected": false,
-  "hasCredentials": true,
-  "username": "ops@acme.com",
-  "message": "ServiceTrade session invalid. Reconnect with username and password."
+  "hasCredentials": false,
+  "auto_reconnect": true,
+  "needs_reconnect": true,
+  "auth_error": "ServiceTrade rejected the saved login (was the password changed?). Reconnect ServiceTrade.",
+  "auth_error_at": "2026-10-15T08:00:03.000Z",
+  "message": "ServiceTrade rejected the saved login (was the password changed?). Reconnect ServiceTrade."
 }
 
 // Response — never connected

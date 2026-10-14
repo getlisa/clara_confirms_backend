@@ -756,13 +756,13 @@ Save and verify ServiceTrade credentials.
 **Query params:** `full=true` for a full re-sync (default: incremental) · `stream=true` for SSE progress · `startDate`/`endDate` (`YYYY-MM-DD`) for a custom window — see `servicetrade-sync-range-frontend.md`.
 
 Without dates: incremental sync of the current calendar month. With both dates
-(company-local, inclusive, **max 31 days**): every job scheduled in that window,
+(company-local, inclusive, **max 92 days**): every job scheduled in that window,
 re-pulled in full. Mutually exclusive with `full=true`. A custom-range run
 deliberately leaves the incremental cursor and `last_sync_at` untouched.
 
 **Response `200`** `{ "success": true, "runId": "42", "counts": { "companies": 120, "locations": 340, "service_requests": 890, "assets": 200 } }`  
 **Response `202`** (`stream=true`) `{ "runId", "kind", "streamToken", "streamUrl", "snapshotUrl" }`  
-**Response `400`** `{ "error": "Date range cannot exceed 31 days" }` — and four other validation strings, all safe to display verbatim (see the frontend guide).
+**Response `400`** `{ "error": "Date range cannot exceed 92 days" }` — and four other validation strings, all safe to display verbatim (see the frontend guide).
 
 ---
 

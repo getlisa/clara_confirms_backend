@@ -12,8 +12,8 @@ const assert = require("node:assert/strict");
 
 const { MAX_SYNC_RANGE_DAYS, isCalendarDate, validateSyncRange } = require("../src/utils/sync-date-range");
 
-test("MAX_SYNC_RANGE_DAYS is 31 — any single calendar month is always a valid range", () => {
-  assert.equal(MAX_SYNC_RANGE_DAYS, 31);
+test("MAX_SYNC_RANGE_DAYS is 92 — any three consecutive calendar months is always a valid range", () => {
+  assert.equal(MAX_SYNC_RANGE_DAYS, 92);
 });
 
 test("isCalendarDate accepts a real date and rejects impossible ones", () => {
@@ -42,14 +42,14 @@ test("a backwards range is rejected", () => {
   assert.match(result.error, /on or after/i);
 });
 
-test("exactly 31 days is allowed", () => {
-  const result = validateSyncRange({ startDate: "2026-07-01", endDate: "2026-07-31" });
-  assert.deepEqual(result, { startDate: "2026-07-01", endDate: "2026-07-31" });
+test("exactly 92 days (Jul–Sep, the longest quarter) is allowed", () => {
+  const result = validateSyncRange({ startDate: "2026-07-01", endDate: "2026-09-30" });
+  assert.deepEqual(result, { startDate: "2026-07-01", endDate: "2026-09-30" });
 });
 
-test("32 days is rejected rather than quietly truncated", () => {
-  const result = validateSyncRange({ startDate: "2026-07-01", endDate: "2026-08-01" });
-  assert.match(result.error, /cannot exceed 31 days/);
+test("93 days is rejected rather than quietly truncated", () => {
+  const result = validateSyncRange({ startDate: "2026-07-01", endDate: "2026-10-01" });
+  assert.match(result.error, /cannot exceed 92 days/);
 });
 
 test("full=true combined with a range is rejected", () => {
