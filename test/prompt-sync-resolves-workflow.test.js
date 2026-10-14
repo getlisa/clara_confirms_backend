@@ -19,7 +19,7 @@ stub("utils/logger", silentLogger());
 const queries = [];
 stub("db", { query: async (sql, params) => { queries.push({ sql, params }); return { rows: [] }; } });
 stub("services/retell", {});
-stub("services/retell-flow", { syncFlowForCompany: async () => {}, CHAT_SESSION_INSTRUCTION: "chat instruction" });
+stub("services/retell-flow", { syncFlowForCompany: async () => {} });
 stub("db/service-line-descriptions", { listByCompany: async () => [] });
 
 let resolvedCompanyId = null;
