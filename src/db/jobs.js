@@ -364,8 +364,13 @@ async function getJobById(id, companyId) {
     job.appointments.map((a) => a.id)
   );
   for (const appt of job.appointments) {
-    appt.services = servicesByAppt.get(appt.id) || [];
-    appt.service_line = appt.services[0]?.service_line ?? null;
+    appt.services = withJobTypeService(job, servicesByAppt.get(appt.id) || []);
+    // The visit's service line comes from its BOOKED services only. An
+    // InspectPoint visit's deficiency_repair rows are offers, not what the
+    // visit is — taking services[0] blindly let a deficiency ("Any
+    // Deficiencies — No") become the visit's service line and reach the
+    // agent's opening line.
+    appt.service_line = appt.services.find((s) => (s.kind || "service") === "service")?.service_line ?? null;
     appt.technicians = techsByAppt.get(appt.id) || [];
   }
 
@@ -380,6 +385,55 @@ async function getJobById(id, companyId) {
   job.contacts = await getJobContacts(id, companyId, row);
 
   return job;
+}
+
+/**
+ * InspectPoint has no per-visit service lines: since migration 111 its
+ * inspection type ("Hood Cleaning Report", "Fire Suppression", "Semi Annual
+ * Inspection") lives only in jobs.job_type, and service_lines holds
+ * deficiencies. Its visits still get a booked service row (the description —
+ * "Semi Annual Hood Cleaning Report inspection (about 4 hours). The Key will
+ * be left under a mat at the back door"), but with service_line NULL.
+ *
+ * So for InspectPoint the JOB TYPE is the service line: a booked row with no
+ * service line takes the job type, and a visit with no booked row at all gets
+ * one derived from the job (type + description).
+ *
+ * Applied at read time, here, because every consumer of a visit's services
+ * goes through getJobById → job-confirmation-context: the voice dynamic
+ * variables (next_service_line, next_appointment_services), the chat prompt,
+ * appointment cards, get_appointments, onsite-instruction matching (an exact
+ * service_line match) and service-line-description matching. Nothing is
+ * written, so service_lines keeps meaning "deficiency" for InspectPoint.
+ *
+ * Placed FIRST so it is the visit's primary service; deficiency_repair rows
+ * stay after it and are still partitioned out as offers downstream.
+ * `derived_from` marks it for any UI that wants to show where it came from.
+ */
+function withJobTypeService(job, services) {
+  if (job?.source !== "inspectpoint") return services;
+  const jobType = typeof job.job_type === "string" ? job.job_type.trim() : "";
+  if (!jobType) return services;
+  const isBooked = (s) => (s.kind || "service") === "service";
+  if (services.some(isBooked)) {
+    return services.map((s) => (isBooked(s) && !s.service_line
+      ? { ...s, service_line: jobType, service_line_name: jobType, derived_from: "job_type" }
+      : s));
+  }
+  return [{
+    kind: "service",
+    asset: null,
+    deficiency_id: null,
+    service_line_name: jobType,
+    service_line_trade: null,
+    service_line: jobType,
+    description: job.description ?? null,
+    status: null,
+    completion: null,
+    estimated_price: null,
+    duration: null,
+    derived_from: "job_type",
+  }, ...services];
 }
 
 /**
@@ -775,7 +829,7 @@ async function getAppointmentById(id, companyId) {
 
 module.exports = {
   listJobs, listJobTypes, getJobById, createJob, updateJob, getJobContacts,
-  fetchServicesByAppointment, fetchJobServiceLines,
+  fetchServicesByAppointment, fetchJobServiceLines, withJobTypeService,
   listAppointmentsByJob, createAppointment, updateAppointment, getAppointmentById,
   bulkConfirmAppointments,
   UNSCHEDULED_JOB_STATUSES, UNSCHEDULED_JOB_STATUSES_SQL,

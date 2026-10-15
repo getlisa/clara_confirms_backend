@@ -148,12 +148,21 @@ async function buildOutcomeFacts(companyId, appointmentIds, timezone = "UTC") {
   if (!ids.length) return [];
 
   const { rows } = await db.query(
-    `SELECT a.id, a.scheduled_start, sl.name AS service_line, s.description
+    // Booked services only — an InspectPoint visit's deficiency_repair rows
+    // are offered repairs, not what was done, and must not be summarised as
+    // the visit's services. For InspectPoint the job type IS the service line
+    // (see db/jobs.js withJobTypeService), so it stands in when a visit has
+    // no booked service row.
+    `SELECT a.id, a.scheduled_start,
+            COALESCE(sl.name, CASE WHEN j.source = 'inspectpoint' THEN NULLIF(btrim(j.job_type), '') END) AS service_line,
+            COALESCE(s.description, CASE WHEN j.source = 'inspectpoint' THEN j.description END) AS description
        FROM appointments a
-       LEFT JOIN appointment_services s ON s.appointment_id = a.id
+       LEFT JOIN jobs j ON j.id = a.job_id
+       LEFT JOIN appointment_services s
+              ON s.appointment_id = a.id AND COALESCE(s.kind, 'service') = 'service'
        LEFT JOIN service_lines sl ON sl.id = s.service_line_id
       WHERE a.company_id = $1 AND a.id = ANY($2::bigint[])
-      ORDER BY a.scheduled_start, sl.name`,
+      ORDER BY a.scheduled_start, 3`,
     [companyId, ids]
   );
 
