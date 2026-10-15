@@ -31,11 +31,20 @@ const orderBy = () => {
   return [...q.sql.matchAll(/ORDER BY ([^\n]+)/g)].pop()[1].trim();
 };
 
+// order=asc / default: due soon first — upcoming soonest-first, then past
+// most-recent-first, then no visit (docs/jobs-sort-backend-request.md).
+const DUE_SOON = "(a.scheduled_start IS NULL), (a.scheduled_start < NOW()), CASE WHEN a.scheduled_start >= NOW() THEN a.scheduled_start END ASC, a.scheduled_start DESC, j.id ASC";
+
 test.beforeEach(() => { queries.length = 0; });
 
-test("default: visit date increasing, jobs with no visit last, id tiebreaker", async () => {
+test("default: due soon first — upcoming soonest, then past most recent, no visit last, id tiebreaker", async () => {
   await jobsDb.listJobs(16, {});
-  assert.equal(orderBy(), "a.scheduled_start ASC NULLS LAST, j.id ASC");
+  assert.equal(orderBy(), DUE_SOON);
+});
+
+test("order=asc given explicitly is the same due-soon order as the default", async () => {
+  await jobsDb.listJobs(16, { sort: "visit_date", order: "asc" });
+  assert.equal(orderBy(), DUE_SOON);
 });
 
 test("order=desc: visit date decreasing — no-visit jobs still at the bottom", async () => {
@@ -50,14 +59,14 @@ test("order is case-insensitive", async () => {
 
 test("unknown sort/order fall back to the default instead of failing", async () => {
   await jobsDb.listJobs(16, { sort: "priority", order: "sideways" });
-  assert.equal(orderBy(), "a.scheduled_start ASC NULLS LAST, j.id ASC");
+  assert.equal(orderBy(), DUE_SOON);
 });
 
 test("the raw params are never interpolated into SQL", async () => {
   await jobsDb.listJobs(16, { sort: "j.id; DROP TABLE jobs", order: "desc; DROP TABLE jobs" });
   const sql = queries.map((q) => q.sql).join("\n");
   assert.doesNotMatch(sql, /DROP TABLE/);
-  assert.equal(orderBy(), "a.scheduled_start ASC NULLS LAST, j.id ASC");
+  assert.equal(orderBy(), DUE_SOON);
 });
 
 test("sorting never touches the count query, so `total` is unaffected", async () => {

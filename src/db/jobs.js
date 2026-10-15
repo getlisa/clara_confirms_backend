@@ -180,12 +180,24 @@ async function listJobs(companyId, {
 
   // Sort by the date the Jobs table shows: the active appointment's start
   // (`a`, the lateral below), not jobs.scheduled_date, which drifts from it
-  // after a reschedule. Both pieces come from fixed whitelists — the raw query
-  // params are never interpolated. NULLS LAST in both directions keeps jobs
-  // with no visit at the bottom of a decreasing list too; j.id as the final
-  // tiebreaker keeps paging stable (no job on two pages, none skipped).
+  // after a reschedule. Every piece comes from a fixed whitelist — the raw
+  // query params are never interpolated. j.id as the final tiebreaker keeps
+  // paging stable (no job on two pages, none skipped).
+  //
+  // order=asc (also the default, and the fallback for any unknown value) is
+  // "DUE SOON FIRST" (docs/jobs-sort-backend-request.md): a plain ascending
+  // sort opened the page on the oldest past inspection, burying what's
+  // coming up pages down. Postgres sorts false before true, so the two
+  // boolean keys split the rows into upcoming → past → no visit; the CASE
+  // (null for past rows) orders upcoming soonest-first, and the plain DESC
+  // orders past most-recent-first. NOW() vs timestamptz compares instants,
+  // so no company-timezone handling is needed.
+  //
+  // order=desc is unchanged: latest visit first, no-visit jobs last.
   const sortColumn = JOB_SORTS[sort] || JOB_SORTS.visit_date;
-  const sortDir = String(order).toLowerCase() === "desc" ? "DESC" : "ASC";
+  const orderBy = String(order).toLowerCase() === "desc"
+    ? `${sortColumn} DESC NULLS LAST, j.id DESC`
+    : `(${sortColumn} IS NULL), (${sortColumn} < NOW()), CASE WHEN ${sortColumn} >= NOW() THEN ${sortColumn} END ASC, ${sortColumn} DESC, j.id ASC`;
 
   // `values` deliberately does NOT get limit/offset appended — they're spread
   // into the rows query only. The count query has no LIMIT/OFFSET, so sharing
@@ -225,7 +237,7 @@ async function listJobs(companyId, {
        ORDER BY ap.scheduled_start DESC LIMIT 1
      ) a ON true
      WHERE ${where}
-     ORDER BY ${sortColumn} ${sortDir} NULLS LAST, j.id ${sortDir}
+     ORDER BY ${orderBy}
      LIMIT $${i} OFFSET $${i + 1}`,
       [...values, limit, offset]
     ),
