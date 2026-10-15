@@ -495,10 +495,28 @@ function normalizeDeficiency(row, { companyId, locationId = null, jobId = null, 
  * @param {object|null} accountRow   the Building's `inspectpoint_customers`
  *                                   (Account) row, when we hold it — reference only
  */
-function normalizeCustomer(row, { companyId, accountRow = null }) {
+function normalizeCustomer(row, { companyId, accountRow = null, primaryContactRow = null }) {
   if (!row) return null;
   const p = row.payload || {};
   const account = accountRow?.payload || {};
+  // A Building carries a phone but never an email (0 of 1,590 on the live
+  // tenant), and ~40% carry no phone either — yet its contacts do (156 of 204
+  // have an email). The building's PRIMARY contact (buildPrimaryContactByBuilding:
+  // scheduling role, else owner, else the only one) fills whichever of the two
+  // the building lacks, so this customer — the record every recipient
+  // resolver, prompt variable and chat link reads — is reachable. The
+  // building's own phone always wins; the fallback is recorded below.
+  const pc = primaryContactRow?.payload || null;
+  const contactEmail = pc?.email ? String(pc.email).trim() || null : null;
+  const contactPhone = pc
+    ? toE164(pc.business_phone_number) || toE164(pc.cell_phone_number) || toE164(pc.home_phone_number)
+    : null;
+  const buildingPhone = toE164(p.phone_number);
+  // InspectPoint has no email field on a Building, but offices routinely type
+  // the site's email into billing_name (259 of 808 buildings on the live
+  // tenant). Taken only when the whole value is an email address.
+  const billingName = typeof p.billing_name === "string" ? p.billing_name.trim() : "";
+  const buildingEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(billingName) ? billingName : null;
 
   const warnings = [];
   if (!p.name) warnings.push({ code: "missing_name", message: "Building has no name." });
@@ -514,9 +532,10 @@ function normalizeCustomer(row, { companyId, accountRow = null }) {
     externalRef: String(row.inspectpoint_id),
     source: SOURCE,
     fullName: p.name || null,
-    email: null,
+    // The building's own email first (billing_name), then its primary contact's.
+    email: buildingEmail || contactEmail || null,
     // The whole point of the re-map: a callable customer record.
-    phone: toE164(p.phone_number),
+    phone: buildingPhone || contactPhone || null,
     // The SITE address, not the Account's billing address — this is the
     // customer the agent talks to about a visit.
     addressLine1: p.address1 || null,
@@ -530,6 +549,14 @@ function normalizeCustomer(row, { companyId, accountRow = null }) {
       reference_number: p.reference_number || null,
       external_id: p.external_id || null,
       site_identification: p.site_identification || null,
+      // Where email/phone came from when the building lacked them.
+      contact_fallback: pc
+        ? {
+            inspectpoint_contact_id: primaryContactRow.inspectpoint_id,
+            email_from_contact: !buildingEmail && !!contactEmail,
+            phone_from_contact: !buildingPhone && !!contactPhone,
+          }
+        : null,
       tags: p.tags || null,
       custom_fields: p.custom_fields || null,
       // The billing entity, preserved rather than discarded.

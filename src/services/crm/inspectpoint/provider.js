@@ -17,6 +17,7 @@ const normalize = require("./normalize");
 const { replaceJunction } = require("../shared/junctions");
 const todosDb = require("../../../db/todos");
 const logger = require("../../../utils/logger");
+const { syncAllJobStatuses } = require("../../job-confirmation-status");
 
 const SOURCE = "inspectpoint";
 const refMap = (companyId, table) => db.fetchExternalRefMap(companyId, table, SOURCE);
@@ -292,11 +293,13 @@ class InspectPointProvider extends CrmProvider {
     const counts = { customers: 0, contacts: 0, technicians: 0, locations: 0, jobs: 0, appointments: 0, deficiencies: 0, deficiencyRepairs: 0 };
     const emit = (entity, count) => engine && engine.emit("entity_done", { entity, count });
 
-    counts.customers = await this._normalizeCustomers(companyId);
-    emit("customers", counts.customers);
-
+    // Raw contacts first: the customer step needs each building's primary
+    // contact to fill the email/phone a Building doesn't carry.
     const rawContacts = await db.fetchAllByCompanyChunked(companyId, "inspectpoint_contacts");
     const primaryByBuilding = buildPrimaryContactByBuilding(rawContacts);
+
+    counts.customers = await this._normalizeCustomers(companyId, rawContacts, primaryByBuilding);
+    emit("customers", counts.customers);
 
     counts.contacts = await this._normalizeContacts(companyId, rawContacts, primaryByBuilding);
     emit("contacts", counts.contacts);
@@ -332,6 +335,12 @@ class InspectPointProvider extends CrmProvider {
     emit("deficiencies", counts.deficiencies);
     counts.deficiencyRepairs = await this._projectDeficiencyRepairs(companyId);
     emit("deficiency_repairs", counts.deficiencyRepairs);
+
+    // Re-derive job status from the appointments, as ServiceTrade's sync does:
+    // a job whose every outstanding visit is customer-confirmed becomes
+    // 'confirmed' (pending jobs otherwise stay pending — see
+    // job-confirmation-status). Never fails the sync.
+    counts.jobStatusesDerived = await syncAllJobStatuses(companyId);
 
     return counts;
   }
@@ -520,12 +529,13 @@ class InspectPointProvider extends CrmProvider {
    * Account row is still read, but only so its billing identity can ride along
    * in additional_information.
    */
-  async _normalizeCustomers(companyId) {
+  async _normalizeCustomers(companyId, rawContacts = [], primaryByBuilding = new Map()) {
     const [buildings, accounts] = await Promise.all([
       db.fetchAllByCompanyChunked(companyId, "inspectpoint_locations"),
       db.fetchAllByCompanyChunked(companyId, "inspectpoint_customers"),
     ]);
     const accountById = new Map(accounts.map((a) => [String(a.inspectpoint_id), a]));
+    const contactById = new Map(rawContacts.map((c) => [String(c.inspectpoint_id), c]));
 
     const argsList = buildings
       .map((row) => normalize.normalizeCustomer(row, {
@@ -533,6 +543,7 @@ class InspectPointProvider extends CrmProvider {
         accountRow: row.inspectpoint_customer_id != null
           ? accountById.get(String(row.inspectpoint_customer_id)) ?? null
           : null,
+        primaryContactRow: contactById.get(primaryByBuilding.get(String(row.inspectpoint_id))) ?? null,
       }))
       .filter(Boolean);
     await db.bulkUpsertByExternalRef("customers", CUSTOMER_FIELDS, argsList);
@@ -605,11 +616,16 @@ class InspectPointProvider extends CrmProvider {
       contactParents.push(contactId);
       const p = row.payload || {};
       for (const b of Array.isArray(p.buildings) ? p.buildings : []) {
-        const locationId = b?.id != null ? locationsMap.get(String(b.id)) : null;
+        if (b?.id == null) continue;
+        const locationId = locationsMap.get(String(b.id));
         if (locationId != null) locationPairs.push([contactId, locationId]);
-      }
-      if (row.inspectpoint_customer_id != null) {
-        const customerId = customersMap.get(String(row.inspectpoint_customer_id));
+        // Customers are keyed by BUILDING since migration 111 (a Building is
+        // both the customer and the location), so a contact belongs to the
+        // customer of every building it is assigned to. Looking it up by the
+        // Account id (row.inspectpoint_customer_id) matched nothing — or,
+        // worse, an unrelated building whose id happened to equal the
+        // account's (1 link on the live tenant, to the wrong site).
+        const customerId = customersMap.get(String(b.id));
         if (customerId != null) companyPairs.push([contactId, customerId]);
       }
     }
@@ -634,7 +650,14 @@ class InspectPointProvider extends CrmProvider {
 
     const argsList = raw
       .map((row) => {
-        const customerId = row.inspectpoint_customer_id != null ? customersMap.get(String(row.inspectpoint_customer_id)) ?? null : null;
+        // The job's customer is its OWN BUILDING's customer row (same
+        // external_ref as the location — migration 111), exactly as
+        // _normalizeLocations resolves it. Keying on the Account id
+        // (row.inspectpoint_customer_id) left 1,569 of 1,590 upcoming jobs
+        // with no customer and linked the other 21 to a DIFFERENT building
+        // whose id happened to equal the account's — so calls had no number,
+        // or the wrong site's.
+        const customerId = row.inspectpoint_location_id != null ? customersMap.get(String(row.inspectpoint_location_id)) ?? null : null;
         const locationId = row.inspectpoint_location_id != null ? locationsMap.get(String(row.inspectpoint_location_id)) ?? null : null;
         const technicianId = row.inspectpoint_technician_id != null ? techniciansMap.get(String(row.inspectpoint_technician_id)) ?? null : null;
         const primaryContactId = locationId != null ? primaryContactByLocationId.get(locationId) ?? null : null;
@@ -781,7 +804,18 @@ const JOB_FIELDS = [
   { column: "title", key: "title" },
   { column: "description", key: "description" },
   { column: "job_type", key: "jobType" },
-  { column: "status", key: "status", transform: (v) => v || "open" },
+  {
+    column: "status",
+    key: "status",
+    transform: (v) => v || "open",
+    // InspectPoint has no 'confirmed' state. A plain overwrite reset every job
+    // Clara confirmed back to 'pending' on the next sync. Keep 'confirmed'
+    // while InspectPoint still reports the job as pending/scheduled; any other
+    // InspectPoint status (completed, cancelled, ...) wins. Same guard the
+    // appointments status column already has. syncAllJobStatuses (end of
+    // normalizeAll) then re-derives it from the appointments.
+    updateExpr: `status = CASE WHEN jobs.status = 'confirmed' AND EXCLUDED.status IN ('pending','scheduled') THEN jobs.status ELSE EXCLUDED.status END`,
+  },
   { column: "scheduled_date", key: "scheduledDate" },
   { column: "scheduled_window_start", key: "scheduledWindowStart" },
   { column: "scheduled_window_end", key: "scheduledWindowEnd" },
