@@ -1,66 +1,98 @@
-# Jobs list — sort by visit date (Backend Request)
+# Jobs list — "due soon first" ordering (Backend Request)
 
-> **From the frontend, for the backend.** Two optional query params on the
-> existing `GET /jobs`. No new route, and no change to the response shape.
-> The Jobs page already sends them; until the backend reads them, the list
-> keeps its current order.
+> **From the frontend, for the backend.** A change to the default ordering of
+> `GET /jobs`, on top of the visit-date sort already shipped in `6b97845`
+> ("Sort GET /jobs by visit date"). One `ORDER BY` changes; no new params, no
+> route change, no response shape change. The frontend needs no change — it
+> already sends these params.
 
 ---
 
-## 1. The problem
+## 1. Where things stand
 
-The Jobs page should be sorted by **visit date**, increasing by default, with a
-control to switch to decreasing.
+`6b97845` added `?sort=visit_date&order=asc|desc` to `GET /jobs`
+(`src/routes/jobs.js` → `listJobs` in `src/db/jobs.js`). Today:
 
-`GET /jobs` is paginated (50 per page), so sorting has to happen server-side —
-sorting one page in the browser would be wrong as soon as there's a page 2.
-Today `listJobs` (`src/db/jobs.js`) always orders by the job-level date:
+| request | `ORDER BY` |
+|---|---|
+| `order=asc` (default) | `a.scheduled_start ASC NULLS LAST, j.id ASC` |
+| `order=desc` | `a.scheduled_start DESC NULLS LAST, j.id DESC` |
+
+`a` is the existing `LEFT JOIN LATERAL`: the job's latest appointment whose
+status is not `cancelled`/`rescheduled`. That's also what the Jobs table shows
+in its "Visit Date" column.
+
+The frontend sends `sort=visit_date&order=asc` on every load (the default) and
+`order=desc` when the user picks "Visit date: Decreasing".
+
+## 2. The problem
+
+A plain ascending sort puts the **oldest past visit** at the top. Every
+company has months of completed inspections, so the Jobs page opens on
+history from long ago, and the inspections that are **due soon** are buried
+pages down. Users want the page to open on what's coming up next.
+
+## 3. The change — `order=asc` only
+
+`order=asc` (and the default, and any unknown value that falls back to it)
+becomes **due soon first**:
+
+1. Jobs whose visit is **upcoming** (`a.scheduled_start >= NOW()`), soonest first.
+2. Then jobs whose visit is in the **past**, most recent first.
+3. Jobs with **no visit** (`a` is null) last.
 
 ```sql
-ORDER BY j.scheduled_date ASC NULLS LAST, j.created_at DESC
+ORDER BY
+  (a.scheduled_start IS NULL),                                          -- no visit last
+  (a.scheduled_start < NOW()),                                          -- upcoming before past
+  CASE WHEN a.scheduled_start >= NOW() THEN a.scheduled_start END ASC,  -- upcoming: soonest first
+  a.scheduled_start DESC,                                               -- past: most recent first
+  j.id ASC                                                              -- stable paging
 ```
 
-That is **not** the date the table shows. The "Visit Date" column renders
-`active_appointment.scheduled_start` — the job's latest appointment that isn't
-cancelled or rescheduled, from the `LEFT JOIN LATERAL ... a` in the same
-query. After a reschedule the two disagree, so a "sorted by date" list looks
-out of order.
+How it works: Postgres sorts `false` before `true`, so the first two boolean
+keys split the rows into upcoming → past → none. The `CASE` is null for past
+rows, so it only orders the upcoming group (`ASC` puts nulls last, which
+doesn't matter since groups are already separated). The plain
+`a.scheduled_start DESC` then orders the past group.
 
-## 2. The request
+**`order=desc` is unchanged**: `a.scheduled_start DESC NULLS LAST, j.id DESC`.
 
-`GET /jobs?sort=visit_date&order=<asc|desc>` — both optional.
+Keep the existing guarantees from `6b97845`:
+- `sort`/`order` are mapped to fixed SQL fragments, never interpolated.
+- Unknown values fall back to the default (now due-soon-first), never `400`.
+- `order` stays case-insensitive.
+- The count query gets no `ORDER BY`, so `total` is unaffected.
 
-| param | values | meaning |
-|---|---|---|
-| `sort` | `visit_date` (only value, and the default) | the active appointment's start, `a.scheduled_start` (aliased `active_appointment_start`) |
-| `order` | `asc` (default) · `desc` | increasing · decreasing |
+### Notes
 
-The Jobs page has a single control, "Visit date: Increasing / Decreasing",
-and sends `sort=visit_date` with the chosen `order` on every request.
+- **Timezone:** `NOW()` against a `timestamptz` compares instants, so no
+  company-timezone handling is needed here (unlike the
+  `scheduled_date_from/to` filters, which compare local *dates*).
+- **Why `a` and not the next upcoming appointment:** sorting on the same
+  appointment the "Visit Date" column displays keeps the list visibly in
+  order. The trade-off: a job with two future visits sorts by its later one
+  (that's the date it shows). If you'd rather key on the *next* upcoming
+  visit, the list response would also need to return that date so the column
+  can show it. Please raise that rather than changing only the sort.
+- **Performance:** `a` is already joined for every row; this adds no join.
 
-Suggested implementation — never interpolate the raw param:
+## 4. Tests — `test/jobs-sort.test.js`
 
-```js
-const dir = order === "desc" ? "DESC" : "ASC";
+Update the cases that assert the default `ORDER BY`. Their expected string
+becomes the due-soon clause above:
 
-// NULLS LAST in both directions: a job with no visit belongs at the bottom,
-// not the top of a decreasing list. j.id as the final tiebreaker keeps paging
-// stable (no row on two pages).
-`ORDER BY a.scheduled_start ${dir} NULLS LAST, j.id ${dir}`
-```
+- "default: visit date increasing, jobs with no visit last, id tiebreaker"
+- "unknown sort/order fall back to the default instead of failing"
+- "the raw params are never interpolated into SQL" (its final `orderBy()` assertion)
 
-Route (`src/routes/jobs.js`): read `sort` / `order` from `req.query` and pass
-them to `listJobs` alongside the other filters. An unknown value should fall
-back to the default rather than `400`, so an older or newer frontend never
-breaks the page.
+Leave the `desc` and case-insensitivity cases as they are. Add a case that
+`order=asc` given explicitly yields the same due-soon clause as the default.
 
-**Default changes** from `j.scheduled_date` to the visit date. That is the
-point of the request, and the frontend always sends `sort` anyway.
+Note that `orderBy()` in that file captures only one line
+(`/ORDER BY ([^\n]+)/`). Either emit the new clause on a single line, or
+widen the helper to capture up to `LIMIT`.
 
-## 3. Why this is safe
-
-- The count query is unaffected — ordering doesn't change `total`.
-- `a` is already joined for every row, so sorting on it adds no join. If it
-  shows up as slow on large tenants, an index on
-  `appointments (job_id, scheduled_start DESC)` serves the lateral lookup.
-- No response fields change.
+If there's a DB-backed test path, one fixture covers the behaviour: three
+jobs with a past visit, a future visit and no visit. Default order should be
+**future, past, none**. With two past visits, the more recent comes first.
