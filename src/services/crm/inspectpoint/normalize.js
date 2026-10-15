@@ -138,8 +138,21 @@ function buildInspectionDescription(payload = {}) {
   let sentence = subject ? `${subject} inspection` : "Inspection";
   if (duration) sentence += ` (${duration})`;
 
-  const instructions = (payload.technician_instructions || "").trim();
+  const instructions = officeInstructions(payload.technician_instructions);
   return instructions ? `${sentence}. ${instructions}` : sentence;
+}
+
+// Clara appends call/chat summaries to technician_instructions as lines like
+// "[Clara 2026-10-15 14:42] Call outcome: …" (provider.js _appendInspectionNote).
+// Those are for the technician, not the customer: strip them so the agent's
+// job description only ever carries what the office wrote.
+const CLARA_NOTE_LINE = /^\[Clara \d{4}-\d{2}-\d{2} \d{2}:\d{2}\]/;
+function officeInstructions(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .filter((line) => !CLARA_NOTE_LINE.test(line.trim()))
+    .join("\n")
+    .trim();
 }
 
 /**

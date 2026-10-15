@@ -4,7 +4,11 @@
  * voice the moment a job/appointment has source='inspectpoint' — nothing in
  * this file exercises the channels themselves, only that the provider talks
  * to the right InspectPoint endpoints with the right bodies, self-guards on
- * source, and serializes the internal_notes append correctly.
+ * source, and serializes the technician_instructions append correctly.
+ *
+ * Inspection UPDATES go to PATCH /external/api/v1/buildings/{b}/inspections/{id}:
+ * the documented PATCH /external/api/v1/inspections/{id} answers 404
+ * "building not found" for every body on the live API.
  */
 
 const test = require("node:test");
@@ -16,7 +20,9 @@ stub("utils/logger", silentLogger());
 
 const dbCalls = [];
 let jobRows = {};
-let inspectionGetResponse = { ok: true, data: { inspection: { internal_notes: null } } };
+const BUILDING_PATCH = "/external/api/v1/buildings/613/inspections/1000";
+const freshInspection = (over = {}) => ({ ok: true, data: { inspection: { technician_instructions: null, building: { id: 613 }, ...over } } });
+let inspectionGetResponse = freshInspection();
 let patchResponse = { ok: true, data: { inspection: {} } };
 let postVisitResponse = { ok: true, data: { visit: { id: 9001 } } };
 let patchVisitResponse = { ok: true, data: { visit: {} } };
@@ -51,7 +57,10 @@ stub("services/inspectpoint", {
     if (path.startsWith("/external/api/v1/inspection_visits") && method === "PATCH") return patchVisitResponse;
     if (path.startsWith("/external/api/v1/inspection_visits") && method === "POST") return postVisitResponse;
     if (path.startsWith("/external/api/v1/inspections") && method === "GET") return inspectionGetResponse;
-    if (path.startsWith("/external/api/v1/inspections") && method === "PATCH") return patchResponse;
+    if (/^\/external\/api\/v1\/buildings\/[^/]+\/inspections\//.test(path) && method === "PATCH") return patchResponse;
+    // The flat inspection PATCH is broken on InspectPoint's side — answer the
+    // way the live API does, so any code still using it fails loudly here.
+    if (path.startsWith("/external/api/v1/inspections") && method === "PATCH") return { ok: false, status: 404, messages: { errors: ["building not found"] } };
     return { ok: false, status: 404 };
   },
   fetchAllPages: async () => ({ rows: [], complete: true }),
@@ -64,7 +73,7 @@ function reset() {
   dbCalls.length = 0;
   requestCalls.length = 0;
   jobRows = {};
-  inspectionGetResponse = { ok: true, data: { inspection: { internal_notes: null } } };
+  inspectionGetResponse = freshInspection();
   patchResponse = { ok: true, data: { inspection: {} } };
   postVisitResponse = { ok: true, data: { visit: { id: 9001 } } };
   patchVisitResponse = { ok: true, data: { visit: {} } };
@@ -104,7 +113,10 @@ test("mirrorCancelAppointment resolves the PARENT JOB's external_ref and PATCHes
   const appt = { id: 1, job_id: 2, source: "inspectpoint", external_ref: "5000" };
   const result = await provider.mirrorCancelAppointment(9, appt, {});
   assert.equal(result.ok, true);
-  assert.deepEqual(requestCalls, [{ method: "PATCH", path: "/external/api/v1/inspections/1000", body: { inspection: { status_code: "cancelled" } } }]);
+  assert.deepEqual(requestCalls, [
+    { method: "GET", path: "/external/api/v1/inspections/1000", body: undefined },
+    { method: "PATCH", path: BUILDING_PATCH, body: { inspection: { status_code: "cancelled" }, response: "small" } },
+  ]);
 });
 
 test("mirrorCancelJob PATCHes the same inspection endpoint directly", async () => {
@@ -112,7 +124,10 @@ test("mirrorCancelJob PATCHes the same inspection endpoint directly", async () =
   const job = { id: 2, external_ref: "1000", source: "inspectpoint" };
   const result = await provider.mirrorCancelJob(9, job, {});
   assert.equal(result.ok, true);
-  assert.deepEqual(requestCalls, [{ method: "PATCH", path: "/external/api/v1/inspections/1000", body: { inspection: { status_code: "cancelled" } } }]);
+  assert.deepEqual(requestCalls, [
+    { method: "GET", path: "/external/api/v1/inspections/1000", body: undefined },
+    { method: "PATCH", path: BUILDING_PATCH, body: { inspection: { status_code: "cancelled" }, response: "small" } },
+  ]);
 });
 
 test("mirrorCancelAppointment self-guards when the parent job is not from InspectPoint", async () => {
@@ -131,7 +146,30 @@ test("mirrorRescheduleJob PATCHes the inspection's scheduled_date", async () => 
   const job = { id: 2, external_ref: "1000", source: "inspectpoint" };
   const result = await provider.mirrorRescheduleJob(9, job, { scheduledDate: "2026-09-15" });
   assert.equal(result.ok, true);
-  assert.deepEqual(requestCalls, [{ method: "PATCH", path: "/external/api/v1/inspections/1000", body: { inspection: { scheduled_date: "2026-09-15" } } }]);
+  assert.deepEqual(requestCalls, [
+    { method: "GET", path: "/external/api/v1/inspections/1000", body: undefined },
+    { method: "PATCH", path: BUILDING_PATCH, body: { inspection: { scheduled_date: "2026-09-15" }, response: "small" } },
+  ]);
+});
+
+test("an inspection whose building can't be resolved is never PATCHed, and the failure is reported", async () => {
+  reset();
+  inspectionGetResponse = { ok: true, data: { inspection: { building: null } } };
+  const result = await provider.mirrorRescheduleJob(9, { id: 2, external_ref: "1000", source: "inspectpoint" }, { scheduledDate: "2026-09-15" });
+  assert.equal(result.ok, false);
+  assert.ok(!requestCalls.some((c) => c.method === "PATCH"));
+});
+
+test("no write ever goes to the broken flat PATCH /external/api/v1/inspections/{id}", async () => {
+  reset();
+  jobRows[2] = { external_ref: "1000", source: "inspectpoint" };
+  const job = { id: 2, external_ref: "1000", source: "inspectpoint" };
+  await provider.mirrorCancelJob(9, job, {});
+  await provider.mirrorRescheduleJob(9, job, { scheduledDate: "2026-09-15" });
+  await provider.mirrorPostChatComment(9, { jobId: 2, summaryLines: ["Confirmed."] });
+  await provider.mirrorPostCallComment(9, { scheduledCall: { job_id: 2 }, callSummary: "Confirmed." });
+  const flat = requestCalls.filter((c) => c.method === "PATCH" && c.path.startsWith("/external/api/v1/inspections/"));
+  assert.deepEqual(flat, []);
 });
 
 // ── mirrorCreateAppointment ──────────────────────────────────────────────────
@@ -157,7 +195,7 @@ test("mirrorCreateAppointment dispatches by the JOB's source, not the (not-yet-e
   assert.equal(requestCalls.length, 0);
 });
 
-// ── Comment write-back (internal_notes append) ──────────────────────────────
+// ── Comment write-back (technician_instructions append) ─────────────────────
 
 test("mirrorPostChatComment: nothing reportable with no summary lines — never calls the API", async () => {
   reset();
@@ -166,26 +204,28 @@ test("mirrorPostChatComment: nothing reportable with no summary lines — never 
   assert.equal(requestCalls.length, 0);
 });
 
-test("mirrorPostChatComment: GETs current internal_notes, then PATCHes the appended text back", async () => {
+test("mirrorPostChatComment: GETs current technician_instructions, then PATCHes the appended text back via the building route", async () => {
   reset();
   jobRows[2] = { external_ref: "1000", source: "inspectpoint" };
-  inspectionGetResponse = { ok: true, data: { inspection: { internal_notes: "Existing note." } } };
+  inspectionGetResponse = freshInspection({ technician_instructions: "Existing note." });
   const result = await provider.mirrorPostChatComment(9, { jobId: 2, summaryLines: ["Customer confirmed."], recipientName: "Dana Reed" });
   assert.equal(result.ok, true);
   assert.equal(requestCalls[0].method, "GET");
   assert.equal(requestCalls[1].method, "PATCH");
-  const patchedNote = requestCalls[1].body.inspection.internal_notes;
-  assert.match(patchedNote, /^Existing note\.\n\[Clara /, "must APPEND, not overwrite, the existing note");
+  assert.equal(requestCalls[1].path, BUILDING_PATCH, "building id taken from the GET — no second lookup");
+  assert.equal(requestCalls.length, 2);
+  const patchedNote = requestCalls[1].body.inspection.technician_instructions;
+  assert.match(patchedNote, /^Existing note\.\n\[Clara /, "must APPEND, not overwrite, the office's instructions");
   assert.match(patchedNote, /Customer confirmed\./);
   assert.match(patchedNote, /Dana Reed/);
 });
 
-test("mirrorPostChatComment: an empty existing internal_notes doesn't prefix a stray newline", async () => {
+test("mirrorPostChatComment: empty existing technician_instructions doesn't prefix a stray newline", async () => {
   reset();
   jobRows[2] = { external_ref: "1000", source: "inspectpoint" };
-  inspectionGetResponse = { ok: true, data: { inspection: { internal_notes: null } } };
+  inspectionGetResponse = freshInspection({ technician_instructions: null });
   await provider.mirrorPostChatComment(9, { jobId: 2, summaryLines: ["Confirmed."] });
-  const patchedNote = requestCalls[1].body.inspection.internal_notes;
+  const patchedNote = requestCalls[1].body.inspection.technician_instructions;
   assert.ok(!patchedNote.startsWith("\n"));
   assert.match(patchedNote, /^\[Clara /);
 });
@@ -201,13 +241,14 @@ test("mirrorPostChatComment self-guards when the job is not from InspectPoint", 
 test("mirrorPostCallComment resolves the inspection via scheduledCall.job_id and appends the call summary", async () => {
   reset();
   jobRows[2] = { external_ref: "1000", source: "inspectpoint" };
-  inspectionGetResponse = { ok: true, data: { inspection: { internal_notes: "" } } };
+  inspectionGetResponse = freshInspection({ technician_instructions: "The Key will be left under a mat at the back door" });
   const result = await provider.mirrorPostCallComment(9, { scheduledCall: { job_id: 2 }, callSummary: "Customer confirmed the 1pm visit." });
   assert.equal(result.ok, true);
-  assert.match(requestCalls[1].body.inspection.internal_notes, /Customer confirmed the 1pm visit\./);
+  const patched = requestCalls[1].body.inspection.technician_instructions;
+  assert.match(patched, /^The Key will be left under a mat at the back door\n\[Clara \d{4}-\d{2}-\d{2} \d{2}:\d{2}\] Call outcome: Customer confirmed the 1pm visit\./);
 });
 
-test("the internal_notes append holds an advisory lock for the duration of the GET+PATCH pair", async () => {
+test("the technician_instructions append holds an advisory lock for the duration of the GET+PATCH pair", async () => {
   reset();
   jobRows[2] = { external_ref: "1000", source: "inspectpoint" };
   await provider.mirrorPostChatComment(9, { jobId: 2, summaryLines: ["x"] });

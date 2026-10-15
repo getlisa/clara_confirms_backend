@@ -141,9 +141,7 @@ class InspectPointProvider extends CrmProvider {
   async _cancelInspection(companyId, job, { retellCallId = null, entity = "job" } = {}) {
     if (!job || job.source !== SOURCE || !isNumericRef(job.external_ref)) return { skipped: "not_inspectpoint" };
     const ref = String(job.external_ref);
-    const res = await this.request(companyId, "PATCH", `/external/api/v1/inspections/${encodeURIComponent(ref)}`, {
-      body: { inspection: { status_code: "cancelled" } },
-    });
+    const res = await this._patchInspection(companyId, ref, { status_code: "cancelled" });
     if (!res.ok) {
       await raiseCrmSyncTodo(companyId, { action: `cancel_${entity}`, entity: "inspection", entityId: ref, error: JSON.stringify(res.messages || res.status) });
       return { ok: false, status: res.status };
@@ -155,9 +153,7 @@ class InspectPointProvider extends CrmProvider {
   async mirrorRescheduleJob(companyId, job, { scheduledDate, retellCallId = null } = {}) {
     if (!job || job.source !== SOURCE || !isNumericRef(job.external_ref)) return { skipped: "not_inspectpoint" };
     const ref = String(job.external_ref);
-    const res = await this.request(companyId, "PATCH", `/external/api/v1/inspections/${encodeURIComponent(ref)}`, {
-      body: { inspection: { scheduled_date: scheduledDate } },
-    });
+    const res = await this._patchInspection(companyId, ref, { scheduled_date: scheduledDate });
     if (!res.ok) {
       await raiseCrmSyncTodo(companyId, { action: "reschedule_job", entity: "inspection", entityId: ref, error: JSON.stringify(res.messages || res.status) });
       return { ok: false, status: res.status };
@@ -189,31 +185,69 @@ class InspectPointProvider extends CrmProvider {
     return { ok: true, inspectPointVisitId: String(newId) };
   }
 
+  // ── Inspection updates ───────────────────────────────────────────────────
+  //
+  // InspectPoint's documented PATCH /external/api/v1/inspections/{id} does not
+  // work: it answers 404 {"errors":["building not found"]} for EVERY body,
+  // even an empty one, on every inspection — verified live on the Ultimate
+  // Fire tenant with two separate API keys. The building-scoped route
+  // PATCH /external/api/v1/buildings/{building_id}/inspections/{id} (the same
+  // shape the documented CREATE uses) updates fine. The server evidently
+  // resolves the building from the URL, so it must be there.
+  //
+  // The building id comes from the inspection itself (GET by id works), so a
+  // caller that already read it passes it in and saves the round trip.
+
+  async _inspectionBuildingId(companyId, inspectionRef, inspection = null) {
+    const fromPayload = inspection?.building?.id ?? inspection?.building_id ?? null;
+    if (fromPayload != null) return String(fromPayload);
+    const res = await this.request(companyId, "GET", `/external/api/v1/inspections/${encodeURIComponent(inspectionRef)}`);
+    const id = res.ok ? (res.data?.inspection?.building?.id ?? res.data?.inspection?.building_id ?? null) : null;
+    return id != null ? String(id) : null;
+  }
+
+  /** Update inspection fields through the building-scoped route (see above). */
+  async _patchInspection(companyId, inspectionRef, fields, { inspection = null } = {}) {
+    const buildingId = await this._inspectionBuildingId(companyId, inspectionRef, inspection);
+    if (!buildingId) return { ok: false, status: 404, messages: { error: ["could not resolve the inspection's building"] } };
+    return this.request(
+      companyId, "PATCH",
+      `/external/api/v1/buildings/${encodeURIComponent(buildingId)}/inspections/${encodeURIComponent(inspectionRef)}`,
+      { body: { inspection: fields, response: "small" } }
+    );
+  }
+
   // ── CRM comment write-back ───────────────────────────────────────────────
   //
-  // InspectPoint has no comments API at all — "append" means GET the
-  // inspection, concatenate a marker-prefixed line onto internal_notes, PATCH
-  // it back. That read-modify-write can lose a concurrent write from the
-  // OTHER channel (a voice call and a chat session touching the same
-  // inspection close together), so it's serialized with a Postgres advisory
-  // lock held for the duration of both HTTP calls — the lock protects an
-  // external critical section, not any database row, which is a legitimate
-  // use of pg_advisory_xact_lock as a cross-process mutex.
+  // InspectPoint has no comments API at all. Call and chat summaries are
+  // appended to the inspection's TECHNICIAN INSTRUCTIONS — what the
+  // technician actually reads on the job — as marker-prefixed lines
+  // ("[Clara 2026-10-15 14:42] Call outcome: …") below whatever the office
+  // already wrote there, which is never replaced. normalize.js's
+  // buildInspectionDescription strips these lines back out on sync, so our
+  // own summaries never feed the agent's job description.
+  //
+  // "Append" means GET the inspection, concatenate, PATCH it back. That
+  // read-modify-write can lose a concurrent write from the OTHER channel (a
+  // voice call and a chat session touching the same inspection close
+  // together), so it's serialized with a Postgres advisory lock held for the
+  // duration of both HTTP calls — the lock protects an external critical
+  // section, not any database row, which is a legitimate use of
+  // pg_advisory_xact_lock as a cross-process mutex.
 
-  async _appendInternalNote(companyId, inspectionExternalRef, noteText) {
+  async _appendInspectionNote(companyId, inspectionExternalRef, noteText) {
     if (!isNumericRef(inspectionExternalRef)) return { skipped: "no_inspection_ref" };
     return db.transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`inspectpoint_note:${companyId}:${inspectionExternalRef}`]);
       const getRes = await this.request(companyId, "GET", `/external/api/v1/inspections/${encodeURIComponent(inspectionExternalRef)}`);
       if (!getRes.ok) {
-        await raiseCrmSyncTodo(companyId, { action: "post_comment", entity: "inspection", entityId: inspectionExternalRef, error: "failed to read internal_notes before append" });
+        await raiseCrmSyncTodo(companyId, { action: "post_comment", entity: "inspection", entityId: inspectionExternalRef, error: "failed to read technician_instructions before append" });
         return { ok: false, status: getRes.status };
       }
-      const existing = getRes.data?.inspection?.internal_notes || "";
+      const inspection = getRes.data?.inspection || {};
+      const existing = (inspection.technician_instructions || "").replace(/\s+$/, "");
       const updated = existing ? `${existing}\n${noteText}` : noteText;
-      const patchRes = await this.request(companyId, "PATCH", `/external/api/v1/inspections/${encodeURIComponent(inspectionExternalRef)}`, {
-        body: { inspection: { internal_notes: updated } },
-      });
+      const patchRes = await this._patchInspection(companyId, inspectionExternalRef, { technician_instructions: updated }, { inspection });
       if (!patchRes.ok) {
         await raiseCrmSyncTodo(companyId, { action: "post_comment", entity: "inspection", entityId: inspectionExternalRef, error: JSON.stringify(patchRes.messages || patchRes.status) });
         return { ok: false, status: patchRes.status };
@@ -236,7 +270,7 @@ class InspectPointProvider extends CrmProvider {
     const timestamp = new Date().toISOString().slice(0, 16).replace("T", " ");
     const lapsedNote = expired ? " The chat then lapsed without a formal close." : "";
     const note = `[Clara ${timestamp}] Chat outcome: ${summaryLines.join(" ")}${lapsedNote} Who confirmed: ${recipientName || "unknown"}.`;
-    return this._appendInternalNote(companyId, ref, note);
+    return this._appendInspectionNote(companyId, ref, note);
   }
 
   /** Call outcome — companyId, {scheduledCall, callSummary}. */
@@ -245,7 +279,7 @@ class InspectPointProvider extends CrmProvider {
     if (!ref) return { skipped: "not_inspectpoint" };
     const timestamp = new Date().toISOString().slice(0, 16).replace("T", " ");
     const note = `[Clara ${timestamp}] Call outcome: ${callSummary || "see call recording"}.`;
-    return this._appendInternalNote(companyId, ref, note);
+    return this._appendInspectionNote(companyId, ref, note);
   }
 
   /**
