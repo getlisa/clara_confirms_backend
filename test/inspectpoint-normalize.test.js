@@ -504,3 +504,13 @@ test("mapJobStatus: ambiguous stays `open`, unrecognized becomes `unknown`, and 
     assert.notEqual(mapJobStatus(code).status, "pending", `${code} must never become pending`);
   }
 });
+
+test("buildInspectionDescription drops Clara's own summary lines from technician_instructions — they are for the technician, not the agent", () => {
+  const { buildInspectionDescription } = require("../src/services/crm/inspectpoint/normalize");
+  const d = buildInspectionDescription({
+    projected_duration_mins: 60,
+    technician_instructions: "The Key will be left under a mat at the back door\n[Clara 2026-10-15 14:42] Call outcome: Customer confirmed.\n[Clara 2026-10-16 09:10] Chat outcome: Rescheduled.",
+  });
+  assert.match(d, /The Key will be left under a mat at the back door$/);
+  assert.doesNotMatch(d, /Clara|Call outcome|Chat outcome/);
+});
