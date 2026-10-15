@@ -41,6 +41,19 @@ test("a building with no phone takes its primary contact's phone (business, then
   assert.equal(c.additionalInformation.contact_fallback.phone_from_contact, true);
 });
 
+test("an email typed into the building's billing_name is the building's own email, and wins over the contact's", () => {
+  const c = normalize.normalizeCustomer(building({ phone_number: "4104419480", billing_name: " atexquitarestaurant@gmail.com " }), {
+    companyId: 11, primaryContactRow: contact({ email: "dana@example.com" }),
+  });
+  assert.equal(c.email, "atexquitarestaurant@gmail.com");
+  assert.equal(c.additionalInformation.contact_fallback.email_from_contact, false);
+});
+
+test("a billing_name that is a person or company name is not taken as an email", () => {
+  const c = normalize.normalizeCustomer(building({ billing_name: "Acme Property Management" }), { companyId: 11 });
+  assert.equal(c.email, null);
+});
+
 test("no primary contact: unchanged — building phone, no email", () => {
   const c = normalize.normalizeCustomer(building({ phone_number: "3025550101" }), { companyId: 11 });
   assert.equal(c.email, null);

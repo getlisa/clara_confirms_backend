@@ -512,6 +512,11 @@ function normalizeCustomer(row, { companyId, accountRow = null, primaryContactRo
     ? toE164(pc.business_phone_number) || toE164(pc.cell_phone_number) || toE164(pc.home_phone_number)
     : null;
   const buildingPhone = toE164(p.phone_number);
+  // InspectPoint has no email field on a Building, but offices routinely type
+  // the site's email into billing_name (259 of 808 buildings on the live
+  // tenant). Taken only when the whole value is an email address.
+  const billingName = typeof p.billing_name === "string" ? p.billing_name.trim() : "";
+  const buildingEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(billingName) ? billingName : null;
 
   const warnings = [];
   if (!p.name) warnings.push({ code: "missing_name", message: "Building has no name." });
@@ -527,7 +532,8 @@ function normalizeCustomer(row, { companyId, accountRow = null, primaryContactRo
     externalRef: String(row.inspectpoint_id),
     source: SOURCE,
     fullName: p.name || null,
-    email: contactEmail,
+    // The building's own email first (billing_name), then its primary contact's.
+    email: buildingEmail || contactEmail || null,
     // The whole point of the re-map: a callable customer record.
     phone: buildingPhone || contactPhone || null,
     // The SITE address, not the Account's billing address — this is the
@@ -547,7 +553,7 @@ function normalizeCustomer(row, { companyId, accountRow = null, primaryContactRo
       contact_fallback: pc
         ? {
             inspectpoint_contact_id: primaryContactRow.inspectpoint_id,
-            email_from_contact: !!contactEmail,
+            email_from_contact: !buildingEmail && !!contactEmail,
             phone_from_contact: !buildingPhone && !!contactPhone,
           }
         : null,
