@@ -121,7 +121,9 @@ function seed() {
     { inspectpoint_id: 5000, inspectpoint_job_id: 1000, inspectpoint_technician_id: 200, visit_status: "scheduled", scheduled_date: "2026-09-10T13:00:00-04:00", payload: {} },
   ];
 
-  refMaps.customers = new Map([["1", 501]]);
+  // Since migration 111 a Building is BOTH the customer and the location, so
+  // customers are keyed by BUILDING id (10, 11) — not the Account id (1).
+  refMaps.customers = new Map([["10", 501], ["11", 502]]);
   // Populated progressively as each pass "completes" — locations pass reads
   // the contacts map, so it must already reflect the contacts upsert.
   refMaps.contacts = new Map([["100", 601], ["101", 602], ["102", 603]]);
@@ -221,7 +223,7 @@ test("normalizeAll: resolves customer_id/location_id/technician_id on jobs via t
   seed();
   await provider.normalizeAll(9);
   const jobRow = upsertFor("jobs").argsList[0];
-  assert.equal(jobRow.customerId, 501);
+  assert.equal(jobRow.customerId, 501, "the job's customer is its own building's (10 → 501), not the account's");
   assert.equal(jobRow.locationId, 701);
   assert.equal(jobRow.technicianId, 801);
 });
@@ -303,8 +305,9 @@ test("normalizeAll: writes contact_locations and contact_companies junctions", a
   seed();
   await provider.normalizeAll(9);
   assert.ok(tableOf("contact_locations").has("601|701"), "Dana (601) linked to Building A (701)");
-  assert.ok(tableOf("contact_companies").has("601|501"), "Dana (601) linked to Acme (501)");
+  assert.ok(tableOf("contact_companies").has("601|501"), "Dana (601) linked to Building A's customer (501)");
   assert.ok(tableOf("contact_locations").has("602|702"), "Jordan (602) linked to Building B (702)");
+  assert.ok(tableOf("contact_companies").has("602|502"), "Jordan (602) linked to Building B's customer (502), via the building — not the account");
 });
 
 // ── The confirmation-status-preserving updateExpr (real SQL, not stubbed) ───

@@ -55,10 +55,17 @@ const APPOINTMENT_TALLIES = `
 
 // Precedence: completed wins. The two can't actually collide — an all-completed
 // job has nothing upcoming — but ordering it first states the intent.
+//
+// 'pending' (InspectPoint's resting state for open work) stays 'pending' when
+// not every visit is confirmed — it is NOT turned into 'scheduled', because
+// that would silently put it into the confirmation sweep (which picks only
+// scheduled/rescheduled jobs). It only ever moves to 'confirmed' or
+// 'completed'.
 const DERIVED_STATUS = `
   CASE
     WHEN a.n_active   > 0 AND a.n_completed = a.n_active THEN 'completed'
     WHEN a.n_outstanding > 0 AND a.n_unconfirmed = 0     THEN 'confirmed'
+    WHEN j.status = 'pending'                            THEN 'pending'
     ELSE 'scheduled'
   END`;
 
@@ -68,7 +75,11 @@ const DERIVED_STATUS = `
 // synced onto a finished job, leaving it stuck at 'completed' would hide it
 // from the confirmation sweep, the same silent-miss this file already guards
 // against for 'confirmed'.
-const OWNED_STATUSES = `('scheduled', 'confirmed', 'completed')`;
+//
+// 'pending' is owned so an InspectPoint job (1,652 of them, and only
+// InspectPoint uses 'pending') can become 'confirmed' once its visits are —
+// before this, confirming every visit left the job showing 'pending'.
+const OWNED_STATUSES = `('scheduled', 'confirmed', 'completed', 'pending')`;
 
 /**
  * @returns {Promise<string|null>} the job's status after the recompute, or null
