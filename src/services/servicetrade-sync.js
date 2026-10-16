@@ -486,6 +486,31 @@ async function syncChangedContacts(companyId, credentials, { updatedAfter = null
 }
 
 /**
+ * Deficiencies at the locations we hold (/deficiency). Nothing else in the
+ * regular sync reads them — the month-wide /servicerequest pass that used to
+ * fan them out is disabled — so until a job's Refresh read its location's
+ * deficiencies, the platform had none, and every first Refresh of a job
+ * reported them as "added" although nobody had changed anything in
+ * ServiceTrade. An incremental run reads only what changed since the cursor;
+ * a first/full/custom run reads them all. Deficiencies at locations we don't
+ * hold are skipped (nothing on the platform would show them).
+ */
+async function syncDeficiencies(companyId, credentials, params, counts) {
+  const { rows, complete } = await fetchAllPages(companyId, "/deficiency", "deficiencies", credentials, params);
+  const fetched = rows.filter((d) => d?.id != null);
+  if (!fetched.length) return { count: 0, complete };
+  const locationIds = [...new Set(fetched.map((d) => d.location?.id).filter((id) => id != null).map(String))];
+  const { locationIds: known } = await syncDb.filterKnownRefs(companyId, { locationIds });
+  const keep = fetched.filter((d) => d.location?.id != null && known.has(String(d.location.id)));
+  if (keep.length) {
+    await syncDb.upsertDeficienciesBatch(companyId, keep.map(mapDeficiencyRow));
+    counts.deficiencies += keep.length;
+  }
+  logger.info("ServiceTrade sync: deficiencies", { companyId, fetched: fetched.length, written: keep.length, complete });
+  return { count: keep.length, complete };
+}
+
+/**
  * Contacts named directly — a webhook `contact` event. Fetched by id, so a
  * contact with no outstanding job (which the job-resolving drain used to skip
  * outright) is still refreshed, deactivations included.
@@ -1136,6 +1161,18 @@ async function runSync(companyId, options = {}) {
       await engine.emit("fetched", { entity: "projects", count: counts.projects });
     }
 
+    // --- Deficiencies (/deficiency) ---------------------------------------
+    // Same cursor rules as the changed-contacts pass below: incremental runs
+    // borrow the jobs cursor (and hold it back on a failed fetch), a full or
+    // custom-window run reads every deficiency, a first sync (no cursor yet)
+    // reads them all too. Targeted runs skip it — a job Refresh reads its own
+    // location's deficiencies (withRelated).
+    if (!targeted) {
+      const deficiencies = await syncDeficiencies(companyId, credentials,
+        full || customWindow ? {} : cursorParams(state?.last_jobs_updated_at), counts);
+      if (!deficiencies.complete) complete.jobs = false;
+    }
+
     // --- Contacts that changed without a job changing ---------------------
     // Runs AFTER the job fan-out's contact upsert so a deactivated record wins
     // for any contact a job still embeds. No cursor of its own: an incremental
@@ -1482,4 +1519,5 @@ module.exports = {
   fetchAllPages,
   buildServiceRequestParams,
   buildJobParams,
+  syncDeficiencies,
 };
