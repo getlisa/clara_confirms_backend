@@ -88,15 +88,47 @@ function toList(value) {
 // breaks the Jobs page (docs/jobs-sort-backend-request.md).
 const JOB_SORTS = { visit_date: "a.scheduled_start" };
 
+// ?view= values. "current" hides past jobs, "past" shows only them, "all" both.
+const JOB_VIEWS = ["current", "past", "all"];
+
+/**
+ * SQL for "this job is past" (docs/crm-sync-strategy.md §7): no live visit
+ * (not cancelled / superseded by a reschedule) today or later in the company's
+ * timezone, AND there is something dated to be past — a live visit, or for a
+ * job with none, a scheduled_date before today. A job with no date at all is
+ * never past: it hasn't happened, it just isn't scheduled.
+ *
+ * `tzRef` is a bound parameter reference ("$3"). Visits are compared as LOCAL
+ * dates, the same convention as the scheduled_date_from/to filter, so a visit
+ * this evening is still "today" and stays in the current list.
+ */
+function pastJobCondition(tzRef) {
+  const live = `pv.job_id = j.id AND pv.company_id = j.company_id AND pv.status NOT IN ('cancelled','rescheduled')`;
+  const today = `DATE(NOW() AT TIME ZONE ${tzRef})`;
+  return `(NOT EXISTS (SELECT 1 FROM appointments pv WHERE ${live}
+                   AND DATE(pv.scheduled_start AT TIME ZONE ${tzRef}) >= ${today})
+      AND (EXISTS (SELECT 1 FROM appointments pv WHERE ${live} AND pv.scheduled_start IS NOT NULL)
+           OR j.scheduled_date < ${today}))`;
+}
+
 async function listJobs(companyId, {
   status, jobType, customerId, technicianId, locationId,
   scheduledDateFrom, scheduledDateTo, tz,
   dueSoonDays, confirmed,
   search, sort = "visit_date", order = "asc", limit = 50, offset = 0,
+  view = "all",
 } = {}) {
   const conditions = ["j.company_id = $1"];
   const values = [companyId];
   let i = 2;
+  const companyTz = tz || "America/New_York";
+
+  if (view === "past" || view === "current") {
+    const p = i++;
+    values.push(companyTz);
+    const past = pastJobCondition(`$${p}`);
+    conditions.push(view === "past" ? past : `NOT ${past}`);
+  }
 
   const statusList = toList(status);
   const jobTypeList = toList(jobType);
@@ -118,7 +150,6 @@ async function listJobs(companyId, {
   // Cancelled appointments don't count as "scheduled" for this purpose.
   if (scheduledDateFrom || scheduledDateTo) {
     const apptConditions = ["a2.company_id = j.company_id", "a2.job_id = j.id", "a2.status != 'cancelled'"];
-    const companyTz = tz || "America/New_York";
     if (scheduledDateFrom) {
       apptConditions.push(`DATE(a2.scheduled_start AT TIME ZONE $${i++}) >= $${i++}::date`);
       values.push(companyTz, scheduledDateFrom);
@@ -219,7 +250,8 @@ async function listJobs(companyId, {
             a.scheduled_end   AS active_appointment_end,
             a.status          AS active_appointment_status,
             a.customer_confirmed,
-            a.technician_confirmed
+            a.technician_confirmed,
+            ${pastJobCondition(`$${i}`)} AS is_past
      FROM jobs j
      -- LEFT, not INNER: a job is not required to have a customer. InspectPoint
      -- links work to a BUILDING, and its Account (our customers table) is
@@ -238,8 +270,8 @@ async function listJobs(companyId, {
      ) a ON true
      WHERE ${where}
      ORDER BY ${orderBy}
-     LIMIT $${i} OFFSET $${i + 1}`,
-      [...values, limit, offset]
+     LIMIT $${i + 1} OFFSET $${i + 2}`,
+      [...values, companyTz, limit, offset]
     ),
     // The customers join must stay here and must stay LEFT, matching the rows
     // query exactly: `search` filters on c.full_name, so the column has to be
@@ -272,6 +304,10 @@ async function listJobs(companyId, {
     location_name:             row.location_name ?? null,
     technician_name:           row.technician_name ?? null,
     technician_phone:          row.technician_phone ?? null,
+    // Past-inspections list (?view=past). last_visit_at is the latest live
+    // visit — the same row the lateral picks as active_appointment.
+    is_past:                   row.is_past === true,
+    last_visit_at:             row.active_appointment_start ?? null,
     active_appointment: row.active_appointment_id ? {
       id:                  row.active_appointment_id,
       scheduled_start:     row.active_appointment_start,
@@ -283,6 +319,19 @@ async function listJobs(companyId, {
   }));
 
   return { rows, total: countResult.rows[0].n };
+}
+
+/** Counts behind the "Past inspections (N)" button: { current, past }. */
+async function countJobViews(companyId, { tz } = {}) {
+  const { rows } = await db.query(
+    `SELECT COUNT(*) FILTER (WHERE ${pastJobCondition("$2")})::int AS past,
+            COUNT(*)::int AS total
+       FROM jobs j
+      WHERE j.company_id = $1`,
+    [companyId, tz || "America/New_York"]
+  );
+  const { past, total } = rows[0];
+  return { current: total - past, past };
 }
 
 // Distinct job types actually present for this company — the sync ingests up
@@ -841,7 +890,7 @@ async function getAppointmentById(id, companyId) {
 }
 
 module.exports = {
-  listJobs, listJobTypes, getJobById, createJob, updateJob, getJobContacts,
+  listJobs, listJobTypes, countJobViews, JOB_VIEWS, getJobById, createJob, updateJob, getJobContacts,
   fetchServicesByAppointment, fetchJobServiceLines, withJobTypeService,
   listAppointmentsByJob, createAppointment, updateAppointment, getAppointmentById,
   bulkConfirmAppointments,

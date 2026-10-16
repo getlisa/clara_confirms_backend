@@ -26,7 +26,7 @@ const router = express.Router();
 router.use(authenticate);
 
 // scheduled_date/valid_until are DATE-only columns — never passed through these.
-const JOB_TZ_FIELDS   = ["scheduled_window_start", "scheduled_window_end", "created_at", "updated_at"];
+const JOB_TZ_FIELDS   = ["scheduled_window_start", "scheduled_window_end", "last_visit_at", "created_at", "updated_at"];
 const APPT_TZ_FIELDS  = ["scheduled_start", "scheduled_end", "customer_confirmed_at", "technician_confirmed_at", "rescheduled_to", "created_at", "updated_at"];
 const QUOTE_TZ_FIELDS = ["created_at"];
 
@@ -44,6 +44,22 @@ function localizeAppointment(appointment, tz) {
 }
 
 // ── Jobs ──────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /jobs/views — counts for the main list and the "Past inspections" button.
+ * Declared before /:id so "views" isn't taken as a job id.
+ */
+router.get("/views", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    const tz = await getCompanyTimezone(companyId);
+    return res.json(await jobsDb.countJobViews(companyId, { tz }));
+  } catch (err) {
+    logger.error("GET /jobs/views failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to load job counts" });
+  }
+});
 
 // Must be declared BEFORE /:id to avoid Express matching "technicians" as an id param
 router.get("/technicians", async (req, res) => {
@@ -83,8 +99,16 @@ router.get("/", async (req, res) => {
       status, job_type, customer_id, technician_id, location_id,
       scheduled_date_from, scheduled_date_to,
       due_soon, confirmed,
-      search, sort, order, limit, offset,
+      search, sort, order, limit, offset, view,
     } = req.query;
+
+    // Past inspections are hidden from the default list and live behind
+    // ?view=past (docs/crm-sync-frontend.md §11). An explicit date range is a
+    // request for exactly those dates — a calendar showing last week must keep
+    // working — so it defaults to every job in the range instead.
+    const listView = jobsDb.JOB_VIEWS.includes(view)
+      ? view
+      : (scheduled_date_from || scheduled_date_to ? "all" : "current");
 
     // scheduled_date_from/to need the company timezone up front — they filter
     // on appointment scheduled_start (a timestamptz), compared as a LOCAL date,
@@ -117,6 +141,7 @@ router.get("/", async (req, res) => {
       order:             order || undefined,
       limit:             limitNum,
       offset:            offsetNum,
+      view:              listView,
     });
 
     // const jobsWithAppointments = jobs.filter((j) => j.active_appointment != null);

@@ -309,7 +309,7 @@ Without `sync.run`, show the panel without its actions, and hide ↻.
 
 ---
 
-## 11. Past inspections — hidden from the main list
+## 11. Past inspections — hidden from the main list — [available after PR merge]
 
 Past inspections no longer appear in the main jobs/inspections list. A **Past inspections**
 button opens them. Nothing is deleted.
@@ -322,6 +322,7 @@ its due date. The backend decides. Don't compute it on the client.
 | Call | Returns |
 |---|---|
 | `GET /jobs` (or `?view=current`) | the main list. **Past jobs are excluded.** All existing params work as before. |
+| `GET /jobs?scheduled_date_from=…&scheduled_date_to=…` | a date range (calendar) returns **every** job in the range, past included, unless you also pass `view`. |
 | `GET /jobs?view=past` | only past jobs, newest visit first. Same params (`search`, `status`, `customerId`, `limit`, `offset`, …). |
 | `GET /jobs/views` | `{ "current": 115, "past": 80 }` |
 
