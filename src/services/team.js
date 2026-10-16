@@ -7,8 +7,7 @@
  *    can't be invited. A REMOVED (soft-deleted) user of this same company, or
  *    a never-activated legacy invite row, is revived on accept — users.email is
  *    globally unique, so a new row could never be created for them.
- *  - Seats: active users + pending unexpired invites must stay within
- *    company_settings.max_users.
+ *  - No seat limit: a company can have any number of members.
  *  - The owner can't be demoted, deactivated or removed; nobody can change
  *    their own role or deactivate/remove themselves. Ownership moves only by an
  *    explicit transfer to another active admin.
@@ -21,7 +20,6 @@ const config = require("../config");
 const logger = require("../utils/logger");
 const invitationsDb = require("../db/user-invitations");
 const auditLog = require("../db/audit-log");
-const companySettings = require("../db/company-settings");
 const authService = require("../auth/auth.service");
 const { invalidateUserState } = require("../auth/auth.middleware");
 const { isValidRole, permissionsFor } = require("../auth/permissions");
@@ -44,10 +42,12 @@ const normEmail = (e) => String(e || "").trim().toLowerCase();
 const fullName = (r) => [r?.first_name, r?.last_name].filter(Boolean).join(" ").trim() || null;
 
 // ── Seats ───────────────────────────────────────────────────────────────────
+//
+// There is no seat limit; these counts are informational (the Team page shows
+// them). max_users stays null so a client can tell "unlimited" from a number.
 
 async function seatUsage(companyId) {
-  const [maxUsers, { rows }, pending] = await Promise.all([
-    companySettings.getMaxUsers(companyId),
+  const [{ rows }, pending] = await Promise.all([
     db.query(
       `SELECT COUNT(*)::int AS n FROM users
         WHERE company_id = $1 AND is_deleted = FALSE AND is_active = TRUE
@@ -56,9 +56,7 @@ async function seatUsage(companyId) {
     ),
     invitationsDb.countPendingSeats(companyId),
   ]);
-  const max = Number(maxUsers) || companySettings.DEFAULT_MAX_USERS;
-  const used = (rows[0]?.n ?? 0) + pending;
-  return { max_users: max, active_users: rows[0]?.n ?? 0, pending_invitations: pending, available: Math.max(max - used, 0) };
+  return { max_users: null, active_users: rows[0]?.n ?? 0, pending_invitations: pending };
 }
 
 // ── Emails ──────────────────────────────────────────────────────────────────
@@ -127,11 +125,6 @@ async function createInvitation({ companyId, actorUserId, email, role, firstName
   if (await invitationsDb.findPending(companyId, e)) {
     throw teamError(409, "invite_pending", "An invitation is already open for this email — resend it instead");
   }
-  const seats = await seatUsage(companyId);
-  if (seats.available <= 0) {
-    throw teamError(403, "seat_limit", `Your plan allows ${seats.max_users} user(s). Remove a member or revoke an invitation first.`, { seats });
-  }
-
   const { invitation, token } = await invitationsDb.create({
     companyId, email: e, role, firstName: firstName?.trim() || null, lastName: lastName?.trim() || null, invitedBy: actorUserId,
   });

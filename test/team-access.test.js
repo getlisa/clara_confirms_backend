@@ -172,14 +172,19 @@ test("an invite emails a link to /accept-invite and holds a seat", async () => {
   assert.equal(audits[0].action, "user.invited");
 });
 
-test("invites are refused for an existing member, another company's user, an open invite, a bad role, or no free seat", async () => {
+test("invites are refused for an existing member, another company's user, an open invite or a bad role", async () => {
   await assert.rejects(team.createInvitation({ companyId: 7, actorUserId: 1, email: "dev@acme.test", role: "developer" }), (e) => e.status === 409 && e.code === "already_member");
   await assert.rejects(team.createInvitation({ companyId: 7, actorUserId: 1, email: "other@elsewhere.test", role: "developer" }), (e) => e.status === 409 && e.code === "email_in_use");
   await team.createInvitation({ companyId: 7, actorUserId: 1, email: "x@acme.test", role: "developer" });
   await assert.rejects(team.createInvitation({ companyId: 7, actorUserId: 1, email: "x@acme.test", role: "developer" }), (e) => e.code === "invite_pending");
   await assert.rejects(team.createInvitation({ companyId: 7, actorUserId: 1, email: "y@acme.test", role: "superuser" }), (e) => e.code === "invalid_role");
-  maxUsers = 3; // 2 active + 1 pending = full
-  await assert.rejects(team.createInvitation({ companyId: 7, actorUserId: 1, email: "z@acme.test", role: "developer" }), (e) => e.status === 403 && e.code === "seat_limit");
+});
+
+test("there is no seat limit — any number of members and invites", async () => {
+  maxUsers = 1;
+  for (let i = 0; i < 6; i++) await team.createInvitation({ companyId: 7, actorUserId: 1, email: `m${i}@acme.test`, role: "confirmer" });
+  const seats = await team.seatUsage(7);
+  assert.deepEqual(seats, { max_users: null, active_users: 2, pending_invitations: 6 });
 });
 
 test("accepting creates the member with the invited role, marks the invite used and signs them in", async () => {

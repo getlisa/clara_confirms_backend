@@ -155,15 +155,14 @@ show **Sign in**).
       "role": "admin", "is_owner": true, "active": true,
       "joined_at": null, "created_at": "2026-08-01T10:00:00-05:00", "last_login": "2026-10-16T09:12:00-05:00" }
   ],
-  "seats": { "max_users": 5, "active_users": 3, "pending_invitations": 1, "available": 1 }
+  "seats": { "max_users": null, "active_users": 3, "pending_invitations": 1 }
 }
 ```
 
 - Owner first. Badge **Owner** on `is_owner`; show `role` as Admin / Developer / Confirmer.
-- Seats bar from `seats`: *"4 of 5 seats used (1 pending invite)"*. Disable
-  **Invite** when `available === 0` with *"Seat limit reached — remove a member
-  or revoke an invite."* (Pending invites hold a seat until accepted, revoked or
-  expired.)
+- **There is no seat limit.** `seats` is informational — e.g. *"3 members · 1
+  pending invite"*. `max_users` is always `null` (unlimited); never disable
+  **Invite** for capacity.
 
 ### `GET /users/invitations` — `users.manage`
 
@@ -197,7 +196,6 @@ expire after **7 days**.
 | `409` | `already_member` | "They're already on your team." |
 | `409` | `email_in_use` | "This email already has a Clara Confirms account with another company." (one person = one company) |
 | `409` | `invite_pending` | "An invitation is already open — resend it instead." |
-| `403` | `seat_limit` | message + `seats` object |
 
 > `POST /users/invite` still works for one release (alias; old role `user` maps
 > to `developer`). Switch to `POST /users/invitations`.
