@@ -629,3 +629,85 @@ test("a location event that touches no job is still skipped — only contacts ar
   await processor.drainCompany(8);
   assert.equal(syncCalls.length, 0);
 });
+
+// ── Auto-registration (ensureRegistered) ────────────────────────────────────
+
+async function withEnv(env, fn) {
+  const keys = ["VERCEL_ENV", "PUBLIC_API_URL", "VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_URL"];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) { if (env[k] === undefined) delete process.env[k]; else process.env[k] = env[k]; }
+  try { return await fn(); } finally {
+    for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+}
+const subscriptionRow = (row) => async (s) => {
+  if (s.includes("SELECT * FROM servicetrade_webhook_subscriptions")) return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+  if (s.includes("INSERT INTO servicetrade_webhook_subscriptions")) return { rows: [{ company_id: 8, secret: SECRET, servicetrade_webhook_id: null, hook_url: null }], rowCount: 1 };
+  return { rows: [{ company_id: 8, secret: SECRET }], rowCount: 1 };
+};
+
+test("auto-registration creates a webhook for a connected account that has none", async () => {
+  reset();
+  queryImpl = subscriptionRow(null);
+  stImpl = async () => ({ ok: true, status: 200, data: { id: 9, confirmed: false }, messages: {} });
+  const r = await withEnv({ VERCEL_ENV: "production", VERCEL_PROJECT_PRODUCTION_URL: "clara-confirms-backend.vercel.app" },
+    () => registration.ensureRegistered(8));
+  assert.equal(r.ok, true);
+  assert.deepEqual(stCalls.map((c) => c.method), ["POST"]);
+  assert.equal(stCalls[0].body.hookUrl, `https://clara-confirms-backend.vercel.app/webhooks/servicetrade/${SECRET}`);
+});
+
+test("auto-registration prefers PUBLIC_API_URL and never uses the per-deployment VERCEL_URL", async () => {
+  reset();
+  queryImpl = subscriptionRow(null);
+  stImpl = async () => ({ ok: true, status: 200, data: { id: 9 }, messages: {} });
+  await withEnv({ VERCEL_ENV: "production", PUBLIC_API_URL: "https://api.clara.test/", VERCEL_URL: "x-abc123.vercel.app" },
+    () => registration.ensureRegistered(8));
+  assert.equal(stCalls[0].body.hookUrl, `https://api.clara.test/webhooks/servicetrade/${SECRET}`);
+
+  reset();
+  queryImpl = subscriptionRow(null);
+  const r = await withEnv({ VERCEL_ENV: "production", VERCEL_URL: "x-abc123.vercel.app" },
+    () => registration.ensureRegistered(8));
+  assert.equal(r.ok, false);
+  assert.equal(stCalls.length, 0, "a deployment URL dies on the next deploy — better no webhook than a dead one");
+});
+
+test("auto-registration leaves an existing registration alone", async () => {
+  reset();
+  queryImpl = subscriptionRow({ company_id: 8, servicetrade_webhook_id: "555", enabled: true });
+  const r = await withEnv({ VERCEL_ENV: "production", PUBLIC_API_URL: "https://api.test" }, () => registration.ensureRegistered(8));
+  assert.equal(r.skipped, "already registered");
+  assert.equal(stCalls.length, 0);
+});
+
+test("auto-registration respects an admin who turned the webhook off", async () => {
+  reset();
+  queryImpl = subscriptionRow({ company_id: 8, servicetrade_webhook_id: null, enabled: false });
+  const r = await withEnv({ VERCEL_ENV: "production", PUBLIC_API_URL: "https://api.test" }, () => registration.ensureRegistered(8));
+  assert.equal(r.skipped, "disabled by an admin");
+  assert.equal(stCalls.length, 0);
+});
+
+test("auto-registration never runs outside production (previews, laptops)", async () => {
+  reset();
+  queryImpl = subscriptionRow(null);
+  for (const env of [{ VERCEL_ENV: "preview", PUBLIC_API_URL: "https://api.test" }, { PUBLIC_API_URL: "https://x.ngrok-free.dev" }]) {
+    const r = await withEnv(env, () => registration.ensureRegistered(8));
+    assert.equal(r.skipped, "not production");
+  }
+  assert.equal(stCalls.length, 0);
+});
+
+test("unregister records the opt-out so auto-registration won't undo it", async () => {
+  reset();
+  queryImpl = async (s, p) => {
+    if (s.includes("SELECT * FROM servicetrade_webhook_subscriptions")) return { rows: [{ company_id: 8, servicetrade_webhook_id: "555" }], rowCount: 1 };
+    return { rows: [], rowCount: 1 };
+  };
+  stImpl = async () => ({ ok: true, status: 200, data: {}, messages: {} });
+  await registration.unregister(8);
+  const clear = queries.find((q) => q.sql.includes("SET servicetrade_webhook_id = NULL"));
+  assert.ok(clear);
+  assert.deepEqual(clear.params, [8, true], "disabled = true → enabled = FALSE");
+});

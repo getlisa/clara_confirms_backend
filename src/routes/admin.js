@@ -20,6 +20,7 @@ const crmRegistry = require("../services/crm");
 const enginesDb = require("../engines/core/db");
 const webhookProcessor = require("../services/servicetrade-webhook-processor");
 const webhooksDb = require("../db/servicetrade-webhooks");
+const webhookRegistration = require("../services/servicetrade-webhook-registration");
 const chatLinksDb = require("../db/chat-links");
 const csvImportsDb = require("../db/csv-imports");
 const { runSweep: runDailyReportSweep } = require("../services/daily-report/send");
@@ -149,6 +150,12 @@ router.all("/crm-sync", async (req, res) => {
 
       const perCompany = [];
       for (const companyId of companies) {
+        // Self-heal: every connected ServiceTrade account gets its webhook
+        // (no-op once registered or if an admin disabled it).
+        if (slug === "servicetrade") {
+          await webhookRegistration.ensureRegistered(companyId).catch((err) =>
+            logger.warn("Admin crm-sync: webhook auto-registration failed", { companyId, error: err.message }));
+        }
         try {
           const r = await provider.syncAll(companyId);
           perCompany.push({ companyId, ok: r.ok, counts: r.counts, error: r.error, incomplete: r.incomplete || [] });

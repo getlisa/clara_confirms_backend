@@ -77,12 +77,18 @@ async function saveRegistration(companyId, { servicetradeWebhookId, hookUrl, ena
   return rows[0] || null;
 }
 
-async function clearRegistration(companyId) {
+/**
+ * `disabled` marks an admin's deliberate removal (DELETE /webhook), which the
+ * auto-registration (ensureRegistered) must respect. The repoint path inside
+ * register() clears without it, because it re-creates straight away.
+ */
+async function clearRegistration(companyId, { disabled = false } = {}) {
   await db.query(
     `UPDATE servicetrade_webhook_subscriptions
-        SET servicetrade_webhook_id = NULL, hook_url = NULL, confirmed = FALSE, updated_at = NOW()
+        SET servicetrade_webhook_id = NULL, hook_url = NULL, confirmed = FALSE,
+            enabled = CASE WHEN $2 THEN FALSE ELSE enabled END, updated_at = NOW()
       WHERE company_id = $1`,
-    [companyId]
+    [companyId, disabled]
   );
 }
 

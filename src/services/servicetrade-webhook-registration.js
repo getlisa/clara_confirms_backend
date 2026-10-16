@@ -122,8 +122,48 @@ async function unregister(companyId) {
       return { ok: false, status: 502, error: `ServiceTrade refused to delete the webhook (HTTP ${res.status})` };
     }
   }
-  await webhooksDb.clearRegistration(companyId);
+  // Remembered as an opt-out so ensureRegistered doesn't switch it back on.
+  await webhooksDb.clearRegistration(companyId, { disabled: true });
   return { ok: true, removed: true };
+}
+
+/**
+ * The webhook base URL for automatic registration. Deliberately NOT
+ * config.publicApiUrl's VERCEL_URL fallback: that is the per-deployment URL,
+ * which dies on the next deploy and would leave the subscription pointing at
+ * nothing. Only an explicit PUBLIC_API_URL or Vercel's stable production domain.
+ */
+function stableBaseUrl() {
+  if (process.env.PUBLIC_API_URL) return process.env.PUBLIC_API_URL.replace(/\/+$/, "");
+  const prod = process.env.VERCEL_PROJECT_PRODUCTION_URL;
+  return prod ? `https://${prod.replace(/\/+$/, "")}` : null;
+}
+
+/**
+ * Register the webhook for a connected company that has none, so every
+ * ServiceTrade account gets realtime updates (and a working refresh button)
+ * without anyone pressing "enable". Called after connect/reconnect and by the
+ * 2-hourly crm-sync, which is what heals accounts connected before this existed
+ * or whose registration failed.
+ *
+ * Never repoints and never re-enables: an existing registration is left alone,
+ * and one an admin removed (DELETE /webhook → enabled = false) stays off.
+ * Production only — a preview or a laptop must not point a real account's
+ * webhook at itself.
+ */
+async function ensureRegistered(companyId) {
+  if (process.env.VERCEL_ENV !== "production") return { ok: true, skipped: "not production" };
+  const existing = await webhooksDb.getSubscription(companyId);
+  if (existing?.servicetrade_webhook_id) return { ok: true, skipped: "already registered" };
+  if (existing && existing.enabled === false) return { ok: true, skipped: "disabled by an admin" };
+  const baseUrl = stableBaseUrl();
+  if (!baseUrl) {
+    logger.warn("ServiceTrade webhook: no stable public URL — auto-registration skipped", { companyId });
+    return { ok: false, skipped: "no stable public URL" };
+  }
+  const result = await register(companyId, { baseUrl });
+  if (result.ok) logger.info("ServiceTrade webhook auto-registered", { companyId });
+  return result;
 }
 
 /**
@@ -170,4 +210,4 @@ function publicShape(row) {
   };
 }
 
-module.exports = { register, unregister, status, hookUrlFor, defaultEntityEvents, ENTITY_TYPES, publicShape };
+module.exports = { register, unregister, status, ensureRegistered, stableBaseUrl, hookUrlFor, defaultEntityEvents, ENTITY_TYPES, publicShape };
