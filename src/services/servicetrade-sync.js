@@ -583,7 +583,8 @@ function mapJobCommentRow(c, servicetradeJobId) {
 }
 
 function mapDeficiencyRow(d) {
-  return { servicetrade_id: Number(d.id), ref_number: d.refNumber ?? null, name: d.name ?? null, description: d.description ?? null, payload: d };
+  // /deficiency records carry `title`; older embeds carried `name`.
+  return { servicetrade_id: Number(d.id), ref_number: d.refNumber ?? null, name: d.title ?? d.name ?? null, description: d.description ?? null, payload: d };
 }
 
 function mapChangeOrderRow(co) {
@@ -739,6 +740,79 @@ function buildJobParams({ full = false, scheduleDateFrom = null, scheduleDateTo 
   return params;
 }
 
+// ── Job refresh: related records ────────────────────────────────────────────
+
+/**
+ * Write /servicerequest records and fan their embedded sub-objects into their
+ * own raw tables — the same fan-out the disabled month-wide pass did, minus
+ * the service-opportunity stubs it no longer needs. Appointment links are
+ * preserved by the upsert (servicetrade_appointment_id is COALESCEd).
+ */
+async function writeServiceRequestGraph(companyId, serviceRequests, counts) {
+  if (!serviceRequests.length) return;
+  await syncDb.upsertServiceRequestsBatch(companyId, serviceRequests.map((r) => mapServiceRequestRow(r)));
+  counts.serviceRequests += serviceRequests.length;
+  const by = { serviceLines: new Map(), deficiencies: new Map(), changeOrders: new Map(), contracts: new Map(), recurrences: new Map() };
+  for (const r of serviceRequests) {
+    if (r.serviceLine?.id != null) by.serviceLines.set(r.serviceLine.id, r.serviceLine);
+    if (r.deficiency?.id != null) by.deficiencies.set(r.deficiency.id, r.deficiency);
+    if (r.changeOrder?.id != null) by.changeOrders.set(r.changeOrder.id, r.changeOrder);
+    if (r.contract?.id != null) by.contracts.set(r.contract.id, r.contract);
+    if (r.serviceRecurrence?.id != null) by.recurrences.set(r.serviceRecurrence.id, r.serviceRecurrence);
+  }
+  const write = async (map, fn, mapper, key) => {
+    if (!map.size) return;
+    await fn(companyId, [...map.values()].map(mapper));
+    counts[key] += map.size;
+  };
+  await write(by.serviceLines, syncDb.upsertServiceLinesBatch, mapServiceLineRow, "serviceLines");
+  await write(by.deficiencies, syncDb.upsertDeficienciesBatch, mapDeficiencyRow, "deficiencies");
+  await write(by.changeOrders, syncDb.upsertChangeOrdersBatch, mapChangeOrderRow, "changeOrders");
+  await write(by.contracts, syncDb.upsertContractsBatch, mapContractRow, "contracts");
+  await write(by.recurrences, syncDb.upsertServiceRecurrencesBatch, mapServiceRecurrenceRow, "serviceRecurrences");
+}
+
+/**
+ * Service requests of each job and every deficiency at each job's location.
+ * Deficiencies are fetched from /deficiency?locationId= (full records, with
+ * location / status / serviceLine), written AFTER the service-request fan-out
+ * so the fuller record wins for a deficiency that appears in both.
+ *
+ * Returns, per location whose deficiency fetch paged all the way through, the
+ * complete set of deficiency ids ServiceTrade has there — the caller removes
+ * any platform deficiency at that location not in the set. A partial fetch is
+ * left out, so nothing is ever removed on incomplete information.
+ */
+async function syncJobRelated(companyId, credentials, jobs, counts) {
+  let complete = true;
+  const perJob = await mapWithConcurrency(jobs, API_CONCURRENCY, async (j) => {
+    const r = await fetchAllPages(companyId, "/servicerequest", "servicerequests", credentials, { jobId: String(j.id) });
+    if (!r.complete) complete = false;
+    return r.rows;
+  });
+  const serviceRequests = [...new Map(perJob.flat().filter((r) => r?.id != null).map((r) => [String(r.id), r])).values()];
+  await writeServiceRequestGraph(companyId, serviceRequests, counts);
+
+  const locationIds = [...new Set(jobs.map((j) => j.location?.id).filter((id) => id != null).map(String))];
+  const perLocation = await mapWithConcurrency(locationIds, API_CONCURRENCY, async (locationId) => {
+    const r = await fetchAllPages(companyId, "/deficiency", "deficiencies", credentials, { locationId });
+    if (!r.complete) complete = false;
+    return { locationId, rows: r.rows.filter((d) => d?.id != null), complete: r.complete };
+  });
+  const deficiencies = [...new Map(perLocation.flatMap((l) => l.rows).map((d) => [String(d.id), d])).values()];
+  if (deficiencies.length) {
+    await syncDb.upsertDeficienciesBatch(companyId, deficiencies.map(mapDeficiencyRow));
+    counts.deficiencies += deficiencies.length;
+  }
+  const deficienciesByLocation = Object.fromEntries(
+    perLocation.filter((l) => l.complete).map((l) => [l.locationId, l.rows.map((d) => String(d.id))])
+  );
+  logger.info("ServiceTrade sync: job related records", {
+    companyId, jobs: jobs.length, serviceRequests: serviceRequests.length, deficiencies: deficiencies.length, complete,
+  });
+  return { complete, deficienciesByLocation };
+}
+
 // ── Main sync ───────────────────────────────────────────────────────────────
 
 /**
@@ -844,11 +918,16 @@ async function runSync(companyId, options = {}) {
 
     let jobs = [];
     const fanOutContactIds = new Set();   // contacts the job fan-out wrote this run
+    // Job ids ServiceTrade answered 404 for — deleted upstream. Reported on a
+    // targeted run so a job refresh can say "no longer in ServiceTrade"
+    // instead of quietly showing stale data.
+    const missingJobIds = [];
     if (jobStubs.length) {
       if (engine) await engine.transition("fetching_job_details", { count: jobStubs.length });
       logger.info("ServiceTrade sync: fetching job details", { companyId, count: jobStubs.length });
       const jobDetailResults = await mapWithConcurrency(jobStubs, API_CONCURRENCY, async (j) => {
         const res = await requestWithRetry(companyId, "GET", `/job/${j.id}`, {}, credentials);
+        if (!res.ok && res.status === 404) missingJobIds.push(String(j.id));
         return res.ok ? flattenJobDetail(res.data) : null;
       });
       jobs = jobDetailResults.filter(Boolean);
@@ -1231,8 +1310,21 @@ async function runSync(companyId, options = {}) {
       if (engine) await engine.emit("fetched", { entity: "job_comments", count: counts.jobComments });
     }
 
+    // --- Related records for a job refresh (options.withRelated) ----------
+    // A job refresh re-reads everything tied to the job, not only what
+    // /job/{id} and /appointment?jobId= embed: the job's service requests
+    // (and the deficiencies / change orders / contracts / recurrences they
+    // embed) and every deficiency at the job's location. The month-wide
+    // /servicerequest pass below is disabled, so without this these never
+    // refresh at all.
+    let related = null;
+    if (targeted && options.withRelated && jobs.length) {
+      related = await syncJobRelated(companyId, credentials, jobs, counts);
+    }
+
     // --- Service requests + embedded sub-objects (/servicerequest) ---------
-    // DISABLED. This standalone fetch existed to discover job-less service
+    // DISABLED. (Its fan-out lives on in writeServiceRequestGraph, used by the
+    // job refresh above.) This standalone fetch existed to discover job-less service
     // requests (structurally invisible to /job and /appointment?jobId=) —
     // the basis of service_opportunities, whose normalize step is now also
     // removed (see crm/servicetrade/provider.js's normalizeAll).
@@ -1334,7 +1426,7 @@ async function runSync(companyId, options = {}) {
     // "everything is up to date as of then".
     if (targeted) {
       logger.info("ServiceTrade targeted sync done", { companyId, jobIds: targetedJobIds, contactIds: targetedContactIds, counts });
-      return { success: true, counts, incomplete, targeted: true };
+      return { success: true, counts, incomplete, targeted: true, missingJobIds, related };
     }
 
     // A custom-window run touches NO cursor and NO last_sync_at, for the same

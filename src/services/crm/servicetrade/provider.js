@@ -111,6 +111,90 @@ class ServiceTradeProvider extends CrmProvider {
    * default current-calendar-month job window — see buildJobParams in
    * servicetrade-sync.js.
    */
+  /**
+   * Re-read ONE job's whole graph from ServiceTrade — the per-job Refresh
+   * button and the pre-outreach check (docs/crm-sync-strategy.md §4.3a).
+   *
+   * One targeted runSync covers: the job (any status), every appointment
+   * (removals pruned per job), technicians, appointment service requests, the
+   * customer (/company/{id}) and its contact roster, the location, job
+   * comments; `withRelated` adds the job's service requests (+ embedded change
+   * orders / contracts / recurrences) and every deficiency at its location; and
+   * `contactIds` re-fetches by id every contact the platform links to this
+   * job, which is what catches one that was deactivated or unlinked (no list
+   * endpoint returns those).
+   *
+   * @returns {{ok: true, incomplete: string[]} | {ok: false, code: string, error?: string}}
+   */
+  async refreshJob(companyId, job) {
+    if (!job?.external_ref) return { ok: false, code: "not_in_crm" };
+    const { rows: linked } = await db.query(
+      `SELECT DISTINCT c.external_ref
+         FROM contacts c
+         LEFT JOIN contact_companies cc ON cc.contact_id = c.id
+         LEFT JOIN contact_locations cl ON cl.contact_id = c.id
+        WHERE c.company_id = $1 AND c.source = 'servicetrade' AND c.external_ref IS NOT NULL
+          AND (c.id = $2 OR cc.customer_id = $3 OR cl.location_id = $4
+               OR c.id = (SELECT primary_contact_id FROM locations WHERE id = $4))
+        LIMIT 200`,
+      [companyId, job.primary_contact_id ?? null, job.customer_id ?? null, job.location_id ?? null]
+    );
+
+    const sync = await stEngine.runSync(companyId, {
+      jobIds: [String(job.external_ref)],
+      contactIds: linked.map((r) => r.external_ref),
+      withRelated: true,
+    });
+    if (!sync.success) {
+      const code = /not connected/i.test(sync.error || "") ? "reconnect_required" : "crm_unavailable";
+      return { ok: false, code, error: sync.error };
+    }
+    if ((sync.missingJobIds || []).includes(String(job.external_ref))) return { ok: false, code: "not_in_crm" };
+    if (!sync.counts?.jobs) {
+      // Neither found nor 404 — ServiceTrade didn't answer (or the session is dead).
+      const health = await stCredsDb.getAuthHealth(companyId).catch(() => null);
+      return { ok: false, code: health?.auth_error ? "reconnect_required" : "crm_unavailable", error: health?.auth_error || "ServiceTrade did not return the job" };
+    }
+
+    await this.normalizeAll(companyId, { jobIds: [job.id] });
+    await this._reconcileLocationDeficiencies(companyId, sync.related?.deficienciesByLocation || {});
+    return { ok: true, incomplete: sync.incomplete || [] };
+  }
+
+  /**
+   * Remove deficiencies ServiceTrade no longer has at a location, for every
+   * location whose /deficiency fetch was complete. The raw row goes too, or
+   * the next normalize would bring the platform row back. FKs from
+   * service_requests / service_opportunities are SET NULL and
+   * appointment_services CASCADE, so the delete is safe.
+   */
+  async _reconcileLocationDeficiencies(companyId, byLocation) {
+    const entries = Object.entries(byLocation);
+    if (!entries.length) return 0;
+    const locationsMap = await refMap(companyId, "locations");
+    let removed = 0;
+    for (const [stLocationId, keep] of entries) {
+      const locationId = locationsMap.get(String(stLocationId));
+      if (!locationId) continue;
+      const { rows } = await db.query(
+        `DELETE FROM deficiencies
+          WHERE company_id = $1 AND source = 'servicetrade' AND location_id = $2
+            AND NOT (external_ref = ANY($3::text[]))
+          RETURNING external_ref`,
+        [companyId, locationId, keep]
+      );
+      if (rows.length) {
+        await db.query(
+          `DELETE FROM servicetrade_deficiencies WHERE company_id = $1 AND servicetrade_id = ANY($2::bigint[])`,
+          [companyId, rows.map((r) => r.external_ref)]
+        );
+        removed += rows.length;
+      }
+    }
+    if (removed) logger.info("ServiceTradeProvider: removed deficiencies gone upstream", { companyId, removed });
+    return removed;
+  }
+
   async syncAll(companyId, {
     full = false, engine = null, range = "month",
     scheduleDateFrom = null, scheduleDateTo = null,
@@ -156,7 +240,7 @@ class ServiceTradeProvider extends CrmProvider {
    * location_tags junctions depend on offices/tags), then locations, then
    * technicians, then jobs, then appointments (depend on both).
    */
-  async normalizeAll(companyId, { engine = null, full = false } = {}) {
+  async normalizeAll(companyId, { engine = null, full = false, jobIds = null } = {}) {
     const counts = {
       customers: 0, technicians: 0, crmUsers: 0, projects: 0, jobs: 0, appointments: 0,
       contacts: 0, offices: 0, tags: 0, locations: 0,
@@ -296,7 +380,8 @@ class ServiceTradeProvider extends CrmProvider {
     // dispatch (see job-confirmation-inference.js).
     const callSettings = await callSettingsDb.getByCompanyId(companyId).catch(() => null);
     if (callSettings?.job_confirmation_inference_enabled) {
-      counts.confirmationAssessments = await inferJobConfirmations(companyId).catch((err) => {
+      // `jobIds` (a one-job refresh) scopes the per-job assessment loop.
+      counts.confirmationAssessments = await inferJobConfirmations(companyId, { jobIds }).catch((err) => {
         logger.error("ServiceTradeProvider.normalizeAll: job confirmation inference failed", { companyId, error: err.message });
         return 0;
       });
@@ -985,7 +1070,16 @@ class ServiceTradeProvider extends CrmProvider {
 
   async _normalizeDeficiencies(companyId, engine = null) {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_deficiencies");
-    const argsList = raw.map((row) => normalize.normalizeDeficiency(row, { companyId })).filter(Boolean);
+    const [locationsMap, serviceLinesMap] = await Promise.all([
+      refMap(companyId, "locations"),
+      refMap(companyId, "service_lines"),
+    ]);
+    const argsList = raw.map((row) => {
+      const p = row.payload || {};
+      const locationId = p.location?.id != null ? (locationsMap.get(String(p.location.id)) ?? null) : null;
+      const serviceLineId = p.serviceLine?.id != null ? (serviceLinesMap.get(String(p.serviceLine.id)) ?? null) : null;
+      return normalize.normalizeDeficiency(row, { companyId, locationId, serviceLineId });
+    }).filter(Boolean);
     await db.bulkUpsertByExternalRef("deficiencies", DEFICIENCY_FIELDS, argsList);
     logger.info("ServiceTradeProvider: normalized deficiencies", { companyId, count: argsList.length });
     return argsList.length;
@@ -1391,6 +1485,14 @@ const DEFICIENCY_FIELDS = [
   { column: "ref_number", key: "refNumber" },
   { column: "name", key: "name" },
   { column: "description", key: "description" },
+  // A service-request embed may not carry location/service line — never wipe
+  // what a fuller /deficiency record already set.
+  { column: "location_id", key: "locationId", updateExpr: "location_id = COALESCE(EXCLUDED.location_id, deficiencies.location_id)" },
+  { column: "service_line_id", key: "serviceLineId", updateExpr: "service_line_id = COALESCE(EXCLUDED.service_line_id, deficiencies.service_line_id)" },
+  { column: "status", key: "status", updateExpr: "status = COALESCE(EXCLUDED.status, deficiencies.status)" },
+  { column: "is_resolved", key: "isResolved", transform: (v) => v === true },
+  { column: "opened_at", key: "openedAt", updateExpr: "opened_at = COALESCE(EXCLUDED.opened_at, deficiencies.opened_at)" },
+  { column: "resolved_at", key: "resolvedAt" },
 ];
 
 const CHANGE_ORDER_FIELDS = [

@@ -382,16 +382,45 @@ function normalizeServiceLine(row, { companyId }) {
 }
 
 /** servicetrade_deficiencies → platform `deficiencies` */
-function normalizeDeficiency(row, { companyId }) {
+// ServiceTrade's own terminal states: `status` is the last reported status
+// (new / verified / invalid / fixed), `resolution` the lifecycle
+// (… / fixed / rejected / invalid). Either one being terminal means there's
+// nothing left to repair.
+const RESOLVED_DEFICIENCY_STATUSES = new Set(["fixed", "invalid"]);
+const RESOLVED_DEFICIENCY_RESOLUTIONS = new Set(["fixed", "rejected", "invalid"]);
+
+/**
+ * servicetrade_deficiencies → platform `deficiencies`.
+ * The full /deficiency record (job refresh) carries location, status,
+ * severity, reportedOn and serviceLine; a deficiency embedded on a service
+ * request may carry less, so everything optional stays null and the upsert
+ * COALESCEs location/service line rather than wiping them.
+ */
+function normalizeDeficiency(row, { companyId, locationId = null, serviceLineId = null }) {
   if (!row) return null;
+  const p = row.payload || {};
+  const status = p.status || null;
+  const resolution = typeof p.resolution === "string" ? p.resolution : p.resolution?.status || null;
+  const isResolved = RESOLVED_DEFICIENCY_STATUSES.has(status) || RESOLVED_DEFICIENCY_RESOLUTIONS.has(resolution);
+  const toIso = (unix) => (Number.isFinite(Number(unix)) && unix ? new Date(Number(unix) * 1000).toISOString() : null);
   return {
     companyId,
     externalRef: String(row.servicetrade_id),
     source:      "servicetrade",
     refNumber:   row.ref_number || null,
-    name:        row.name || null,
+    name:        row.name || p.title || null,
     description: row.description || null,
-    additionalInformation: { servicetrade_deficiency_id: row.servicetrade_id },
+    locationId,
+    serviceLineId,
+    status,
+    isResolved,
+    openedAt:    toIso(p.reportedOn ?? p.created),
+    resolvedAt:  isResolved ? toIso(p.updated) : null,
+    additionalInformation: {
+      servicetrade_deficiency_id: row.servicetrade_id,
+      severity: p.severity || null,
+      resolution,
+    },
   };
 }
 
