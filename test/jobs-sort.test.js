@@ -86,7 +86,7 @@ test("it sorts on the same active appointment the table displays (latest non-can
 
 test("GET /jobs forwards sort and order to listJobs", async () => {
   const calls = [];
-  stub("db/jobs", { listJobs: async (_c, opts) => { calls.push(opts); return { rows: [], total: 0 }; } });
+  stub("db/jobs", { JOB_VIEWS: ["current", "past", "all"], listJobs: async (_c, opts) => { calls.push(opts); return { rows: [], total: 0 }; } });
   stub("auth", {
     authenticate: (req, _res, next) => { req.user = { userId: 1, companyId: 16, role: "admin" }; next(); },
     getCompanyId: (req) => req.user.companyId,
