@@ -166,6 +166,7 @@ async function getConfirmationContacts(customerId, companyId) {
        FROM contacts c
        JOIN contact_companies cc ON cc.contact_id = c.id
       WHERE c.company_id = $1 AND cc.customer_id = $2
+        AND c.status IS DISTINCT FROM 'inactive'
       ORDER BY c.last_name NULLS LAST, c.first_name NULLS LAST`,
     [companyId, customerId]
   );
@@ -189,7 +190,8 @@ async function getLinkedContactIds(customerId, companyId, contactIds) {
     `SELECT c.id
        FROM contacts c
        JOIN contact_companies cc ON cc.contact_id = c.id
-      WHERE c.company_id = $1 AND cc.customer_id = $2 AND c.id = ANY($3::int[])`,
+      WHERE c.company_id = $1 AND cc.customer_id = $2 AND c.id = ANY($3::int[])
+        AND c.status IS DISTINCT FROM 'inactive'`,
     [companyId, customerId, contactIds]
   );
   return rows.map((r) => r.id);

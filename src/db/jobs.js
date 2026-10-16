@@ -599,6 +599,7 @@ async function getJobContacts(jobId, companyId, jobRowData = null) {
      LEFT JOIN contact_locations cl ON cl.contact_id = c.id
      WHERE c.company_id = $1
        AND (c.id = $2 OR cc.customer_id = $3 OR cl.location_id = $4)
+       AND c.status IS DISTINCT FROM 'inactive'
      ORDER BY c.id`,
     [companyId, row.primary_contact_id, row.customer_id, row.location_id]
   );

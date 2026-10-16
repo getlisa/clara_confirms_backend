@@ -441,6 +441,35 @@ function mapContactRow(c) {
   };
 }
 
+/**
+ * Deactivated contacts. Every other contact source in this file is blind to a
+ * contact that was deactivated in ServiceTrade: the /contact?companyId= roster
+ * only returns active contacts, deactivating usually unlinks the contact from
+ * its companies/locations too, and job embeds stop naming it once the job's
+ * primary contact is repointed. Without this pass the platform kept the old
+ * row — "public", still linked, still a confirmation recipient — forever.
+ *
+ * `status=inactive` is not in ServiceTrade's OpenAPI spec but is verified live
+ * (`status=*` returns nothing on /contact). Only contacts we already hold are
+ * written — an inactive contact we never imported has nothing to update here.
+ * The full record is written as-is, so its payload's real (usually empty)
+ * companies[]/locations[] and status reach normalize.
+ */
+async function syncInactiveContacts(companyId, credentials, params = {}) {
+  const { rows, complete } = await fetchAllPages(
+    companyId, "/contact", "contacts", credentials, { status: "inactive", ...params }
+  );
+  const fetched = rows.filter((c) => c?.id != null);
+  if (!fetched.length) return { count: 0, complete };
+  const known = await syncDb.filterKnownContactIds(companyId, fetched.map((c) => c.id));
+  const contactRows = fetched.filter((c) => known.has(String(c.id))).map(mapContactRow);
+  if (contactRows.length) await syncDb.upsertContactsBatch(companyId, contactRows);
+  logger.info("ServiceTrade sync: deactivated contacts", {
+    companyId, fetched: fetched.length, updated: contactRows.length, complete,
+  });
+  return { count: contactRows.length, complete };
+}
+
 function mapOfficeRow(o) {
   return {
     servicetrade_id: Number(o.id),
@@ -967,6 +996,20 @@ async function runSync(companyId, options = {}) {
       await engine.emit("fetched", { entity: "users", count: counts.users });
       await engine.emit("fetched", { entity: "projects", count: counts.projects });
     }
+
+    // --- Deactivated contacts (/contact?status=inactive) -------------------
+    // Runs AFTER the job fan-out's contact upsert so the inactive record wins
+    // for any contact a job still embeds. It has no cursor of its own: an
+    // incremental run borrows the jobs cursor, and a failed fetch holds that
+    // cursor back so the deactivation isn't skipped past. A full or
+    // custom-window run re-reads every inactive contact; a targeted (webhook)
+    // run looks back one day, which covers the contact event that triggered it.
+    const inactiveParams = targeted
+      ? { updatedAfter: String(Math.floor(Date.now() / 1000) - 86400) }
+      : (full || customWindow ? {} : cursorParams(state?.last_jobs_updated_at));
+    const inactive = await syncInactiveContacts(companyId, credentials, inactiveParams);
+    counts.contacts += inactive.count;
+    if (!inactive.complete) complete.jobs = false;
 
     // --- Appointments per job (/appointment?jobId={id}) --------------------
     // Replaces both the old embedded-on-/job appointment extraction and the

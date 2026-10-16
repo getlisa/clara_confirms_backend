@@ -35,6 +35,7 @@ stub("utils/logger", logger);
 // is observable rather than asserted against SQL text.
 const tables = new Map();          // table -> Set("a|b")
 const statements = [];
+const upserts = [];          // bulkUpsertByExternalRef calls, for normalize assertions
 
 function tableOf(name) {
   if (!tables.has(name)) tables.set(name, new Set());
@@ -69,6 +70,8 @@ const refMaps = {};
 stub("db", {
   query: async (sql, params) => {
     statements.push({ sql, params });
+    // _normalizeContacts' merge-away delete of duplicate contacts — not a junction.
+    if (/^\s*DELETE FROM contacts\b/.test(sql)) return { rows: [], rowCount: params[1].length };
     if (/^\s*DELETE FROM/.test(sql)) {
       const r = runDelete(sql, params);
       statements[statements.length - 1].removed = r.rowCount;   // observable, for assertions
@@ -79,7 +82,7 @@ stub("db", {
   },
   fetchAllByCompanyChunked: async (_companyId, table) => rawRows[table] || [],
   fetchExternalRefMap: async (_companyId, table) => refMaps[table] || new Map(),
-  bulkUpsertByExternalRef: async () => 0,
+  bulkUpsertByExternalRef: async (table, _fields, argsList) => { upserts.push({ table, argsList }); return argsList.length; },
   fetchAllByCompany: async () => [],
 });
 stub("db/service-line-descriptions", { listByCompany: async () => [] });
@@ -93,6 +96,7 @@ const provider = require("../src/services/crm/servicetrade/provider");
 function reset() {
   tables.clear();
   statements.length = 0;
+  upserts.length = 0;
   for (const k of Object.keys(rawRows)) rawRows[k] = [];
   for (const k of Object.keys(refMaps)) delete refMaps[k];
   logger.reset();
@@ -296,4 +300,76 @@ test("job and location junctions also replace rather than accumulate", async () 
   refMaps.offices = map([["O7", 7]]);
   await provider._normalizeLocationOffices(8);
   assert.equal(tableOf("location_offices").size, 0);
+});
+
+// ── Deactivated contacts (syncInactiveContacts) ─────────────────────────────
+
+test("a deactivated contact loses every link, even ones its payload still lists", async () => {
+  reset();
+  tableOf("contact_locations").add("700|999");
+  tableOf("contact_companies").add("700|55");
+  rawRows.servicetrade_contacts = [
+    { servicetrade_id: "C700", email: "gone@x.test", status: "inactive",
+      payload: { status: "inactive", locations: [{ id: "888" }], companies: [{ id: "CO1" }] } },
+  ];
+  refMaps.contacts = map([["C700", 700]]);
+  refMaps.locations = map([["888", 999]]);
+  refMaps.customers = map([["CO1", 55]]);
+
+  await provider._normalizeContactJunctions(8);
+
+  assert.equal(tableOf("contact_locations").size, 0, "an inactive contact is nobody's recipient");
+  assert.equal(tableOf("contact_companies").size, 0);
+});
+
+test("a deactivated contact unlinked in ServiceTrade (empty arrays) is cleaned too", async () => {
+  // The real case: deactivated AND removed from every location/company, so its
+  // payload asserts nothing — the active-contact guard would have kept the links.
+  reset();
+  tableOf("contact_locations").add("700|999");
+  tableOf("contact_companies").add("700|55");
+  rawRows.servicetrade_contacts = [
+    { servicetrade_id: "C700", email: "gone@x.test", status: "inactive", payload: { locations: [], companies: [] } },
+  ];
+  refMaps.contacts = map([["C700", 700]]);
+  refMaps.locations = map([["888", 999]]);
+  refMaps.customers = map([["CO1", 55]]);
+
+  await provider._normalizeContactJunctions(8);
+
+  assert.equal(tableOf("contact_locations").size, 0);
+  assert.equal(tableOf("contact_companies").size, 0);
+});
+
+test("an inactive duplicate does not strip the links of the active record it merged with", async () => {
+  reset();
+  tableOf("contact_locations").add("700|999");
+  rawRows.servicetrade_contacts = [
+    { servicetrade_id: "1", email: "same@x.test", status: "inactive", payload: { locations: [], companies: [] } },
+    { servicetrade_id: "2", email: "same@x.test", status: "public", payload: { locations: [{ id: "888" }] } },
+  ];
+  refMaps.contacts = map([["1", 700]]);              // lowest id is canonical
+  refMaps.locations = map([["888", 999]]);
+  refMaps.customers = new Map();
+
+  await provider._normalizeContactJunctions(8);
+
+  assert.deepEqual([...tableOf("contact_locations")], ["700|999"]);
+});
+
+test("when the canonical (lowest-id) record is inactive, the active duplicate's fields win", async () => {
+  reset();
+  rawRows.servicetrade_contacts = [
+    { servicetrade_id: "1", email: "same@x.test", status: "inactive", phone: "4155550000", first_name: "Old" },
+    { servicetrade_id: "2", email: "same@x.test", status: "public", phone: "4155551111", first_name: "New" },
+  ];
+
+  await provider._normalizeContacts(8);
+
+  const contacts = upserts.find((u) => u.table === "contacts").argsList;
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].externalRef, "1", "identity stays on the lowest id — every FK resolves through it");
+  assert.equal(contacts[0].status, "public", "otherwise the merged person vanishes from every recipient query");
+  assert.equal(contacts[0].phone, "+14155551111");
+  assert.equal(contacts[0].firstName, "New");
 });

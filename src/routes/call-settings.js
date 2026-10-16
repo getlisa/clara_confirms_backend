@@ -201,6 +201,7 @@ router.get("/contact-types", async (req, res) => {
       `SELECT lower(btrim(t)) AS type, count(DISTINCT c.id)::int AS contact_count
          FROM contacts c, jsonb_array_elements_text(c.types) t
         WHERE c.company_id = $1 AND btrim(t) <> ''
+          AND c.status IS DISTINCT FROM 'inactive'
         GROUP BY 1
         ORDER BY contact_count DESC, type`,
       [companyId]

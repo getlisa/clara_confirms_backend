@@ -76,6 +76,7 @@ async function fetchTypeMatchedContacts(companyId, customerId, types) {
        JOIN contact_companies cc ON cc.contact_id = c.id
       WHERE c.company_id = $1
         AND cc.customer_id = $2
+        AND c.status IS DISTINCT FROM 'inactive'
         AND EXISTS (
               SELECT 1 FROM jsonb_array_elements_text(c.types) t
                WHERE lower(btrim(t)) = ANY($3::text[])
@@ -160,7 +161,8 @@ async function resolveConfirmationRecipients(companyId, customerRow, { contactTy
     }
     const { rows } = await db.query(
       `SELECT id, first_name, last_name, phone, mobile, alternate_phone, email
-         FROM contacts WHERE company_id = $1 AND id = ANY($2::int[])`,
+         FROM contacts WHERE company_id = $1 AND id = ANY($2::int[])
+          AND status IS DISTINCT FROM 'inactive'`,
       [companyId, contactIds]
     );
     // A contact id that doesn't resolve (deleted, cross-tenant mistake) is

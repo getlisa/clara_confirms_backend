@@ -542,7 +542,7 @@ class ServiceTradeProvider extends CrmProvider {
    * doesn't) — until then this is a no-op, which is expected.
    */
   async _normalizeContactJunctions(companyId, dedupe = null) {
-    const rawContacts = await db.fetchAllByCompanyChunked(companyId, "servicetrade_contacts", { columns: "id, servicetrade_id, payload, email" });
+    const rawContacts = await db.fetchAllByCompanyChunked(companyId, "servicetrade_contacts", { columns: "id, servicetrade_id, payload, email, status" });
     const alias = (dedupe || dedupeContactsByEmail(rawContacts)).alias;
     const [contactsMap, locationsMap, customersMap] = await Promise.all([
       refMap(companyId, "contacts"),
@@ -570,9 +570,11 @@ class ServiceTradeProvider extends CrmProvider {
     // costs nothing today — it just refuses to act on a payload that never told
     // us anything.
     //
-    // Residual gap, deliberately left: a contact removed from its LAST location
-    // is not cleaned, because its payload then asserts nothing. Closing that
-    // needs the raw upsert to merge these arrays rather than replace them.
+    // Residual gap, deliberately left: an ACTIVE contact removed from its LAST
+    // location is not cleaned, because its payload then asserts nothing.
+    // Closing that needs the raw upsert to merge these arrays rather than
+    // replace them. A DEACTIVATED contact is cleaned (below): whatever links
+    // ServiceTrade still shows, an inactive contact is nobody's recipient.
     const locationParents = new Set();
     const companyParents = new Set();
     // Every duplicate's links are walked, but resolved onto the CANONICAL
@@ -582,6 +584,16 @@ class ServiceTradeProvider extends CrmProvider {
       const canonicalRef = alias.get(String(row.servicetrade_id)) ?? String(row.servicetrade_id);
       const contactId = contactsMap.get(canonicalRef);
       if (!contactId) continue;
+
+      // Deactivated in ServiceTrade (syncInactiveContacts): every link this
+      // record contributed is dropped. It joins both parent sets with zero
+      // pairs, so replaceJunction deletes them — while an ACTIVE duplicate
+      // merged onto the same canonical contact still re-adds its own links.
+      if (row.status === "inactive") {
+        locationParents.add(contactId);
+        companyParents.add(contactId);
+        continue;
+      }
 
       // The plural array only wins when it actually has entries — ServiceTrade's
       // real /contact?companyId= responses are inconsistent about this: some
@@ -1214,6 +1226,16 @@ function dedupeContactsByEmail(rawContacts) {
   for (const rows of groups.values()) {
     rows.sort((a, b) => (BigInt(a.servicetrade_id) < BigInt(b.servicetrade_id) ? -1 : 1));
     const canonical = { ...rows[0] };
+    // The lowest id keeps the identity, but a deactivated record must not
+    // speak for a person who still has an active one: its status would hide
+    // the merged contact from every recipient query, and its phone/email are
+    // the stale ones. The first active duplicate's values win instead.
+    const firstActive = rows.find((r) => r.status !== "inactive");
+    if (canonical.status === "inactive" && firstActive) {
+      for (const field of MERGEABLE) {
+        if (!isEmpty(firstActive[field])) canonical[field] = firstActive[field];
+      }
+    }
     for (const dup of rows.slice(1)) {
       for (const field of MERGEABLE) {
         if (isEmpty(canonical[field]) && !isEmpty(dup[field])) canonical[field] = dup[field];
