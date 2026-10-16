@@ -1,5 +1,6 @@
 /**
- * Deactivated ServiceTrade contacts must reach the platform.
+ * Contacts that change in ServiceTrade without a job changing must reach the
+ * platform — on Sync now / the hourly poll, and on the webhook refresh.
  *
  * Found on a real account: 254 contacts were deactivated and unlinked from
  * every company/location in ServiceTrade, and the platform kept all of them —
@@ -7,7 +8,9 @@
  * the sync had was blind to them: /contact?companyId= only returns active
  * contacts, and once a job's primary contact is repointed no job embeds the
  * old one either. The sync now reads /contact?status=inactive (undocumented,
- * verified live — `status=*` returns nothing on that endpoint).
+ * verified live — `status=*` returns nothing on that endpoint) and the
+ * contacts updated since the cursor, and a webhook contact event fetches the
+ * contact by id.
  */
 
 const test = require("node:test");
@@ -32,13 +35,18 @@ stub("db/servicetrade-credentials", {
 });
 
 const CURSOR = 1700000000;
-const known = new Set();
+const known = { contacts: new Set(), customers: new Set(), locations: new Set() };
 const contactUpserts = [];
 const stateWrites = [];
+const pick = (set, ids) => new Set(ids.map(String).filter((id) => set.has(id)));
 stub("db/servicetrade-sync", new Proxy({
   getSyncState: async () => ({ last_jobs_updated_at: CURSOR, last_appointments_updated_at: CURSOR }),
   updateSyncState: async (_c, fields) => { stateWrites.push(fields); },
-  filterKnownContactIds: async (_c, ids) => new Set(ids.map(String).filter((id) => known.has(id))),
+  filterKnownRefs: async (_c, { contactIds = [], customerIds = [], locationIds = [] }) => ({
+    contactIds: pick(known.contacts, contactIds),
+    customerIds: pick(known.customers, customerIds),
+    locationIds: pick(known.locations, locationIds),
+  }),
   upsertContactsBatch: async (_c, rows) => { contactUpserts.push(...rows); },
 }, {
   get: (target, prop) => prop in target ? target[prop] : async () => {},
@@ -46,72 +54,90 @@ stub("db/servicetrade-sync", new Proxy({
 
 const stEngine = require("../src/services/servicetrade-sync");
 
-const inactiveContact = (id, extra = {}) => ({
-  id, firstName: "Old", lastName: "Contact", email: `old${id}@x.test`, phone: "555",
-  status: "inactive", locations: [], companies: [], ...extra,
+const contact = (id, extra = {}) => ({
+  id, firstName: "A", lastName: "Contact", email: `c${id}@x.test`, phone: "555",
+  status: "public", locations: [], companies: [], ...extra,
 });
+const ok = (data) => ({ ok: true, status: 200, data: { totalPages: 1, page: 1, ...data }, messages: {} });
 
-let inactivePage;
+let inactivePage, activePage, byId;
 function reset() {
   stCalls.length = 0;
   contactUpserts.length = 0;
   stateWrites.length = 0;
-  known.clear();
-  inactivePage = { ok: true, status: 200, data: { totalPages: 1, page: 1, contacts: [] }, messages: {} };
+  for (const s of Object.values(known)) s.clear();
+  inactivePage = ok({ contacts: [] });
+  activePage = ok({ contacts: [] });
+  byId = new Map();
   stImpl = async (_c, _m, path) => {
-    if (path.startsWith("/contact?") && path.includes("status=inactive")) return inactivePage;
-    if (path.startsWith("/job?")) return { ok: true, status: 200, data: { totalPages: 1, page: 1, jobs: [] }, messages: {} };
-    return { ok: true, status: 200, data: { totalPages: 1, page: 1 }, messages: {} };
+    if (path.startsWith("/contact?")) return path.includes("status=inactive") ? inactivePage : activePage;
+    if (path.startsWith("/contact/")) {
+      const c = byId.get(path.split("/")[2]);
+      return c ? { ok: true, status: 200, data: c, messages: {} } : { ok: false, status: 404, data: null, messages: {} };
+    }
+    if (path.startsWith("/job?")) return ok({ jobs: [] });
+    return ok({});
   };
   logger.reset();
 }
 
-const inactiveCall = () => {
-  const c = stCalls.find((x) => x.path.startsWith("/contact?") && x.path.includes("status=inactive"));
-  return c && new URLSearchParams(c.path.split("?")[1]);
-};
+const contactListCalls = () => stCalls
+  .filter((x) => x.path.startsWith("/contact?"))
+  .map((x) => new URLSearchParams(x.path.split("?")[1]));
 
-test("an incremental run reads contacts deactivated since the jobs cursor", async () => {
+// ── Sync now / hourly poll ──────────────────────────────────────────────────
+
+test("an incremental run reads inactive AND updated contacts since the jobs cursor", async () => {
   reset();
   await stEngine.runSync(8, {});
-  const qs = inactiveCall();
-  assert.ok(qs, "the run must ask ServiceTrade for inactive contacts");
-  assert.equal(qs.get("status"), "inactive");
-  assert.equal(qs.get("updatedAfter"), String(CURSOR - 5 * 60), "borrows the jobs cursor with its usual overlap");
+  const calls = contactListCalls();
+  assert.equal(calls.length, 2);
+  const since = String(CURSOR - 5 * 60);
+  assert.ok(calls.some((q) => q.get("status") === "inactive" && q.get("updatedAfter") === since));
+  assert.ok(calls.some((q) => q.get("status") === null && q.get("updatedAfter") === since),
+    "a contact edited at a customer whose jobs didn't change is otherwise invisible to Sync now");
 });
 
-test("a full run re-reads every inactive contact", async () => {
+test("a full run re-reads every inactive contact but never lists the whole account's active ones", async () => {
   reset();
   await stEngine.runSync(8, { full: true });
-  const qs = inactiveCall();
-  assert.ok(qs);
-  assert.equal(qs.get("updatedAfter"), null);
+  const calls = contactListCalls();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].get("status"), "inactive");
+  assert.equal(calls[0].get("updatedAfter"), null);
 });
 
-test("a targeted (webhook) run looks back one day", async () => {
+test("inactive contacts: only ones the platform holds are written, flagged as full records", async () => {
   reset();
-  const before = Math.floor(Date.now() / 1000);
-  await stEngine.runSync(8, { jobIds: ["111"] });
-  const qs = inactiveCall();
-  assert.ok(qs, "a contact webhook drains as a targeted run — it must see the deactivation too");
-  const after = Number(qs.get("updatedAfter"));
-  assert.ok(after >= before - 86400 - 1 && after <= before - 86400 + 5);
-});
-
-test("only contacts the platform already holds are written, as inactive with their real (empty) links", async () => {
-  reset();
-  known.add("101");
-  inactivePage.data.contacts = [inactiveContact(101), inactiveContact(202)];
+  known.contacts.add("101");
+  known.customers.add("900");
+  inactivePage = ok({ contacts: [contact(101, { status: "inactive" }), contact(202, { status: "inactive", companies: [{ id: 900 }] })] });
   await stEngine.runSync(8, {});
   assert.deepEqual(contactUpserts.map((r) => r.servicetrade_id), [101],
-    "an inactive contact we never imported has nothing on the platform to update");
+    "an inactive contact we never imported has nothing on the platform to update — even at a known customer");
   const [row] = contactUpserts;
   assert.equal(row.status, "inactive");
   assert.deepEqual(row.payload.locations, []);
-  assert.deepEqual(row.payload.companies, []);
+  assert.equal(row.payload._fullRecord, true, "its empty links are the truth, not an absence of data");
 });
 
-test("a failed inactive-contact fetch holds the jobs cursor back so the deactivation isn't skipped", async () => {
+test("updated active contacts: written when held, or when they belong to a customer/location we hold", async () => {
+  reset();
+  known.contacts.add("1");
+  known.customers.add("900");
+  known.locations.add("700");
+  activePage = ok({ contacts: [
+    contact(1),                                         // held — e.g. its phone changed
+    contact(2, { companies: [{ id: 900 }] }),           // new colleague at a known customer
+    contact(3, { company: { id: 900 } }),               // singular `company` only (seen live)
+    contact(4, { locations: [{ id: 700 }] }),           // new contact at a known location
+    contact(5, { companies: [{ id: 111 }] }),           // someone else's customer
+  ] });
+  await stEngine.runSync(8, {});
+  assert.deepEqual(contactUpserts.map((r) => r.servicetrade_id).sort(), [1, 2, 3, 4]);
+});
+
+test("a failed contact fetch holds the jobs cursor back so the change isn't skipped", async () => {
   reset();
   inactivePage = { ok: false, status: 400, data: null, messages: {} }; // 4xx: not retried
   await stEngine.runSync(8, {});
@@ -124,4 +150,29 @@ test("a clean run still advances the jobs cursor", async () => {
   await stEngine.runSync(8, {});
   assert.equal(stateWrites.length, 1);
   assert.notEqual(stateWrites[0].last_jobs_updated_at, undefined);
+});
+
+// ── Webhook refresh ─────────────────────────────────────────────────────────
+
+test("a targeted run with only contactIds fetches each contact by id — no job, no list call", async () => {
+  reset();
+  known.contacts.add("101");
+  byId.set("101", contact(101, { status: "inactive" }));
+  const out = await stEngine.runSync(8, { jobIds: [], contactIds: ["101", "404"] });
+  assert.equal(out.success, true);
+  assert.equal(out.targeted, true);
+  assert.deepEqual(stCalls.map((c) => c.path).sort(), ["/contact/101", "/contact/404"]);
+  assert.deepEqual(contactUpserts.map((r) => r.servicetrade_id), [101]);
+  assert.equal(contactUpserts[0].status, "inactive");
+  assert.equal(stateWrites.length, 0, "a targeted run never advances a cursor");
+});
+
+test("a targeted job-only run makes no contact calls at all", async () => {
+  reset();
+  stImpl = async (_c, _m, path) => path.startsWith("/job/")
+    ? { ok: true, status: 200, data: { id: "111", status: "scheduled" }, messages: {} }
+    : ok({ appointments: [] });
+  await stEngine.runSync(8, { jobIds: ["111"] });
+  assert.equal(stCalls.filter((c) => c.path.startsWith("/contact")).length, 0,
+    "the webhook drain runs every minute — job events must not pay for contact lists");
 });

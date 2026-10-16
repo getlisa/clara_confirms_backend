@@ -6,13 +6,19 @@
  * affects, refresh those jobs through the existing sync pipeline, then
  * normalize.
  *
- * ── Why everything resolves to a job id ────────────────────────────────────
+ * ── Why (almost) everything resolves to a job id ───────────────────────────
  * runSync's per-job detail fetch already fans out the entire graph around a
  * job — appointments, customer, location, contacts, offices, tags,
  * technicians, comments — so feeding it a job id refreshes all of them with no
  * second code path to keep in step with the bulk sync. An event about a
  * contact or a location is therefore translated into "which jobs does this
- * affect", not into a bespoke contact fetch.
+ * affect".
+ *
+ * The one exception: a `contact` event ALSO refreshes the contact itself, by
+ * id. Resolving only to jobs skipped a contact with no outstanding job, and a
+ * deactivated or unlinked contact never reaches the job fan-out at all (the
+ * customer roster lists only active, linked contacts) — so those changes
+ * waited for a full sync.
  *
  * ── What this does NOT do ──────────────────────────────────────────────────
  * It is not a replacement for the hourly /admin/crm-sync. ServiceRequest is not
@@ -191,6 +197,7 @@ async function drainCompany(companyId, { batchSize = BATCH_SIZE } = {}) {
   }
 
   const jobIds = new Set();
+  const contactIds = new Set();
   const resolvedIds = [];
   const skippedIds = [];
   const failedIds = [];
@@ -198,12 +205,14 @@ async function drainCompany(companyId, { batchSize = BATCH_SIZE } = {}) {
   for (const event of events) {
     try {
       const ids = await resolveJobIds(companyId, event, credentials);
-      if (ids.length === 0) {
+      const contactRef = event.entity_type === "contact" && isRef(String(event.entity_id)) ? String(event.entity_id) : null;
+      if (ids.length === 0 && !contactRef) {
         skippedIds.push(event.id);
         continue;
       }
       ids.forEach((id) => jobIds.add(id));
-      resolvedIds.push({ id: event.id, jobRef: ids[0] });
+      if (contactRef) contactIds.add(contactRef);
+      resolvedIds.push({ id: event.id, jobRef: ids[0] ?? null });
     } catch (err) {
       logger.warn("ServiceTrade webhook: resolve failed", {
         companyId, eventId: event.id, entity: `${event.entity_type}#${event.entity_id}`, error: err.message,
@@ -215,15 +224,15 @@ async function drainCompany(companyId, { batchSize = BATCH_SIZE } = {}) {
   if (skippedIds.length) await webhooksDb.markSkipped(skippedIds, "no job affected");
   if (failedIds.length) await webhooksDb.markFailed(failedIds, "could not resolve job");
 
-  if (jobIds.size === 0) {
+  if (jobIds.size === 0 && contactIds.size === 0) {
     return { claimed: events.length, jobIds: [], synced: false, skipped: skippedIds.length, failed: failedIds.length };
   }
 
   const ids = [...jobIds];
-  logger.info("ServiceTrade webhook drain: syncing jobs", { companyId, events: events.length, jobs: ids.length });
+  logger.info("ServiceTrade webhook drain: syncing jobs", { companyId, events: events.length, jobs: ids.length, contacts: contactIds.size });
 
   try {
-    const sync = await stEngine.runSync(companyId, { jobIds: ids });
+    const sync = await stEngine.runSync(companyId, { jobIds: ids, contactIds: [...contactIds] });
     if (!sync.success) throw new Error(sync.error || "targeted sync failed");
 
     // normalizeAll is watermark-driven (migration 086), so it picks up exactly

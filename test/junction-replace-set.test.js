@@ -373,3 +373,22 @@ test("when the canonical (lowest-id) record is inactive, the active duplicate's 
   assert.equal(contacts[0].phone, "+14155551111");
   assert.equal(contacts[0].firstName, "New");
 });
+
+test("an ACTIVE contact from a full /contact record with no links loses its stale ones", async () => {
+  // Closes the old residual gap: removed from its last location, still active.
+  reset();
+  tableOf("contact_locations").add("800|999");
+  tableOf("contact_companies").add("800|55");
+  rawRows.servicetrade_contacts = [
+    { servicetrade_id: "C800", email: "moved@x.test", status: "public",
+      payload: { _fullRecord: true, locations: [], companies: [] } },
+  ];
+  refMaps.contacts = map([["C800", 800]]);
+  refMaps.locations = map([["888", 999]]);
+  refMaps.customers = map([["CO1", 55]]);
+
+  await provider._normalizeContactJunctions(8);
+
+  assert.equal(tableOf("contact_locations").size, 0);
+  assert.equal(tableOf("contact_companies").size, 0);
+});

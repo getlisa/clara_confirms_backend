@@ -196,7 +196,7 @@ async function markDoneWithRefs(pairs) {
         SET status = 'done', processed_at = NOW(), last_error = NULL, resolved_job_ref = v.job_ref
        FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::text[]) AS job_ref) v
       WHERE e.id = v.id`,
-    [pairs.map((p) => p.id), pairs.map((p) => String(p.jobRef))]
+    [pairs.map((p) => p.id), pairs.map((p) => (p.jobRef == null ? null : String(p.jobRef)))]
   );
 }
 
