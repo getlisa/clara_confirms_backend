@@ -33,6 +33,20 @@ router.use(authenticate);
  * never returned or logged.
  * Body: { username, password, metadata? } — on reconnect, metadata is merged with existing.
  */
+/**
+ * Best-effort: give a freshly (re)connected account its webhook. Awaited (one or
+ * two ServiceTrade calls) because Vercel may freeze the instance once the
+ * response is sent; never fails the connect itself — the daily crm-sync retries.
+ */
+async function ensureWebhook(companyId, reason) {
+  try {
+    const r = await webhookRegistration.ensureRegistered(companyId);
+    if (!r.ok) logger.warn(`ServiceTrade ${reason}: webhook auto-registration failed`, { companyId, error: r.error || r.skipped });
+  } catch (err) {
+    logger.warn(`ServiceTrade ${reason}: webhook auto-registration threw`, { companyId, error: err.message });
+  }
+}
+
 router.post("/credentials", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   const companyId = req.user.companyId;
   const { username, password, metadata } = req.body || {};
@@ -65,6 +79,7 @@ router.post("/credentials", requirePermission(PERM.INTEGRATIONS_MANAGE), async (
     syncAccountTimezone(companyId).catch((err) => {
       logger.warn("ServiceTrade connect: account timezone sync failed", { companyId, error: err.message });
     });
+    await ensureWebhook(companyId, "connect");
 
     return res.json({
       connected: true,
@@ -99,6 +114,7 @@ router.post("/login", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, r
         error: health.auth_error || "Could not renew the ServiceTrade session. Connect again with username and password.",
       });
     }
+    await ensureWebhook(companyId, "reconnect");
     return res.json({ connected: true, auto_reconnect: health.auto_reconnect, message: "ServiceTrade session renewed" });
   } catch (err) {
     logger.error("ServiceTrade manual re-login error", { error: err.message });
