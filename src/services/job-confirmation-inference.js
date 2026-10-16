@@ -142,7 +142,14 @@ async function analyzeJob(openai, { jobNumber, customerName, comments }) {
  * or when its comment count hasn't grown since the last assessment (nothing
  * new to re-read). Returns the number of jobs actually (re-)assessed.
  */
-async function inferJobConfirmations(companyId) {
+/**
+ * @param {object} [opts]
+ * @param {number[]} [opts.jobIds] — only assess these platform jobs. A one-job
+ *   refresh passes its job: the unscoped pass walks every upcoming unconfirmed
+ *   job in the company (~2k sequential queries on a 360-job account), which is
+ *   right for a sync and far too slow for a button press.
+ */
+async function inferJobConfirmations(companyId, { jobIds = null } = {}) {
   if (!process.env.OPENAI_API_KEY) {
     logger.warn("inferJobConfirmations: OPENAI_API_KEY not set; skipping", { companyId });
     return 0;
@@ -155,8 +162,9 @@ async function inferJobConfirmations(companyId) {
       WHERE a.company_id = $1
         AND a.status IN ('scheduled', 'confirmed', 'rescheduled')
         AND a.scheduled_start > NOW()
-        AND COALESCE(a.customer_confirmed, false) = false`,
-    [companyId]
+        AND COALESCE(a.customer_confirmed, false) = false
+        AND ($2::int[] IS NULL OR a.job_id = ANY($2::int[]))`,
+    [companyId, jobIds]
   );
 
   let assessed = 0;

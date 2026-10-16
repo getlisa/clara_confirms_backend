@@ -21,6 +21,7 @@ const { syncJobConfirmationStatus } = require("../services/job-confirmation-stat
 const scheduler = require("../services/scheduler");
 const callSettingsDb = require("../db/call-settings");
 const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
+const jobRefresh = require("../services/job-refresh");
 
 const router = express.Router();
 router.use(authenticate);
@@ -302,6 +303,51 @@ router.post("/", requirePermission(PERM.JOBS_EDIT), async (req, res) => {
   } catch (err) {
     logger.error("POST /jobs failed", { error: err.message });
     return res.status(500).json({ error: "Failed to create job" });
+  }
+});
+
+// Refresh errors → HTTP status (docs/crm-sync-frontend.md §2).
+const REFRESH_STATUS = {
+  not_found: 404, not_in_crm: 404, not_syncable: 400, not_supported: 501,
+  too_soon: 429, reconnect_required: 409, crm_unavailable: 502, crm_timeout: 504,
+};
+// Past this, answer 504 and let the refresh finish in the background — the
+// data still lands, and the auto-update / next view picks it up.
+const REFRESH_TIMEOUT_MS = 60_000;
+
+/**
+ * POST /jobs/:id/refresh — the ↻ button on every job. Re-reads the job's whole
+ * graph from its CRM (appointments, technicians, services, customer, location,
+ * contacts, deficiencies, service requests, notes) and returns the updated job
+ * plus a field-level list of what changed.
+ */
+router.post("/:id/refresh", requirePermission(PERM.SYNC_RUN), async (req, res) => {
+  const companyId = getCompanyId(req);
+  if (!companyId) return res.status(403).json({ error: "Company context required" });
+  const jobId = Number(req.params.id);
+  if (!Number.isInteger(jobId)) return res.status(404).json({ error: "Job not found", code: "not_found" });
+
+  let timer;
+  try {
+    const result = await Promise.race([
+      jobRefresh.refreshJob(companyId, jobId, { trigger: "manual" }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new jobRefresh.RefreshError("crm_timeout", "The CRM didn't respond in time")), REFRESH_TIMEOUT_MS);
+      }),
+    ]);
+    const [job, tz] = await Promise.all([jobsDb.getJobById(jobId, companyId), getCompanyTimezone(companyId)]);
+    return res.json({ job: localizeJob(job, tz), ...result });
+  } catch (err) {
+    if (err instanceof jobRefresh.RefreshError) {
+      return res.status(REFRESH_STATUS[err.code] || 502).json({
+        error: err.message, code: err.code,
+        ...(err.retry_after_s ? { retry_after_s: err.retry_after_s } : {}),
+      });
+    }
+    logger.error("POST /jobs/:id/refresh failed", { companyId, jobId, error: err.message });
+    return res.status(500).json({ error: "Failed to refresh job", code: "internal" });
+  } finally {
+    clearTimeout(timer);
   }
 });
 
