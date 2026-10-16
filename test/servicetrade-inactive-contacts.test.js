@@ -176,3 +176,58 @@ test("a targeted job-only run makes no contact calls at all", async () => {
   assert.equal(stCalls.filter((c) => c.path.startsWith("/contact")).length, 0,
     "the webhook drain runs every minute — job events must not pay for contact lists");
 });
+
+// ── Deficiencies in the regular sync ────────────────────────────────────────
+// Nothing in the regular sync read ServiceTrade deficiencies, so every first
+// job Refresh reported its location's deficiencies as "added" although nobody
+// had changed anything in ServiceTrade.
+
+const defCalls = () => stCalls.filter((c) => c.path.startsWith("/deficiency?")).map((c) => new URLSearchParams(c.path.split("?")[1]));
+
+test("an incremental run reads deficiencies changed since the jobs cursor; a full run reads them all", async () => {
+  reset();
+  await stEngine.runSync(8, {});
+  assert.equal(defCalls().length, 1);
+  assert.equal(defCalls()[0].get("updatedAfter"), String(CURSOR - 5 * 60));
+  reset();
+  await stEngine.runSync(8, { full: true });
+  assert.equal(defCalls()[0].get("updatedAfter"), null);
+});
+
+test("only deficiencies at locations the platform holds are written", async () => {
+  reset();
+  known.locations.add("900");
+  const base = stImpl;
+  stImpl = async (c, m, path) => path.startsWith("/deficiency?")
+    ? ok({ deficiencies: [
+        { id: 1, title: "Deficient - Street Side", status: "verified", location: { id: 900 } },
+        { id: 2, title: "Elsewhere", status: "new", location: { id: 777 } },
+        { id: 3, title: "No location" },
+      ] })
+    : base(c, m, path);
+  const writes = [];
+  const syncDbStub = require("../src/db/servicetrade-sync");
+  const orig = syncDbStub.upsertDeficienciesBatch;
+  syncDbStub.upsertDeficienciesBatch = async (_c, rows) => { writes.push(...rows); };
+  try {
+    await stEngine.runSync(8, {});
+  } finally {
+    syncDbStub.upsertDeficienciesBatch = orig;
+  }
+  assert.deepEqual(writes.map((r) => r.servicetrade_id), [1]);
+  assert.equal(writes[0].name, "Deficient - Street Side");
+});
+
+test("a failed deficiency fetch holds the jobs cursor back", async () => {
+  reset();
+  const base = stImpl;
+  stImpl = async (c, m, path) => path.startsWith("/deficiency?") ? { ok: false, status: 400, data: null, messages: {} } : base(c, m, path);
+  await stEngine.runSync(8, {});
+  assert.equal(stateWrites[0].last_jobs_updated_at, undefined);
+});
+
+test("a targeted (webhook / refresh) run never runs the account-wide deficiency pass", async () => {
+  reset();
+  await stEngine.runSync(8, { jobIds: [], contactIds: ["101"] });
+  assert.equal(defCalls().length, 0);
+});
