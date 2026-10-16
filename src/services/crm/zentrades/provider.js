@@ -489,6 +489,19 @@ class ZenTradesProvider extends CrmProvider {
    *   nothing here has a "week/month/3month" concept the way ServiceTrade's
    *   calendar-month default does).
    */
+  /**
+   * Re-read ONE ticket's whole graph from ZenTrades — the per-job Refresh
+   * button (docs/crm-sync-strategy.md §4.3a). See zentrades-sync.js's
+   * refreshTicket for what is fetched.
+   */
+  async refreshJob(companyId, job) {
+    if (!job?.external_ref) return { ok: false, code: "not_in_crm" };
+    const raw = await ztSync.refreshTicket(companyId, job.external_ref);
+    if (!raw.success) return { ok: false, code: raw.code, error: raw.error };
+    await this.normalizeAll(companyId);
+    return { ok: true, incomplete: raw.incomplete || [] };
+  }
+
   async syncAll(companyId, { full = false, engine = null, scheduleDateFrom = null, scheduleDateTo = null } = {}) {
     try {
       const rawResult = await ztSync.runSync(companyId, { full, engine, scheduleDateFrom, scheduleDateTo });
@@ -634,15 +647,21 @@ class ZenTradesProvider extends CrmProvider {
 
   async _normalizeAppointments(companyId) {
     const raw = await db.fetchAllByCompanyChunked(companyId, "zentrades_appointments");
-    const [jobsMap, techniciansMap] = await Promise.all([
+    const [jobsMap, techniciansMap, completeTickets] = await Promise.all([
       refMap(companyId, "jobs"),
       refMap(companyId, "technicians"),
+      db.query(
+        `SELECT zentrades_id::text AS id FROM zentrades_tickets
+          WHERE company_id = $1 AND lower(btrim(job_status)) = 'complete'`,
+        [companyId]
+      ).then((r) => new Set(r.rows.map((x) => x.id))),
     ]);
     const argsList = raw
       .map((row) => {
         const jobId = row.zentrades_ticket_id != null ? jobsMap.get(String(row.zentrades_ticket_id)) ?? null : null;
         const technicianId = row.zentrades_technician_id != null ? techniciansMap.get(String(row.zentrades_technician_id)) ?? null : null;
-        return normalize.normalizeAppointment(row, { companyId, jobId, technicianId });
+        const ticketComplete = row.zentrades_ticket_id != null && completeTickets.has(String(row.zentrades_ticket_id));
+        return normalize.normalizeAppointment(row, { companyId, jobId, technicianId, ticketComplete });
       })
       .filter(Boolean);
     await db.bulkUpsertByExternalRef("appointments", APPOINTMENT_FIELDS, argsList);

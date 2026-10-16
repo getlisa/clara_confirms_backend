@@ -35,6 +35,9 @@ const SOURCE = "zentrades";
 // dispatched technician as unscheduled, precisely what this function exists
 // to avoid).
 const OPEN_JOB_STATUS_LABEL = "open";
+// Verified live on both tenants (2026-10-17). The regular sync only fetches
+// Open tickets; a Complete one arrives via the per-job Refresh.
+const COMPLETE_JOB_STATUS_LABEL = "complete";
 
 /**
  * One `name` string -> {firstName, lastName}. Only needed for
@@ -111,6 +114,7 @@ function mapJobStatus(row) {
   if (statusLabel === OPEN_JOB_STATUS_LABEL) {
     return { status: ticketHasLiveAssignment(p) ? "scheduled" : "open", warning: null };
   }
+  if (statusLabel === COMPLETE_JOB_STATUS_LABEL) return { status: "completed", warning: null };
   return {
     status: "open",
     warning: {
@@ -126,9 +130,13 @@ function mapJobStatus(row) {
  * signals today. A plain "Open" -> scheduled default until a real mapping
  * is confirmed against production data carrying other values.
  */
-function mapAssignmentStatus(row) {
+function mapAssignmentStatus(row, { ticketComplete = false } = {}) {
   const p = row.payload || {};
   if (p.isDeleted === true || p.isActive === false) return "cancelled";
+  // A Complete ticket keeps its assignments active (verified live), so the
+  // ticket's status is what says the visit is done — otherwise Clara could
+  // still try to confirm a visit on finished work.
+  if (ticketComplete) return "completed";
   return "scheduled";
 }
 
@@ -413,7 +421,7 @@ function normalizeJob(row, { companyId, customerId, locationId, technicianId = n
 }
 
 /** zentrades_appointments (one per assignment, 1:1) -> platform `appointments`. */
-function normalizeAppointment(row, { companyId, jobId, technicianId }) {
+function normalizeAppointment(row, { companyId, jobId, technicianId, ticketComplete = false }) {
   if (!row) return null;
   const warnings = [];
   if (!row.scheduled_start) {
@@ -429,7 +437,7 @@ function normalizeAppointment(row, { companyId, jobId, technicianId }) {
     source: SOURCE,
     jobId,
     technicianId,
-    status: mapAssignmentStatus(row),
+    status: mapAssignmentStatus(row, { ticketComplete }),
     scheduledStart: row.scheduled_start || null,
     scheduledEnd: row.scheduled_end || null,
     duration,

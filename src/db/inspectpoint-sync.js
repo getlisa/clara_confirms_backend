@@ -181,7 +181,36 @@ async function listOpenInspectionIdsInWindow(companyId, from, to) {
   return rows.map((r) => String(r.inspectpoint_id));
 }
 
+/**
+ * Remove raw visits of one inspection that InspectPoint no longer returns and
+ * cancel their platform appointments — mirrors servicetrade-sync's
+ * reconcileAppointmentsForJob. Only called after a COMPLETE visit fetch.
+ */
+async function reconcileVisitsForInspection(companyId, inspectionId, keepIds) {
+  const { rows } = await db.query(
+    `DELETE FROM inspectpoint_appointments
+      WHERE company_id = $1 AND inspectpoint_job_id::text = $2
+        AND NOT (inspectpoint_id::text = ANY($3::text[]))
+      RETURNING inspectpoint_id::text AS ref`,
+    [companyId, String(inspectionId), keepIds.map(String)]
+  );
+  const removed = rows.map((r) => r.ref);
+  if (!removed.length) return { removed, cancelled: 0 };
+  const { rowCount: cancelled } = await db.query(
+    `UPDATE appointments
+        SET status = 'cancelled',
+            cancellation_reason = COALESCE(cancellation_reason, 'Deleted in InspectPoint'),
+            updated_at = NOW()
+      WHERE company_id = $1 AND source = 'inspectpoint'
+        AND external_ref = ANY($2::text[])
+        AND status NOT IN ('completed', 'cancelled')`,
+    [companyId, removed]
+  );
+  return { removed, cancelled };
+}
+
 module.exports = {
+  reconcileVisitsForInspection,
   getSyncState, updateSyncState, upsertRawBatch, listRaw,
   listOpenInspectionIdsInWindow,
 };
