@@ -360,6 +360,134 @@ async function fetchRecurrences(companyId, tickets) {
   };
 }
 
+// ── Ticket graph: decompose + write (shared by runSync and refreshTicket) ──
+
+/**
+ * Split ticket hits into the six raw sinks. A ticket detail (GET /api/ticket)
+ * has the same shape as a search hit (plus extras), so the same decomposition
+ * serves the per-job refresh.
+ */
+function decomposeTickets(tickets) {
+  const customers = new Map();
+  const locations = new Map();
+  const technicians = new Map();
+  const contacts = new Map();
+  const ticketRows = [];
+  const appointmentRows = [];
+  let thinHitCount = 0;
+
+  for (const hit of tickets) {
+    ticketRows.push(mapTicketRow(hit));
+
+    for (const a of (Array.isArray(hit.assignments) ? hit.assignments : [])) {
+      if (a?.id == null) continue;
+      appointmentRows.push(mapAppointmentRow(a, hit.id));
+      if (a.technician?.id != null) keepFreshest(technicians, a.technician.id, a.technician);
+    }
+
+    if (hit.serviceAddress?.id != null) {
+      keepFreshest(locations, hit.serviceAddress.id, hit.serviceAddress);
+      keepFreshest(contacts, `addr:${hit.serviceAddress.id}`, { kind: "service_address", data: hit.serviceAddress, parent: null }, (o) => o.data.updatedAt);
+      for (const ac of (hit.serviceAddress.additionalContacts || [])) {
+        if (ac?.id == null) continue;
+        keepFreshest(contacts, `ac:${ac.id}`, { kind: "additional", data: ac, parent: hit.serviceAddress }, (o) => o.data.updatedAt);
+      }
+    } else {
+      thinHitCount++;
+    }
+
+    if (hit.customer?.id != null) {
+      keepFreshest(customers, hit.customer.id, hit.customer);
+      keepFreshest(contacts, `cust:${hit.customer.id}`, { kind: "customer", data: hit.customer, parent: null }, (o) => o.data.updatedAt);
+    } else {
+      thinHitCount++;
+    }
+  }
+  return { customers, locations, technicians, contacts, ticketRows, appointmentRows, thinHitCount };
+}
+
+async function writeTicketGraph(companyId, graph, recurrenceRows) {
+  const out = {};
+  out.customers = await syncDb.upsertRawBatch("zentrades_customers", [], companyId, [...graph.customers.values()].map(mapCustomerRow));
+  out.locations = await syncDb.upsertRawBatch("zentrades_locations", ["zentrades_customer_id", "do_not_serve"], companyId, [...graph.locations.values()].map(mapLocationRow));
+  out.technicians = await syncDb.upsertRawBatch("zentrades_technicians", [], companyId, [...graph.technicians.values()].map(mapTechnicianRow));
+  out.contacts = await syncDb.upsertRawBatch(
+    "zentrades_contacts", ["contact_kind", "zentrades_customer_id", "zentrades_location_id", "email_lower"],
+    companyId, [...graph.contacts.values()].map(mapContactRow)
+  );
+  out.tickets = await syncDb.upsertRawBatch(
+    "zentrades_tickets",
+    ["zentrades_customer_id", "zentrades_location_id", "job_status_id", "job_status", "scheduled_start", "scheduled_end", "ticket_number", "combined_feature_flag"],
+    companyId, graph.ticketRows
+  );
+  out.appointments = await syncDb.upsertRawBatch(
+    "zentrades_appointments",
+    ["zentrades_ticket_id", "zentrades_technician_id", "assignment_status_id", "assignment_status", "assignment_status_cf_id", "assignment_status_cf", "scheduled_start", "scheduled_end", "recurring_assignment_id"],
+    companyId, graph.appointmentRows
+  );
+  out.recurrences = await syncDb.upsertRawBatch(
+    "zentrades_recurrences", ["zentrades_ticket_id", "rrule", "rrule_string", "nth_event", "module_id", "zt_ticket_updated_at"],
+    companyId, recurrenceRows, { conflictColumns: ["company_id", "zentrades_ticket_id"] }
+  );
+  return out;
+}
+
+// Ticket labels a refresh may write. "Open" is the only label the regular
+// sync fetches; "Complete" verified live on both tenants (2026-10-17: 101 of
+// 217 tickets on company 13, 8 of 126 on company 12) — normalize maps it to
+// completed. Any other label is unverified and would normalize to "open",
+// which could have Clara chase finished work, so a refresh leaves it alone.
+const REFRESHABLE_JOB_STATUS_LABELS = new Set(["open", "complete"]);
+
+/**
+ * Re-read ONE ticket's whole graph from ZenTrades — the per-job Refresh
+ * button (docs/crm-sync-strategy.md §4.3a): the ticket (open or complete),
+ * every assignment (removals reconciled), technicians, customer, service
+ * address and its contacts, and its recurrence. Never touches sync state.
+ *
+ * @returns {{success: true, incomplete: string[]} | {success: false, code: string, error?: string}}
+ */
+async function refreshTicket(companyId, ticketId) {
+  const credState = await credsDb.getByCompanyId(companyId);
+  if (!credState) return { success: false, code: "reconnect_required", error: "ZenTrades not connected" };
+  if (credState.authStatus !== "ok") return { success: false, code: "reconnect_required", error: `ZenTrades re-authentication required (${credState.authStatus})` };
+  const tenantCompanyId = credState.metadata?.zentradesCompanyId ?? null;
+  const id = String(ticketId);
+
+  const res = await zentrades.request(companyId, "GET", TICKET_DETAIL_PATH, { query: { id }, retryable: true });
+  if (!res.ok) {
+    return {
+      success: false,
+      code: res.status === 404 ? "not_in_crm" : (res.status === 401 || res.status === 403) ? "reconnect_required" : "crm_unavailable",
+      error: `ZenTrades ${res.status}`,
+    };
+  }
+  const ticket = res.data || {};
+  if (ticket.id == null) return { success: false, code: "not_in_crm" };
+  if (String(ticket.id) !== id) return { success: false, code: "crm_unavailable", error: "ZenTrades returned a different ticket" };
+  if (tenantCompanyId != null && ticket.companyId != null && Number(ticket.companyId) !== Number(tenantCompanyId)) {
+    return { success: false, code: "crm_unavailable", error: "ZenTrades ticket belongs to a different tenant" };
+  }
+
+  const incomplete = [];
+  const label = String(ticket.jobStatus ?? "").trim().toLowerCase();
+  const deleted = ticket.isDeleted === true || ticket.isActive === false;
+  if (!deleted && !REFRESHABLE_JOB_STATUS_LABELS.has(label)) {
+    logger.warn("zentrades refresh: unverified ticket status — not written", { companyId, ticketId: id, jobStatus: ticket.jobStatus });
+    return { success: true, incomplete: ["job_status"] };
+  }
+
+  const graph = decomposeTickets([ticket]);
+  const recurrenceRows = ticket.rruleDetails ? [mapRecurrenceRow(ticket.rruleDetails, ticket.id, ticket.updatedAt ?? null)] : [];
+  await writeTicketGraph(companyId, graph, recurrenceRows);
+  // The detail carries every assignment of the ticket, so one it no longer
+  // lists was removed in ZenTrades.
+  await syncDb.reconcileAssignmentsForTicket(companyId, id, graph.appointmentRows.map((r) => String(r.zentradesId ?? r.zentrades_id)));
+
+  logger.info("zentrades: refreshed one ticket", { companyId, ticketId: id, jobStatus: ticket.jobStatus, assignments: graph.appointmentRows.length });
+  return { success: true, incomplete };
+}
+
 /**
  * @param {string|number} companyId
  * @param {{full?: boolean, engine?: object|null, scheduleDateFrom?: number|null, scheduleDateTo?: number|null}} [opts]
@@ -458,70 +586,16 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
     }
 
     // ── Decomposition — one pass, six sinks ────────────────────────────────
-    const customers = new Map();
-    const locations = new Map();
-    const technicians = new Map();
-    const contacts = new Map();
-    const ticketRows = [];
-    const appointmentRows = [];
-    let thinHitCount = 0;
-
-    for (const hit of validTickets) {
-      ticketRows.push(mapTicketRow(hit));
-
-      for (const a of (Array.isArray(hit.assignments) ? hit.assignments : [])) {
-        if (a?.id == null) continue;
-        appointmentRows.push(mapAppointmentRow(a, hit.id));
-        if (a.technician?.id != null) keepFreshest(technicians, a.technician.id, a.technician);
-      }
-
-      if (hit.serviceAddress?.id != null) {
-        keepFreshest(locations, hit.serviceAddress.id, hit.serviceAddress);
-        keepFreshest(contacts, `addr:${hit.serviceAddress.id}`, { kind: "service_address", data: hit.serviceAddress, parent: null }, (o) => o.data.updatedAt);
-        for (const ac of (hit.serviceAddress.additionalContacts || [])) {
-          if (ac?.id == null) continue;
-          keepFreshest(contacts, `ac:${ac.id}`, { kind: "additional", data: ac, parent: hit.serviceAddress }, (o) => o.data.updatedAt);
-        }
-      } else {
-        thinHitCount++;
-      }
-
-      if (hit.customer?.id != null) {
-        keepFreshest(customers, hit.customer.id, hit.customer);
-        keepFreshest(contacts, `cust:${hit.customer.id}`, { kind: "customer", data: hit.customer, parent: null }, (o) => o.data.updatedAt);
-      } else {
-        thinHitCount++;
-      }
-    }
-    if (thinHitCount > 0) {
-      logger.warn("zentrades sync: some tickets were missing customer/serviceAddress — thin data, not a fetch error", { companyId, thinHitCount });
+    const graph = decomposeTickets(validTickets);
+    if (graph.thinHitCount > 0) {
+      logger.warn("zentrades sync: some tickets were missing customer/serviceAddress — thin data, not a fetch error", { companyId, thinHitCount: graph.thinHitCount });
     }
 
     if (engine) await engine.transition("fetching_recurrences", {});
     const recurrenceResult = await fetchRecurrences(companyId, validTickets);
 
     // ── Upserts — FK-friendly order (soft FKs, not DB-enforced) ────────────
-    counts.customers = await syncDb.upsertRawBatch("zentrades_customers", [], companyId, [...customers.values()].map(mapCustomerRow));
-    counts.locations = await syncDb.upsertRawBatch("zentrades_locations", ["zentrades_customer_id", "do_not_serve"], companyId, [...locations.values()].map(mapLocationRow));
-    counts.technicians = await syncDb.upsertRawBatch("zentrades_technicians", [], companyId, [...technicians.values()].map(mapTechnicianRow));
-    counts.contacts = await syncDb.upsertRawBatch(
-      "zentrades_contacts", ["contact_kind", "zentrades_customer_id", "zentrades_location_id", "email_lower"],
-      companyId, [...contacts.values()].map(mapContactRow)
-    );
-    counts.tickets = await syncDb.upsertRawBatch(
-      "zentrades_tickets",
-      ["zentrades_customer_id", "zentrades_location_id", "job_status_id", "job_status", "scheduled_start", "scheduled_end", "ticket_number", "combined_feature_flag"],
-      companyId, ticketRows
-    );
-    counts.appointments = await syncDb.upsertRawBatch(
-      "zentrades_appointments",
-      ["zentrades_ticket_id", "zentrades_technician_id", "assignment_status_id", "assignment_status", "assignment_status_cf_id", "assignment_status_cf", "scheduled_start", "scheduled_end", "recurring_assignment_id"],
-      companyId, appointmentRows
-    );
-    counts.recurrences = await syncDb.upsertRawBatch(
-      "zentrades_recurrences", ["zentrades_ticket_id", "rrule", "rrule_string", "nth_event", "module_id", "zt_ticket_updated_at"],
-      companyId, recurrenceResult.rows, { conflictColumns: ["company_id", "zentrades_ticket_id"] }
-    );
+    Object.assign(counts, await writeTicketGraph(companyId, graph, recurrenceResult.rows));
     if (engine) await engine.emit("entity_done", { entity: "tickets", count: counts.tickets });
 
     const ticketsComplete = sliceResults.every((r) => r.complete) && !tenantMismatchDetected;
@@ -594,6 +668,8 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
 
 module.exports = {
   runSync,
+  refreshTicket,
+  decomposeTickets,
   sliceWindow,
   keepFreshest,
   mapTicketRow,

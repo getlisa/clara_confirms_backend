@@ -172,6 +172,20 @@ function mapVisitRow(v) {
   };
 }
 
+// The non-key columns each raw table is written with — shared by runSync and
+// refreshInspection so the two can never write different shapes.
+const RAW_COLUMNS = {
+  customers: ["is_active"],
+  locations: ["inspectpoint_customer_id"],
+  contacts: ["inspectpoint_customer_id"],
+  technicians: ["is_active"],
+  deficiencies: ["inspectpoint_location_id", "inspectpoint_inspection_id", "deficiency_status",
+    "resolution_status", "is_resolved", "date_opened", "date_resolved",
+    "reference_number", "unique_id", "display_name", "notes"],
+  jobs: ["inspectpoint_location_id", "inspectpoint_customer_id", "inspectpoint_technician_id", "status_code", "scheduled_at", "due_date"],
+  appointments: ["inspectpoint_job_id", "inspectpoint_technician_id", "visit_status", "scheduled_date"],
+};
+
 const extractInspection = (d) => (Array.isArray(d?.inspections) ? d.inspections.map((w) => w.inspection) : []);
 
 /**
@@ -262,7 +276,7 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
     );
     const accounts = validateIds(accountsFetch.rows, "/v1/accounts");
     complete.customers = accountsFetch.complete && accounts.complete;
-    await syncDb.upsertRawBatch("inspectpoint_customers", ["is_active"], companyId, accounts.rows.map(mapAccountRow));
+    await syncDb.upsertRawBatch("inspectpoint_customers", RAW_COLUMNS.customers, companyId, accounts.rows.map(mapAccountRow));
     counts.customers = accounts.rows.length;
     if (engine) await engine.emit("fetched", { entity: "accounts", count: counts.customers });
 
@@ -276,7 +290,7 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
     );
     const buildings = validateIds(buildingsFetch.rows, "/v1/buildings");
     complete.locations = buildingsFetch.complete && buildings.complete;
-    await syncDb.upsertRawBatch("inspectpoint_locations", ["inspectpoint_customer_id"], companyId, buildings.rows.map(mapBuildingRow));
+    await syncDb.upsertRawBatch("inspectpoint_locations", RAW_COLUMNS.locations, companyId, buildings.rows.map(mapBuildingRow));
     counts.locations = buildings.rows.length;
     if (engine) await engine.emit("fetched", { entity: "buildings", count: counts.locations });
 
@@ -284,7 +298,7 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
     if (engine) await engine.transition("fetching_contacts", {});
     const contactsFetch = await ip.fetchAllPages(companyId, "/external/api/v1/contacts", {}, credentials, (d) => d.contacts);
     const contacts = validateIds(contactsFetch.rows, "/v1/contacts");
-    await syncDb.upsertRawBatch("inspectpoint_contacts", ["inspectpoint_customer_id"], companyId, contacts.rows.map(mapContactRow));
+    await syncDb.upsertRawBatch("inspectpoint_contacts", RAW_COLUMNS.contacts, companyId, contacts.rows.map(mapContactRow));
     counts.contacts = contacts.rows.length;
     if (engine) await engine.emit("fetched", { entity: "contacts", count: counts.contacts });
 
@@ -292,7 +306,7 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
     if (engine) await engine.transition("fetching_technicians", {});
     const techniciansFetch = await ip.fetchAllPages(companyId, "/external/api/v1/technicians", {}, credentials, (d) => d);
     const technicians = validateIds(techniciansFetch.rows, "/v1/technicians");
-    await syncDb.upsertRawBatch("inspectpoint_technicians", ["is_active"], companyId, technicians.rows.map(mapTechnicianRow));
+    await syncDb.upsertRawBatch("inspectpoint_technicians", RAW_COLUMNS.technicians, companyId, technicians.rows.map(mapTechnicianRow));
     counts.technicians = technicians.rows.length;
     if (engine) await engine.emit("fetched", { entity: "technicians", count: counts.technicians });
 
@@ -321,10 +335,7 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
     const deficiencies = validateIds(deficienciesFetch.rows, "/v1/deficiencies");
     complete.deficiencies = deficienciesFetch.complete && deficiencies.complete;
     await syncDb.upsertRawBatch(
-      "inspectpoint_deficiencies",
-      ["inspectpoint_location_id", "inspectpoint_inspection_id", "deficiency_status",
-       "resolution_status", "is_resolved", "date_opened", "date_resolved",
-       "reference_number", "unique_id", "display_name", "notes"],
+      "inspectpoint_deficiencies", RAW_COLUMNS.deficiencies,
       companyId, deficiencies.rows.map(mapDeficiencyRow)
     );
     counts.deficiencies = deficiencies.rows.length;
@@ -432,8 +443,7 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
     // label out from the `frequency` object that IS on every row, and still
     // prefers a real `inspection_type.name` for any tenant that has one.
     await syncDb.upsertRawBatch(
-      "inspectpoint_jobs",
-      ["inspectpoint_location_id", "inspectpoint_customer_id", "inspectpoint_technician_id", "status_code", "scheduled_at", "due_date"],
+      "inspectpoint_jobs", RAW_COLUMNS.jobs,
       companyId, inspections.rows.map(mapJobRow)
     );
     counts.jobs = inspections.rows.length;
@@ -584,8 +594,7 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
       });
     }
     await syncDb.upsertRawBatch(
-      "inspectpoint_appointments",
-      ["inspectpoint_job_id", "inspectpoint_technician_id", "visit_status", "scheduled_date"],
+      "inspectpoint_appointments", RAW_COLUMNS.appointments,
       companyId, visits.rows.map(mapVisitRow)
     );
     counts.appointments = visits.rows.length;
@@ -631,4 +640,89 @@ async function runSync(companyId, { full = false, engine = null, scheduleDateFro
   }
 }
 
-module.exports = { runSync };
+// ── Refresh ONE inspection (the per-job Refresh button) ─────────────────────
+
+/**
+ * Re-read one inspection's whole graph from InspectPoint and write it to the
+ * raw tables (docs/crm-sync-strategy.md §4.3a): the inspection, its visits
+ * (removals reconciled), its building and account, the contacts at that
+ * building/account, the technicians, and the tenant's deficiencies (v1
+ * /deficiencies can't be filtered by building, and it's the same few pages the
+ * regular sync pulls every run). Normalize is the caller's job.
+ *
+ * Never touches sync state or cursors: it covered one inspection, not "every
+ * change up to now".
+ *
+ * @returns {{success: true, incomplete: string[]} | {success: false, code: string, error?: string}}
+ */
+async function refreshInspection(companyId, inspectionId) {
+  const credentials = await credsDb.getByCompanyId(companyId);
+  if (!credentials) return { success: false, code: "reconnect_required", error: "InspectPoint not connected" };
+  const id = String(inspectionId);
+  const fail = (res) => ({
+    success: false,
+    code: res.status === 404 ? "not_in_crm" : (res.status === 401 || res.status === 403) ? "reconnect_required" : "crm_unavailable",
+    error: `InspectPoint ${res.status}`,
+  });
+
+  const res = await ip.request(companyId, "GET", `/external/api/v2/inspections/${id}`, {}, credentials);
+  if (!res.ok) return fail(res);
+  const inspection = res.data?.inspection || res.data;
+  if (inspection?.id == null) return { success: false, code: "crm_unavailable", error: "InspectPoint returned no inspection" };
+  const buildingId = inspection.building_id ?? inspection.building?.id ?? null;
+  const accountId = inspection.building?.account_id ?? null;
+  const none = Promise.resolve({ rows: [], complete: true });
+
+  const [visits, buildingRes, accountRes, buildingContacts, accountContacts, deficiencies, technicians] = await Promise.all([
+    ip.fetchAllPages(companyId, "/external/api/v2/inspection_visits", { inspection_id: id }, credentials, (d) => d),
+    buildingId != null ? ip.request(companyId, "GET", `/external/api/v1/buildings/${buildingId}`, {}, credentials) : null,
+    accountId != null ? ip.request(companyId, "GET", `/external/api/v1/accounts/${accountId}`, {}, credentials) : null,
+    buildingId != null ? ip.fetchAllPages(companyId, "/external/api/v1/contacts", { building_id: buildingId }, credentials, (d) => d.contacts) : none,
+    accountId != null ? ip.fetchAllPages(companyId, "/external/api/v1/contacts", { account_id: accountId }, credentials, (d) => d.contacts) : none,
+    ip.fetchAllPages(companyId, "/external/api/v1/deficiencies", {}, credentials, (d) => d.deficiencies),
+    ip.fetchAllPages(companyId, "/external/api/v1/technicians", {}, credentials, (d) => d),
+  ]);
+  const incomplete = [];
+
+  await syncDb.upsertRawBatch("inspectpoint_jobs", RAW_COLUMNS.jobs, companyId, [mapJobRow(inspection)]);
+  if (buildingRes?.ok) {
+    const building = buildingRes.data?.building || buildingRes.data;
+    if (building?.id != null) await syncDb.upsertRawBatch("inspectpoint_locations", RAW_COLUMNS.locations, companyId, [mapBuildingRow(building)]);
+  } else if (buildingRes) incomplete.push("location");
+  if (accountRes?.ok) {
+    const account = accountRes.data?.account || accountRes.data;
+    if (account?.id != null) await syncDb.upsertRawBatch("inspectpoint_customers", RAW_COLUMNS.customers, companyId, [mapAccountRow(account)]);
+  } else if (accountRes) incomplete.push("customer");
+
+  const contacts = [...new Map([...buildingContacts.rows, ...accountContacts.rows].filter((c) => c?.id != null).map((c) => [c.id, c])).values()];
+  if (!buildingContacts.complete || !accountContacts.complete) incomplete.push("contacts");
+  await syncDb.upsertRawBatch("inspectpoint_contacts", RAW_COLUMNS.contacts, companyId, contacts.map(mapContactRow));
+
+  const techRows = validateIds(technicians.rows, "/v1/technicians").rows;
+  if (!technicians.complete) incomplete.push("technicians");
+  await syncDb.upsertRawBatch("inspectpoint_technicians", RAW_COLUMNS.technicians, companyId, techRows.map(mapTechnicianRow));
+
+  const defRows = validateIds(deficiencies.rows, "/v1/deficiencies").rows;
+  if (!deficiencies.complete) incomplete.push("deficiencies");
+  await syncDb.upsertRawBatch("inspectpoint_deficiencies", RAW_COLUMNS.deficiencies, companyId, defRows.map(mapDeficiencyRow));
+
+  // Visits: only this inspection's (a server ignoring the filter must not
+  // attach another job's visits here), and — when the fetch was complete —
+  // a visit InspectPoint no longer has is removed from raw and its platform
+  // appointment cancelled, the same rule ServiceTrade's reconcile follows.
+  const ownVisits = visits.rows.filter((v) => v?.id != null && String(v.inspection_id) === id);
+  await syncDb.upsertRawBatch("inspectpoint_appointments", RAW_COLUMNS.appointments, companyId, ownVisits.map(mapVisitRow));
+  if (visits.complete) {
+    await syncDb.reconcileVisitsForInspection(companyId, id, ownVisits.map((v) => String(v.id)));
+  } else {
+    incomplete.push("appointments");
+  }
+
+  logger.info("inspectpoint: refreshed one inspection", {
+    companyId, inspectionId: id, visits: ownVisits.length, contacts: contacts.length,
+    deficiencies: defRows.length, incomplete,
+  });
+  return { success: true, incomplete };
+}
+
+module.exports = { runSync, refreshInspection };

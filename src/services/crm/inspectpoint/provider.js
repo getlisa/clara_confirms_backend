@@ -291,6 +291,19 @@ class InspectPointProvider extends CrmProvider {
    * default rolling one; see inspectpoint-sync.js's runSync for what that
    * changes.
    */
+  /**
+   * Re-read ONE inspection's whole graph from InspectPoint — the per-job
+   * Refresh button (docs/crm-sync-strategy.md §4.3a). See
+   * inspectpoint-sync.js's refreshInspection for what is fetched.
+   */
+  async refreshJob(companyId, job) {
+    if (!job?.external_ref) return { ok: false, code: "not_in_crm" };
+    const raw = await ipSync.refreshInspection(companyId, job.external_ref);
+    if (!raw.success) return { ok: false, code: raw.code, error: raw.error };
+    await this.normalizeAll(companyId);
+    return { ok: true, incomplete: raw.incomplete || [] };
+  }
+
   async syncAll(companyId, { full = false, engine = null, scheduleDateFrom = null, scheduleDateTo = null } = {}) {
     try {
       const rawResult = await ipSync.runSync(companyId, { full, engine, scheduleDateFrom, scheduleDateTo });
