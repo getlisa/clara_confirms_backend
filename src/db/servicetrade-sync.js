@@ -823,6 +823,17 @@ async function listLocations(companyId, { includeInactive = false, page = 1, per
   return { rows: rows.rows, total: total.rows[0].n };
 }
 
+/** The subset of `servicetradeIds` this company already holds a raw contact row for. */
+async function filterKnownContactIds(companyId, servicetradeIds) {
+  if (!servicetradeIds.length) return new Set();
+  const { rows } = await db.query(
+    `SELECT servicetrade_id::text AS id FROM servicetrade_contacts
+      WHERE company_id = $1 AND servicetrade_id = ANY($2::bigint[])`,
+    [companyId, servicetradeIds.map(String)]
+  );
+  return new Set(rows.map((r) => r.id));
+}
+
 async function listContacts(companyId) {
   const r = await db.query(`SELECT * FROM servicetrade_contacts WHERE company_id = $1 ORDER BY id DESC`, [companyId]);
   return r.rows;
@@ -972,6 +983,7 @@ module.exports = {
   listTechnicians,
   listLocations,
   listContacts,
+  filterKnownContactIds,
   listOffices,
   listTags,
   listServiceRequests,
