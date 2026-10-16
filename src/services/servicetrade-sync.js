@@ -442,32 +442,88 @@ function mapContactRow(c) {
 }
 
 /**
- * Deactivated contacts. Every other contact source in this file is blind to a
- * contact that was deactivated in ServiceTrade: the /contact?companyId= roster
- * only returns active contacts, deactivating usually unlinks the contact from
- * its companies/locations too, and job embeds stop naming it once the job's
- * primary contact is repointed. Without this pass the platform kept the old
- * row — "public", still linked, still a confirmation recipient — forever.
+ * Contacts that changed in ServiceTrade without any job changing.
  *
- * `status=inactive` is not in ServiceTrade's OpenAPI spec but is verified live
- * (`status=*` returns nothing on /contact). Only contacts we already hold are
- * written — an inactive contact we never imported has nothing to update here.
- * The full record is written as-is, so its payload's real (usually empty)
- * companies[]/locations[] and status reach normalize.
+ * The job fan-out only sees contacts of customers whose JOBS changed this run,
+ * so on its own it misses: a contact edited, added or unlinked at a customer
+ * whose jobs didn't move, and — worst — a contact DEACTIVATED, which no
+ * contact source returns at all: the /contact?companyId= roster only lists
+ * active contacts, deactivating usually unlinks the contact too, and job
+ * embeds stop naming it once the job's primary is repointed. Without this the
+ * platform kept such a contact "public", linked and a confirmation recipient
+ * forever, and neither Sync now nor the webhook refresh could fix it.
+ *
+ * Two lists, both from /contact:
+ *   - `status=inactive` (undocumented, verified live — `status=*` returns
+ *     nothing on this endpoint). Only contacts we already hold are written;
+ *     an inactive contact we never imported has nothing to update.
+ *   - the default (active) listing, ONLY with `updatedAfter` — unfiltered it
+ *     is the whole account. Written when we hold the contact or it belongs to
+ *     a customer/location we hold (a new colleague added at a known customer).
+ *     Ids the job fan-out already wrote this run are skipped: the roster had
+ *     the same record, plus the job-derived links.
+ *
+ * Every record is a FULL /contact record, so its companies[]/locations[] are
+ * the complete truth even when empty — flagged `_fullRecord` for
+ * _normalizeContactJunctions, which otherwise refuses to act on a payload that
+ * lists no links.
  */
-async function syncInactiveContacts(companyId, credentials, params = {}) {
-  const { rows, complete } = await fetchAllPages(
-    companyId, "/contact", "contacts", credentials, { status: "inactive", ...params }
-  );
-  const fetched = rows.filter((c) => c?.id != null);
-  if (!fetched.length) return { count: 0, complete };
-  const known = await syncDb.filterKnownContactIds(companyId, fetched.map((c) => c.id));
-  const contactRows = fetched.filter((c) => known.has(String(c.id))).map(mapContactRow);
-  if (contactRows.length) await syncDb.upsertContactsBatch(companyId, contactRows);
-  logger.info("ServiceTrade sync: deactivated contacts", {
-    companyId, fetched: fetched.length, updated: contactRows.length, complete,
+async function syncChangedContacts(companyId, credentials, { updatedAfter = null, skipIds = new Set() } = {}) {
+  const since = updatedAfter ? { updatedAfter } : {};
+  const inactive = await fetchAllPages(companyId, "/contact", "contacts", credentials, { status: "inactive", ...since });
+  const active = updatedAfter
+    ? await fetchAllPages(companyId, "/contact", "contacts", credentials, since)
+    : { rows: [], complete: true };
+  const count = await writeFullContacts(companyId, [
+    ...inactive.rows,
+    ...active.rows.filter((c) => !skipIds.has(String(c?.id))),
+  ]);
+  const complete = inactive.complete && active.complete;
+  logger.info("ServiceTrade sync: changed contacts", {
+    companyId, inactive: inactive.rows.length, active: active.rows.length, updated: count, complete,
   });
-  return { count: contactRows.length, complete };
+  return { count, complete };
+}
+
+/**
+ * Contacts named directly — a webhook `contact` event. Fetched by id, so a
+ * contact with no outstanding job (which the job-resolving drain used to skip
+ * outright) is still refreshed, deactivations included.
+ */
+async function syncContactsById(companyId, credentials, contactIds) {
+  let complete = true;
+  const records = await mapWithConcurrency(contactIds, API_CONCURRENCY, async (id) => {
+    const res = await requestWithRetry(companyId, "GET", `/contact/${id}`, {}, credentials);
+    if (!res.ok) { if (res.status !== 404) complete = false; return null; }
+    return res.data?.contact || res.data;
+  });
+  const count = await writeFullContacts(companyId, records.filter(Boolean));
+  logger.info("ServiceTrade sync: contacts by id", { companyId, requested: contactIds.length, updated: count, complete });
+  return { count, complete };
+}
+
+/** Write full /contact records we have a reason to hold (see syncChangedContacts). */
+async function writeFullContacts(companyId, records) {
+  const byId = new Map();
+  for (const c of records) if (c?.id != null) byId.set(String(c.id), c);
+  if (!byId.size) return 0;
+  const contacts = [...byId.values()];
+  const linkIds = (c, plural, singular) => [
+    ...(Array.isArray(c[plural]) ? c[plural] : []), ...(c[singular] ? [c[singular]] : []),
+  ].map((x) => x?.id).filter((id) => id != null).map(String);
+  const { contactIds, customerIds, locationIds } = await syncDb.filterKnownRefs(companyId, {
+    contactIds: [...byId.keys()],
+    customerIds: [...new Set(contacts.flatMap((c) => linkIds(c, "companies", "company")))],
+    locationIds: [...new Set(contacts.flatMap((c) => linkIds(c, "locations", "location")))],
+  });
+  const rows = contacts
+    .filter((c) => contactIds.has(String(c.id)) || (c.status !== "inactive" && (
+      linkIds(c, "companies", "company").some((id) => customerIds.has(id)) ||
+      linkIds(c, "locations", "location").some((id) => locationIds.has(id))
+    )))
+    .map((c) => mapContactRow({ ...c, _fullRecord: true }));
+  if (rows.length) await syncDb.upsertContactsBatch(companyId, rows);
+  return rows.length;
 }
 
 function mapOfficeRow(o) {
@@ -701,7 +757,7 @@ async function runSync(companyId, options = {}) {
   // Presence of the KEY decides the mode, not its length — an empty array must
   // sync nothing, never silently fall through to the whole month window, which
   // is what a webhook drain that resolved no job ids would otherwise trigger.
-  const targeted = Array.isArray(options.jobIds);
+  const targeted = Array.isArray(options.jobIds) || Array.isArray(options.contactIds);
   // An explicit scheduleDateFrom/To replaces the default current-calendar-month
   // window. That makes the run a *windowed full* pull rather than an
   // incremental one — see the cursor handling at the end of this function.
@@ -710,10 +766,12 @@ async function runSync(companyId, options = {}) {
   // today but only just, and a silently rounded id would fetch the wrong job.
   // The id is only ever interpolated into a URL path, so nothing needs it
   // numeric.
-  const targetedJobIds = targeted
-    ? [...new Set(options.jobIds.map(String).filter((s) => /^[0-9]{1,19}$/.test(s)))]
-    : null;
-  if (targeted && targetedJobIds.length === 0) {
+  const cleanRefs = (list) => [...new Set((list || []).map(String).filter((s) => /^[0-9]{1,19}$/.test(s)))];
+  const targetedJobIds = targeted ? cleanRefs(options.jobIds) : null;
+  // A webhook `contact` event names the contact itself; refreshed directly even
+  // when it touches no job (see syncContactsById).
+  const targetedContactIds = targeted ? cleanRefs(options.contactIds) : [];
+  if (targeted && targetedJobIds.length === 0 && targetedContactIds.length === 0) {
     return { success: true, counts: {}, incomplete: [], targeted: true, skipped: "no job ids" };
   }
 
@@ -785,6 +843,7 @@ async function runSync(companyId, options = {}) {
     complete.jobs = jobListComplete;
 
     let jobs = [];
+    const fanOutContactIds = new Set();   // contacts the job fan-out wrote this run
     if (jobStubs.length) {
       if (engine) await engine.transition("fetching_job_details", { count: jobStubs.length });
       logger.info("ServiceTrade sync: fetching job details", { companyId, count: jobStubs.length });
@@ -966,6 +1025,7 @@ async function runSync(companyId, options = {}) {
         });
         await syncDb.upsertContactsBatch(companyId, contactRows);
         counts.contacts = contactRows.length;
+        for (const id of contactsById.keys()) fanOutContactIds.add(String(id));
       }
       if (usersById.size) {
         await syncDb.upsertUsersBatch(companyId, Array.from(usersById.values()).map(mapUserRow));
@@ -997,19 +1057,21 @@ async function runSync(companyId, options = {}) {
       await engine.emit("fetched", { entity: "projects", count: counts.projects });
     }
 
-    // --- Deactivated contacts (/contact?status=inactive) -------------------
-    // Runs AFTER the job fan-out's contact upsert so the inactive record wins
-    // for any contact a job still embeds. It has no cursor of its own: an
-    // incremental run borrows the jobs cursor, and a failed fetch holds that
-    // cursor back so the deactivation isn't skipped past. A full or
-    // custom-window run re-reads every inactive contact; a targeted (webhook)
-    // run looks back one day, which covers the contact event that triggered it.
-    const inactiveParams = targeted
-      ? { updatedAfter: String(Math.floor(Date.now() / 1000) - 86400) }
-      : (full || customWindow ? {} : cursorParams(state?.last_jobs_updated_at));
-    const inactive = await syncInactiveContacts(companyId, credentials, inactiveParams);
-    counts.contacts += inactive.count;
-    if (!inactive.complete) complete.jobs = false;
+    // --- Contacts that changed without a job changing ---------------------
+    // Runs AFTER the job fan-out's contact upsert so a deactivated record wins
+    // for any contact a job still embeds. No cursor of its own: an incremental
+    // run borrows the jobs cursor, and a failed fetch holds that cursor back so
+    // the change isn't skipped past. A full or custom-window run re-reads every
+    // inactive contact (the rosters already cover active ones in scope). A
+    // targeted (webhook) run fetches exactly the contacts its events named.
+    const changed = targeted
+      ? (targetedContactIds.length ? await syncContactsById(companyId, credentials, targetedContactIds) : { count: 0, complete: true })
+      : await syncChangedContacts(companyId, credentials, {
+          updatedAfter: full || customWindow ? null : (cursorParams(state?.last_jobs_updated_at).updatedAfter ?? null),
+          skipIds: fanOutContactIds,
+        });
+    counts.contacts += changed.count;
+    if (!changed.complete) complete.jobs = false;
 
     // --- Appointments per job (/appointment?jobId={id}) --------------------
     // Replaces both the old embedded-on-/job appointment extraction and the
@@ -1271,7 +1333,7 @@ async function runSync(companyId, options = {}) {
     // real sync. It also must not write last_sync_at, which the UI presents as
     // "everything is up to date as of then".
     if (targeted) {
-      logger.info("ServiceTrade targeted sync done", { companyId, jobIds: targetedJobIds, counts });
+      logger.info("ServiceTrade targeted sync done", { companyId, jobIds: targetedJobIds, contactIds: targetedContactIds, counts });
       return { success: true, counts, incomplete, targeted: true };
     }
 

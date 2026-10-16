@@ -570,11 +570,13 @@ class ServiceTradeProvider extends CrmProvider {
     // costs nothing today — it just refuses to act on a payload that never told
     // us anything.
     //
-    // Residual gap, deliberately left: an ACTIVE contact removed from its LAST
-    // location is not cleaned, because its payload then asserts nothing.
-    // Closing that needs the raw upsert to merge these arrays rather than
-    // replace them. A DEACTIVATED contact is cleaned (below): whatever links
-    // ServiceTrade still shows, an inactive contact is nobody's recipient.
+    // Two exceptions where an empty payload IS an assertion:
+    //  - `_fullRecord` — written from a full /contact record by the sync's
+    //    changed-contacts pass (syncChangedContacts / syncContactsById), whose
+    //    companies[]/locations[] are the complete truth. This is how an active
+    //    contact removed from its LAST location gets cleaned.
+    //  - a DEACTIVATED contact: whatever links ServiceTrade still shows, an
+    //    inactive contact is nobody's recipient.
     const locationParents = new Set();
     const companyParents = new Set();
     // Every duplicate's links are walked, but resolved onto the CANONICAL
@@ -606,7 +608,8 @@ class ServiceTradeProvider extends CrmProvider {
       const locations = Array.isArray(row.payload?.locations) && row.payload.locations.length
                        ? row.payload.locations
                        : row.payload?.location ? [row.payload.location] : [];
-      if (locations.length) locationParents.add(contactId);
+      const fullRecord = row.payload?._fullRecord === true;
+      if (locations.length || fullRecord) locationParents.add(contactId);
       for (const l of locations) {
         if (l?.id == null) continue;
         const locationId = locationsMap.get(String(l.id));
@@ -616,7 +619,7 @@ class ServiceTradeProvider extends CrmProvider {
       const companiesArr = Array.isArray(row.payload?.companies) && row.payload.companies.length
                           ? row.payload.companies
                           : row.payload?.company ? [row.payload.company] : [];
-      if (companiesArr.length) companyParents.add(contactId);
+      if (companiesArr.length || fullRecord) companyParents.add(contactId);
       for (const c of companiesArr) {
         if (c?.id == null) continue;
         const customerId = customersMap.get(String(c.id));

@@ -599,3 +599,33 @@ test("one unresolvable event does not stop the rest of the batch", async () => {
   assert.equal(out.synced, true);
   assert.ok(marks.some((m) => m.sql.includes("status = 'skipped'")));
 });
+
+// ── Contact events refresh the contact itself ───────────────────────────────
+
+test("a contact event with no outstanding job still refreshes the contact (it used to be skipped)", async () => {
+  reset();
+  const marks = drainDb({ claimed: [ev({ entity_type: "contact", entity_id: "2779627674040513" })], related: [] });
+  const out = await processor.drainCompany(8);
+  assert.equal(syncCalls.length, 1, "a deactivated or unlinked contact must not wait for a full sync");
+  assert.deepEqual(syncCalls[0].options.jobIds, []);
+  assert.deepEqual(syncCalls[0].options.contactIds, ["2779627674040513"]);
+  assert.equal(out.synced, true);
+  assert.ok(!marks.some((m) => m.sql.includes("status = 'skipped'")));
+  const done = marks.find((m) => m.sql.includes("status = 'done'"));
+  assert.deepEqual(done.params[1], [null], "no job ref is recorded as NULL, not the string 'null'");
+});
+
+test("a contact event with jobs refreshes both the jobs and the contact", async () => {
+  reset();
+  drainDb({ claimed: [ev({ entity_type: "contact", entity_id: "55" })], related: ["111"] });
+  await processor.drainCompany(8);
+  assert.deepEqual(syncCalls[0].options.jobIds, ["111"]);
+  assert.deepEqual(syncCalls[0].options.contactIds, ["55"]);
+});
+
+test("a location event that touches no job is still skipped — only contacts are fetched directly", async () => {
+  reset();
+  drainDb({ claimed: [ev({ entity_type: "location", entity_id: "9" })], related: [] });
+  await processor.drainCompany(8);
+  assert.equal(syncCalls.length, 0);
+});

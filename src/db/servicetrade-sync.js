@@ -823,15 +823,27 @@ async function listLocations(companyId, { includeInactive = false, page = 1, per
   return { rows: rows.rows, total: total.rows[0].n };
 }
 
-/** The subset of `servicetradeIds` this company already holds a raw contact row for. */
-async function filterKnownContactIds(companyId, servicetradeIds) {
-  if (!servicetradeIds.length) return new Set();
-  const { rows } = await db.query(
-    `SELECT servicetrade_id::text AS id FROM servicetrade_contacts
-      WHERE company_id = $1 AND servicetrade_id = ANY($2::bigint[])`,
-    [companyId, servicetradeIds.map(String)]
-  );
-  return new Set(rows.map((r) => r.id));
+/**
+ * Which of these ServiceTrade ids this company already holds raw rows for —
+ * contacts, customers (servicetrade_customers) and locations. Each result is
+ * a Set of string ids.
+ */
+async function filterKnownRefs(companyId, { contactIds = [], customerIds = [], locationIds = [] } = {}) {
+  const lookup = async (table, ids) => {
+    if (!ids.length) return new Set();
+    const { rows } = await db.query(
+      `SELECT servicetrade_id::text AS id FROM ${table}
+        WHERE company_id = $1 AND servicetrade_id = ANY($2::bigint[])`,
+      [companyId, ids.map(String)]
+    );
+    return new Set(rows.map((r) => r.id));
+  };
+  const [contacts, customers, locations] = await Promise.all([
+    lookup("servicetrade_contacts", contactIds),
+    lookup("servicetrade_customers", customerIds),
+    lookup("servicetrade_locations", locationIds),
+  ]);
+  return { contactIds: contacts, customerIds: customers, locationIds: locations };
 }
 
 async function listContacts(companyId) {
@@ -983,7 +995,7 @@ module.exports = {
   listTechnicians,
   listLocations,
   listContacts,
-  filterKnownContactIds,
+  filterKnownRefs,
   listOffices,
   listTags,
   listServiceRequests,
