@@ -143,7 +143,7 @@ function stableBaseUrl() {
  * Register the webhook for a connected company that has none, so every
  * ServiceTrade account gets realtime updates (and a working refresh button)
  * without anyone pressing "enable". Called after connect/reconnect and by the
- * daily crm-sync, which is what heals accounts connected before this existed
+ * 2-hourly crm-sync, which is what heals accounts connected before this existed
  * or whose registration failed.
  *
  * Never repoints and never re-enables: an existing registration is left alone,

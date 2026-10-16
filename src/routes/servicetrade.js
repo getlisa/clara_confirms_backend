@@ -36,7 +36,7 @@ router.use(authenticate);
 /**
  * Best-effort: give a freshly (re)connected account its webhook. Awaited (one or
  * two ServiceTrade calls) because Vercel may freeze the instance once the
- * response is sent; never fails the connect itself — the daily crm-sync retries.
+ * response is sent; never fails the connect itself — the 2-hourly crm-sync retries.
  */
 async function ensureWebhook(companyId, reason) {
   try {
