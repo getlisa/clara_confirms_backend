@@ -10,6 +10,7 @@ const triggerDb = require("../db/call-trigger-configs");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localizeFields, localizeRows } = require("../utils/timezone");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
@@ -39,7 +40,7 @@ router.get("/", async (req, res) => {
  * Update one trigger. :type must be one of the three valid types.
  * Body: { enabled?, call_type?, days_before?, trigger_config? }
  */
-router.patch("/:type", async (req, res) => {
+router.patch("/:type", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

@@ -3,6 +3,7 @@ const callAnalysisConfigsDb = require("../db/call-analysis-configs");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localizeRows, localizeFields } = require("../utils/timezone");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
@@ -23,7 +24,7 @@ router.get("/", async (req, res) => {
 });
 
 // PATCH /call-analysis-configs/:type — update priority or enabled for one outcome
-router.patch("/:type", async (req, res) => {
+router.patch("/:type", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

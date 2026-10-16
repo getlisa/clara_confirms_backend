@@ -150,4 +150,4 @@ async function sendMail({ to, subject, text, html, attachments = [] }) {
   }
 }
 
-module.exports = { sendMail, init, buildEmailTemplate, COMPANY_NAME };
+module.exports = { sendMail, init, buildEmailTemplate, escapeHtml, COMPANY_NAME };

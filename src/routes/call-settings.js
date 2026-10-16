@@ -5,6 +5,7 @@ const logger = require("../utils/logger");
 const db = require("../db");
 const retell = require("../services/retell");
 const { getCompanyTimezone, localizeFields } = require("../utils/timezone");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
@@ -59,7 +60,7 @@ router.get("/", async (req, res) => {
   }
 });
 
-router.patch("/", async (req, res) => {
+router.patch("/", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

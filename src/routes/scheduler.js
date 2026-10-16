@@ -4,6 +4,7 @@ const schedulerEngine = require("../engines/scheduler-run");
 const engineToken = require("../engines/core/token");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 const router = express.Router();
 
 function verifyCronSecret(req, res) {
@@ -45,7 +46,7 @@ router.all("/daily", async (req, res) => {
 // These bypass the per-company auto_* toggles so the user can fire on demand
 // even when their company has the system cron disabled for that action.
 
-router.post("/daily/manual", authenticate, async (req, res) => {
+router.post("/daily/manual", authenticate, requirePermission(PERM.CALLS_MAKE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -75,7 +76,7 @@ router.post("/daily/manual", authenticate, async (req, res) => {
   }
 });
 
-router.post("/run/manual", authenticate, async (req, res) => {
+router.post("/run/manual", authenticate, requirePermission(PERM.CALLS_MAKE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

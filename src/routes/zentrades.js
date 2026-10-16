@@ -23,6 +23,7 @@ const engineToken = require("../engines/core/token");
 const enginesDb = require("../engines/core/db");
 const { validateSyncRange } = require("../utils/sync-date-range");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 
@@ -35,7 +36,7 @@ router.use(authenticate);
  * password should fail the connect attempt immediately, not surface on the
  * next cron tick.
  */
-router.post("/credentials", async (req, res) => {
+router.post("/credentials", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   const companyId = req.user.companyId;
   const { username, password } = req.body || {};
 
@@ -139,7 +140,7 @@ router.get("/status", async (req, res) => {
  * Clears the stored password; username + metadata are preserved for a
  * one-click reconnect (just re-enter the password).
  */
-router.delete("/session", async (req, res) => {
+router.delete("/session", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   const companyId = req.user.companyId;
   try {
     await credentialsDb.clearCredentials(companyId);
@@ -178,7 +179,7 @@ function utcDayBounds(startDate, endDate) {
  * services/zentrades-sync.js's runSync). Same contract shape as the other
  * two CRMs' sync routes.
  */
-router.post("/sync", async (req, res) => {
+router.post("/sync", requirePermission(PERM.SYNC_RUN), async (req, res) => {
   const companyId = req.user.companyId;
   const full = req.query.full === "true" || req.query.full === true;
   const stream = req.query.stream === "true" || req.query.stream === true;

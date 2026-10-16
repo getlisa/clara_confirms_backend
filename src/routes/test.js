@@ -10,11 +10,12 @@ const { createCall } = require("../services/retell");
 const { authenticate, getCompanyId } = require("../auth");
 const db = require("../db");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
 
-router.post("/call", async (req, res) => {
+router.post("/call", requirePermission(PERM.CALLS_MAKE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

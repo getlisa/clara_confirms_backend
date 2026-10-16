@@ -30,6 +30,7 @@ const { getCompanyTimezone } = require("../utils/timezone");
 const { parseSpreadsheet } = require("../services/csv-import/parser");
 const { mapRows, describeMapping, TARGET_FIELDS } = require("../services/csv-import/mapper");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 
@@ -89,7 +90,7 @@ function streamEnvelope(engine, companyId) {
  * WITHOUT writing any platform rows, so the office can check a file before
  * committing to it.
  */
-router.post("/csv", rawBody, async (req, res) => {
+router.post("/csv", requirePermission(PERM.SYNC_RUN), rawBody, async (req, res) => {
   try {
     const companyId = req.user.companyId;
     // getUserId's field is `userId`; routes/engines.js and inspectpoint.js both
@@ -204,7 +205,7 @@ router.get("/csv/mapping", async (req, res) => {
 });
 
 /** Save a mapping without uploading — e.g. editing it from Settings. */
-router.put("/csv/mapping", express.json(), async (req, res) => {
+router.put("/csv/mapping", requirePermission(PERM.SYNC_RUN), express.json(), async (req, res) => {
   try {
     const mapping = req.body?.mapping;
     if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) {
@@ -283,7 +284,7 @@ router.get("/csv/:id/rows", async (req, res) => {
  * companyId is re-derived from the stored row and checked against the caller's
  * — never taken from the request body.
  */
-router.post("/csv/:id/reprocess", async (req, res) => {
+router.post("/csv/:id/reprocess", requirePermission(PERM.SYNC_RUN), async (req, res) => {
   try {
     const companyId = req.user.companyId;
     const record = await csvImportsDb.getById(req.params.id, companyId);

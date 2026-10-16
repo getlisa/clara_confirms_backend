@@ -19,11 +19,20 @@ const runsDb = require("../engines/core/db");
 const sse = require("../engines/core/sse");
 const token = require("../engines/core/token");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 
+// Which engine decides the permission: syncs and CSV imports are sync.run, the
+// scheduler (which places calls) is calls.make.
+const ENGINE_PERMISSIONS = { crm_sync: PERM.SYNC_RUN, csv_import: PERM.SYNC_RUN, scheduler_run: PERM.CALLS_MAKE };
+const enginePermission = requireDynamicPermission(
+  (req) => ENGINE_PERMISSIONS[req.params.kind] || PERM.CALLS_MAKE,
+  "sync.run | calls.make"
+);
+
 // ── Start a run ──────────────────────────────────────────────────────────────
-router.post("/:kind", authenticate, async (req, res) => {
+router.post("/:kind", authenticate, enginePermission, async (req, res) => {
   const { kind } = req.params;
   const mod = engines.getEngine(kind);
   if (!mod) {

@@ -33,14 +33,30 @@ const { authenticate, getCompanyId } = require("../auth");
 const manualCall = require("../services/manual-call");
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localizeFields } = require("../utils/timezone");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
+const db = require("../db");
 
 const router = express.Router();
 router.use(authenticate);
 
+// A confirmation call (the trigger resolves to customer_/technician_confirmation)
+// only needs confirmations.send, so Confirmers can place it; any other call
+// type needs calls.make. Resolved through the company's own trigger config —
+// the same lookup triggerManualCall does — not guessed from the trigger name.
+const manualCallPermission = requireDynamicPermission(async (req) => {
+  const trigger = req.body?.trigger_type || req.body?.call_type;
+  if (!trigger) return null; // the handler answers 400
+  const { rows } = await db.query(
+    `SELECT call_type FROM call_trigger_configs WHERE company_id = $1 AND trigger_type = $2 LIMIT 1`,
+    [req.user.companyId, String(trigger)]
+  );
+  return rows[0] ? permissionForCallType(rows[0].call_type) : null;
+}, "confirmations.send | calls.make");
+
 // job_date is a DATE-only column — never passed through this.
 const SCHEDULED_CALL_TZ_FIELDS = ["scheduled_at", "last_attempted_at", "created_at", "updated_at", "callback_requested_at"];
 
-router.post("/", async (req, res) => {
+router.post("/", manualCallPermission, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

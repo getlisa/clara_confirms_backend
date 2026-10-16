@@ -1,8 +1,9 @@
 const express = require("express");
 const todosDb = require("../db/todos");
-const { authenticate, getCompanyId, getUserId, requireRole } = require("../auth");
+const { authenticate, getCompanyId, getUserId } = require("../auth");
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localizeRows, localizeFields } = require("../utils/timezone");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 
@@ -41,7 +42,7 @@ router.get("/", async (req, res) => {
  * PATCH /todos/:id/status
  * Body: { status, notes }
  */
-router.patch("/:id/status", async (req, res) => {
+router.patch("/:id/status", requirePermission(PERM.TODOS_MANAGE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -71,7 +72,7 @@ router.patch("/:id/status", async (req, res) => {
  * Body: { assigned_to }  (user id)
  * Admin only
  */
-router.patch("/:id/assign", requireRole("admin"), async (req, res) => {
+router.patch("/:id/assign", requirePermission(PERM.TODOS_MANAGE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

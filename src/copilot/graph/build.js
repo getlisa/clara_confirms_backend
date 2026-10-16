@@ -47,7 +47,10 @@ async function buildGraph() {
     // confirms in the UI). This is independent of call_settings.agent_can_make_changes,
     // which governs the VOICE agent during a live call, not the copilot.
     const sys = new SystemMessage(prompt.build());
-    const message = await invokeWithFailover(tools, [sys, ...state.messages], config, ctx);
+    // Offer only what the acting user's role may use (registry.js); each write
+    // tool also re-checks when it runs.
+    const allowed = tools.filter((t) => registry.toolAllowedForRole(t.name, ctx?.role));
+    const message = await invokeWithFailover(allowed, [sys, ...state.messages], config, ctx);
     return { messages: [message] };
   }
 

@@ -13,7 +13,9 @@ const {
   requireCompanyMatch,
   requireRole,
   clearUserCache,
+  invalidateUserState,
 } = require("./auth.middleware");
+const permissions = require("./permissions");
 
 module.exports = {
   // Routes
@@ -32,4 +34,12 @@ module.exports = {
   requireCompanyMatch,
   requireRole,
   clearUserCache,
+  invalidateUserState,
+
+  // Role-based permissions (src/auth/permissions.js)
+  PERMISSIONS: permissions.PERMISSIONS,
+  requirePermission: permissions.requirePermission,
+  requireDynamicPermission: permissions.requireDynamicPermission,
+  hasPermission: permissions.hasPermission,
+  permissionsFor: permissions.permissionsFor,
 };

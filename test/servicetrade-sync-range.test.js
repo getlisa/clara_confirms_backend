@@ -151,7 +151,7 @@ stub("engines/crm-sync", {
 });
 stub("engines/core/db", { getRun: async () => ({ status: "done", result: { jobs: 3 } }) });
 stub("auth/auth.middleware", {
-  authenticate: (req, _res, next) => { req.user = { companyId: 8, id: 1 }; next(); },
+  authenticate: (req, _res, next) => { req.user = { companyId: 8, id: 1, role: "admin" }; next(); },
 });
 
 const router = require("../src/routes/servicetrade");

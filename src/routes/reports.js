@@ -18,6 +18,7 @@ const { sendForRecipient } = require("../services/daily-report/send");
 const { getCompanyTimezone } = require("../utils/timezone");
 const db = require("../db");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 
@@ -49,7 +50,7 @@ router.get("/recipients", authenticate, async (req, res) => {
   }
 });
 
-router.post("/recipients", authenticate, async (req, res) => {
+router.post("/recipients", authenticate, requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -75,7 +76,7 @@ router.post("/recipients", authenticate, async (req, res) => {
   }
 });
 
-router.patch("/recipients/:id", authenticate, async (req, res) => {
+router.patch("/recipients/:id", authenticate, requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -93,7 +94,7 @@ router.patch("/recipients/:id", authenticate, async (req, res) => {
   }
 });
 
-router.delete("/recipients/:id", authenticate, async (req, res) => {
+router.delete("/recipients/:id", authenticate, requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -110,7 +111,7 @@ router.delete("/recipients/:id", authenticate, async (req, res) => {
 // send, no attachment build. Defaults to yesterday if no date is given, since
 // "what would today's not-yet-finished business day look like" isn't a
 // meaningful preview.
-router.post("/daily/preview", authenticate, async (req, res) => {
+router.post("/daily/preview", authenticate, requirePermission(PERM.DATA_READ), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -130,7 +131,7 @@ router.post("/daily/preview", authenticate, async (req, res) => {
 // POST /reports/daily/send-now — SENDS A REAL EMAIL to the given recipient,
 // immediately, bypassing the schedule/idempotency check entirely (repeatable
 // on purpose, for testing). Body: { recipient_id, date? }.
-router.post("/daily/send-now", authenticate, async (req, res) => {
+router.post("/daily/send-now", authenticate, requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

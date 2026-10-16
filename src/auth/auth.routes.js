@@ -7,12 +7,20 @@
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const authService = require("./auth.service");
-const { authenticate, clearUserCache } = require("./auth.middleware");
+const { authenticate, clearUserCache, invalidateUserState } = require("./auth.middleware");
+const { permissionsFor } = require("./permissions");
 const config = require("../config");
 const logger = require("../utils/logger");
 const { sendMail, buildEmailTemplate } = require("../utils/email");
 
 const router = express.Router();
+
+// Every user object handed to the frontend carries what the user may do, so it
+// can hide controls they can't use. The backend still enforces every action.
+function withPermissions(user) {
+  if (!user) return user;
+  return { ...user, is_owner: user.is_owner === true, permissions: permissionsFor(user.role) };
+}
 
 const EMAIL_LINK_EXPIRES_IN = "15m";
 const PASSWORD_RESET_EXPIRES_IN = "1h";
@@ -73,7 +81,7 @@ router.post("/login", async (req, res) => {
 
     return res.json({
       message: "Login successful",
-      user: result.user,
+      user: withPermissions(result.user),
       token: result.token,
       refreshToken: result.refreshToken,
     });
@@ -105,7 +113,7 @@ router.post("/refresh", async (req, res) => {
     return res.json({
       token: result.token,
       refreshToken: result.refreshToken,
-      user: result.user,
+      user: withPermissions(result.user),
     });
   } catch (err) {
     logger.warn("Token refresh failed", { error: err.message });
@@ -128,7 +136,7 @@ router.get("/me", authenticate, async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    return res.json({ user });
+    return res.json({ user: withPermissions(user) });
   } catch (err) {
     logger.error("Failed to get user", { userId: req.user.userId, error: err.message });
     return res.status(500).json({ error: "Failed to get user" });
@@ -333,27 +341,23 @@ router.post("/verify-email-link", async (req, res) => {
       return res.status(400).json({ error: "Invalid or expired link" });
     }
 
-    const tokenPayload = {
-      userId: user.id,
-      email: user.email,
-      companyId: user.company_id,
-      role: user.role,
-    };
+    const tokenPayload = authService.buildTokenPayload(user);
     const accessToken = authService.generateAccessToken(tokenPayload);
     const refreshToken = authService.generateRefreshToken(tokenPayload);
 
     return res.json({
       message: "Sign-in successful",
-      user: {
+      user: withPermissions({
         id: user.id,
         email: user.email,
         name: user.name,
         first_name: user.first_name,
         last_name: user.last_name,
         role: user.role,
+        is_owner: user.is_owner,
         company_id: user.company_id,
         company_name: user.company_name,
-      },
+      }),
       token: accessToken,
       refreshToken,
     });
@@ -412,6 +416,7 @@ router.post("/reset-password", async (req, res) => {
 
     await authService.updatePasswordByEmail(email, newPassword);
     clearUserCache(user.id);
+    invalidateUserState(user.id);
 
     const message = isInvite ? "Account setup successful" : "Password reset successful";
     logger.info(message, { email: email.substring(0, 3) + "***", isInvite });
@@ -421,6 +426,43 @@ router.post("/reset-password", async (req, res) => {
     return res.status(err.status || 500).json({
       error: err.message || "Password reset failed",
     });
+  }
+});
+
+// ── Team invitations (public — the invitee has no account yet) ─────────────
+
+/**
+ * GET /auth/invitations/:token
+ * What the accept-invite page shows: company, inviter, email, role, expiry.
+ * 404 for an unknown token; 410 for expired / used / revoked.
+ */
+router.get("/invitations/:token", async (req, res) => {
+  try {
+    const team = require("../services/team");
+    return res.json({ invitation: await team.describeInvitation(req.params.token) });
+  } catch (err) {
+    if (err.status && err.status < 500) return res.status(err.status).json({ error: err.message, code: err.code });
+    logger.error("GET /auth/invitations/:token failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to load invitation" });
+  }
+});
+
+/**
+ * POST /auth/invitations/accept
+ * Body: { token, password, first_name?, last_name? }
+ * Creates the account with the invited role and signs the user in.
+ */
+router.post("/invitations/accept", async (req, res) => {
+  try {
+    const team = require("../services/team");
+    const { token, password, first_name, last_name } = req.body || {};
+    const result = await team.acceptInvitation({ token, password, firstName: first_name, lastName: last_name });
+    logger.info("Invitation accepted", { userId: result.user.id, companyId: result.user.company_id });
+    return res.status(201).json({ message: "Welcome aboard", ...result });
+  } catch (err) {
+    if (err.status && err.status < 500) return res.status(err.status).json({ error: err.message, code: err.code });
+    logger.error("POST /auth/invitations/accept failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to accept invitation" });
   }
 });
 
