@@ -24,6 +24,7 @@ const { resolveSlugForCompany } = require("../services/crm");
 const { getWorkflow } = require("../confirmation-agent/workflows");
 const logger = require("../utils/logger");
 
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 const router = express.Router();
 
 // Named triggers for POST /:token/messages that map to a FIXED internal
@@ -39,7 +40,7 @@ const router = express.Router();
 // handleCardTriggerMessage/buildCardTriggerArgs further down.
 const NAMED_TRIGGERS = { propose_remaining_appointments: PROPOSE_REMAINING_TRIGGER };
 
-router.post("/appointments/:id", authenticate, async (req, res) => {
+router.post("/appointments/:id", authenticate, requirePermission(PERM.CONFIRMATIONS_SEND), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -60,7 +61,7 @@ router.post("/appointments/:id", authenticate, async (req, res) => {
   }
 });
 
-router.post("/jobs/:id", authenticate, async (req, res) => {
+router.post("/jobs/:id", authenticate, requirePermission(PERM.CONFIRMATIONS_SEND), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -84,7 +85,7 @@ router.post("/jobs/:id", authenticate, async (req, res) => {
 // "Send chat link" via email — creates/reuses the link (same as the plain
 // POST above) and additionally emails it to the customer on file, for a
 // button that actually delivers the link instead of just copying a URL.
-router.post("/appointments/:id/send-email", authenticate, async (req, res) => {
+router.post("/appointments/:id/send-email", authenticate, requirePermission(PERM.CONFIRMATIONS_SEND), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -114,7 +115,7 @@ router.post("/appointments/:id/send-email", authenticate, async (req, res) => {
   }
 });
 
-router.post("/jobs/:id/send-email", authenticate, async (req, res) => {
+router.post("/jobs/:id/send-email", authenticate, requirePermission(PERM.CONFIRMATIONS_SEND), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -146,7 +147,7 @@ router.post("/jobs/:id/send-email", authenticate, async (req, res) => {
 
 // Same idea as send-email above, but texts the link via Twilio instead — a
 // plain text with a link, NOT the conversational Retell "Text Now" feature.
-router.post("/appointments/:id/send-sms", authenticate, async (req, res) => {
+router.post("/appointments/:id/send-sms", authenticate, requirePermission(PERM.CONFIRMATIONS_SEND), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -173,7 +174,7 @@ router.post("/appointments/:id/send-sms", authenticate, async (req, res) => {
   }
 });
 
-router.post("/jobs/:id/send-sms", authenticate, async (req, res) => {
+router.post("/jobs/:id/send-sms", authenticate, requirePermission(PERM.CONFIRMATIONS_SEND), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

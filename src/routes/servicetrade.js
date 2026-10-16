@@ -19,6 +19,7 @@ const webhookProcessor = require("../services/servicetrade-webhook-processor");
 const { getCompanyTimezone, localToUTC } = require("../utils/timezone");
 const { validateSyncRange } = require("../utils/sync-date-range");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 
@@ -32,7 +33,7 @@ router.use(authenticate);
  * never returned or logged.
  * Body: { username, password, metadata? } — on reconnect, metadata is merged with existing.
  */
-router.post("/credentials", async (req, res) => {
+router.post("/credentials", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   const companyId = req.user.companyId;
   const { username, password, metadata } = req.body || {};
 
@@ -86,7 +87,7 @@ router.post("/credentials", async (req, res) => {
  * Normally unnecessary — every request and the keep-alive cron renew it on
  * their own — but useful as a manual "reconnect" button.
  */
-router.post("/login", async (req, res) => {
+router.post("/login", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   const companyId = req.user.companyId;
   try {
     const cookie = await servicetrade.reauthenticate(companyId, null, null);
@@ -226,7 +227,7 @@ router.get("/status", async (req, res) => {
  * DELETE /integrations/servicetrade/session
  * Close ServiceTrade session and clear stored username and auth_code; metadata is preserved.
  */
-router.delete("/session", async (req, res) => {
+router.delete("/session", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   const companyId = req.user.companyId;
 
   try {
@@ -282,7 +283,7 @@ async function resolveSyncRange(companyId, { startDate, endDate, full }) {
  * incremental cursors and last_sync_at untouched (see runSync). Mutually
  * exclusive with full=true.
  */
-router.post("/sync", async (req, res) => {
+router.post("/sync", requirePermission(PERM.SYNC_RUN), async (req, res) => {
   const companyId = req.user.companyId;
   const full = req.query.full === "true" || req.query.full === true;
   const stream = req.query.stream === "true" || req.query.stream === true;
@@ -535,7 +536,7 @@ router.get("/webhook", async (req, res) => {
 // POST /integrations/servicetrade/webhook — create or repoint the subscription.
 // Idempotent: re-posting updates the existing subscription instead of adding a
 // second one (ServiceTrade would then deliver every message twice).
-router.post("/webhook", async (req, res) => {
+router.post("/webhook", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   try {
     const result = await webhookRegistration.register(req.user.companyId, {
       // Override only for testing against a tunnel; production uses PUBLIC_API_URL.
@@ -550,7 +551,7 @@ router.post("/webhook", async (req, res) => {
   }
 });
 
-router.delete("/webhook", async (req, res) => {
+router.delete("/webhook", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   try {
     const result = await webhookRegistration.unregister(req.user.companyId);
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
@@ -568,7 +569,7 @@ router.delete("/webhook", async (req, res) => {
 // Scoped to the caller's own company, and safe to hammer — claimPending uses
 // FOR UPDATE SKIP LOCKED, so a concurrent cron tick and ten impatient clicks
 // cannot process the same event twice.
-router.post("/webhook/drain", async (req, res) => {
+router.post("/webhook/drain", requirePermission(PERM.SYNC_RUN), async (req, res) => {
   try {
     const result = await webhookProcessor.drainCompany(req.user.companyId);
     return res.json({ ok: true, ...result });

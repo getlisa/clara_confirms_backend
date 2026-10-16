@@ -25,11 +25,12 @@ const logger = require("../utils/logger");
 
 const SUBSCRIBER_WAIT_MS = 4000;
 
-async function start({ companyId, userId, conversationId, threadId, message }) {
+async function start({ companyId, userId, role = null, conversationId, threadId, message }) {
   const engine = await Engine.create({ kind: "copilot_turn", companyId, startedBy: userId });
   runTurn(engine, {
     companyId,
     userId,
+    role,
     conversationId,
     threadId,
     input: { messages: [new HumanMessage(message)] },
@@ -37,11 +38,12 @@ async function start({ companyId, userId, conversationId, threadId, message }) {
   return engine;
 }
 
-async function resume({ companyId, userId, conversationId, threadId, pendingActionId, decision }) {
+async function resume({ companyId, userId, role = null, conversationId, threadId, pendingActionId, decision }) {
   const engine = await Engine.create({ kind: "copilot_turn", companyId, startedBy: userId });
   runTurn(engine, {
     companyId,
     userId,
+    role,
     conversationId,
     threadId,
     pendingActionId,
@@ -51,7 +53,7 @@ async function resume({ companyId, userId, conversationId, threadId, pendingActi
   return engine;
 }
 
-async function runTurn(engine, { companyId, userId, conversationId, threadId, input, pendingActionId, decision }) {
+async function runTurn(engine, { companyId, userId, role = null, conversationId, threadId, input, pendingActionId, decision }) {
   // Give the SSE client a moment to subscribe so early tokens aren't lost
   // (tokens are live-only, not persisted/replayed).
   await waitForSubscriber(String(engine.id), SUBSCRIBER_WAIT_MS);
@@ -59,6 +61,9 @@ async function runTurn(engine, { companyId, userId, conversationId, threadId, in
   const ctx = {
     companyId,
     userId,
+    // The ACTING user's role — on a resume, whoever confirms the action. Write
+    // tools re-check it when they run (copilot/tools/registry.js).
+    role,
     conversationId,
     runId: engine.id,
     emit: (type, payload) => engine.emit(type, payload),

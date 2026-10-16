@@ -20,13 +20,14 @@ const token = require("../engines/core/token");
 const copilot = require("../copilot");
 const persistence = require("../copilot/persistence");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 
 const MAX_MESSAGE_LEN = 4000;
 
 // ── Create conversation ────────────────────────────────────────────────────
-router.post("/conversations", authenticate, async (req, res) => {
+router.post("/conversations", authenticate, requirePermission(PERM.COPILOT_USE), async (req, res) => {
   try {
     const conv = await persistence.createConversation(
       getCompanyId(req),
@@ -66,7 +67,7 @@ router.get("/conversations/:id", authenticate, async (req, res) => {
 });
 
 // ── Send a message → start a streaming turn ────────────────────────────────
-router.post("/conversations/:id/messages", authenticate, async (req, res) => {
+router.post("/conversations/:id/messages", authenticate, requirePermission(PERM.COPILOT_USE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     const conv = await persistence.getConversation(req.params.id, companyId);
@@ -81,6 +82,8 @@ router.post("/conversations/:id/messages", authenticate, async (req, res) => {
     const engine = await copilot.start({
       companyId,
       userId: getUserId(req),
+      // The role gates which write tools the copilot may offer and run.
+      role: req.user?.role ?? null,
       conversationId: conv.id,
       threadId: conv.thread_id,
       message,
@@ -94,7 +97,7 @@ router.post("/conversations/:id/messages", authenticate, async (req, res) => {
 });
 
 // ── Confirm / reject a pending write action ────────────────────────────────
-router.post("/conversations/:id/confirm", authenticate, async (req, res) => {
+router.post("/conversations/:id/confirm", authenticate, requirePermission(PERM.COPILOT_USE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     const conv = await persistence.getConversation(req.params.id, companyId);
@@ -124,6 +127,8 @@ router.post("/conversations/:id/confirm", authenticate, async (req, res) => {
     const engine = await copilot.resume({
       companyId,
       userId: getUserId(req),
+      // The role gates which write tools the copilot may offer and run.
+      role: req.user?.role ?? null,
       conversationId: conv.id,
       threadId: conv.thread_id,
       pendingActionId,

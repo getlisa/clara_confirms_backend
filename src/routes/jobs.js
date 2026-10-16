@@ -20,6 +20,7 @@ const { getCompanyTimezone, localToUTC, localizeFields, localizeRows } = require
 const { syncJobConfirmationStatus } = require("../services/job-confirmation-status");
 const scheduler = require("../services/scheduler");
 const callSettingsDb = require("../db/call-settings");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
@@ -170,7 +171,7 @@ router.get("/job-types", async (req, res) => {
  * now covers every upcoming appointment on a job, so there's nothing to
  * address at the individual-appointment level.
  */
-router.post("/bulk-send-confirmation", async (req, res) => {
+router.post("/bulk-send-confirmation", requirePermission(PERM.CONFIRMATIONS_SEND), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -262,7 +263,7 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-router.post("/", async (req, res) => {
+router.post("/", requirePermission(PERM.JOBS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -279,7 +280,7 @@ router.post("/", async (req, res) => {
   }
 });
 
-router.patch("/:id", async (req, res) => {
+router.patch("/:id", requirePermission(PERM.JOBS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -299,7 +300,7 @@ router.patch("/:id", async (req, res) => {
 });
 
 // PATCH /jobs/:id/reschedule — update job's scheduled_date (from UI or Retell tool)
-router.patch("/:id/reschedule", async (req, res) => {
+router.patch("/:id/reschedule", requirePermission(PERM.JOBS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -338,7 +339,7 @@ router.get("/:id/appointments", async (req, res) => {
   }
 });
 
-router.post("/:id/appointments", async (req, res) => {
+router.post("/:id/appointments", requirePermission(PERM.JOBS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -399,7 +400,7 @@ router.get("/appointments/:id", async (req, res) => {
   }
 });
 
-router.patch("/appointments/:id", async (req, res) => {
+router.patch("/appointments/:id", requirePermission(PERM.JOBS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

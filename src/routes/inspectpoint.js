@@ -21,6 +21,7 @@ const engineToken = require("../engines/core/token");
 const enginesDb = require("../engines/core/db");
 const { validateSyncRange } = require("../utils/sync-date-range");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 
@@ -31,7 +32,7 @@ router.use(authenticate);
  * Connect with a subdomain + API key. Verified with one cheap read
  * (GET /accounts?max=1) before saving — there is no dedicated auth endpoint.
  */
-router.post("/credentials", async (req, res) => {
+router.post("/credentials", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   const companyId = req.user.companyId;
   const { subdomain, apiKey, metadata } = req.body || {};
 
@@ -123,7 +124,7 @@ router.get("/status", async (req, res) => {
  * Clears the stored API key; subdomain + metadata are preserved for a
  * one-click reconnect.
  */
-router.delete("/session", async (req, res) => {
+router.delete("/session", requirePermission(PERM.INTEGRATIONS_MANAGE), async (req, res) => {
   const companyId = req.user.companyId;
   try {
     await credentialsDb.clearCredentials(companyId);
@@ -165,7 +166,7 @@ function utcDayBounds(startDate, endDate) {
  * untouched (see inspectpoint-sync.js's runSync). Mutually exclusive with
  * full=true. Same contract as routes/servicetrade.js's equivalent.
  */
-router.post("/sync", async (req, res) => {
+router.post("/sync", requirePermission(PERM.SYNC_RUN), async (req, res) => {
   const companyId = req.user.companyId;
   const full = req.query.full === "true" || req.query.full === true;
   const stream = req.query.stream === "true" || req.query.stream === true;

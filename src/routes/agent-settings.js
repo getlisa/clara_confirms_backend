@@ -6,9 +6,17 @@ const { syncFlowForCompany } = require("../services/retell-flow");
 const promptEditor = require("../services/prompt-editor");
 const retell = require("../services/retell");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, hasPermission, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
+
+// Editing a call type's prompt text is prompt.edit (admins); toggling it on or
+// off, renaming or re-describing it is an ordinary settings change.
+const callTypePatchPermission = requireDynamicPermission(
+  (req) => (req.body?.general_prompt !== undefined || req.body?.begin_message !== undefined ? PERM.PROMPT_EDIT : PERM.SETTINGS_EDIT),
+  "prompt.edit | settings.edit"
+);
 
 // ── Global agent identity ─────────────────────────────────────────────────────
 
@@ -33,7 +41,7 @@ router.get("/", async (req, res) => {
 // Updating representative_name or voice_id re-syncs the flow so the Retell
 // agent picks up the new value (voice via agent.update, representative_name
 // via the flow's default_dynamic_variables).
-router.patch("/", async (req, res) => {
+router.patch("/", requirePermission(PERM.AGENT_VOICE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -125,7 +133,7 @@ router.get("/flow-status", async (req, res) => {
  * Manually provision or repair the Retell conversation flow for this company.
  * Safe to call on existing tenants that predate the flow feature.
  */
-router.post("/sync-flow", async (req, res) => {
+router.post("/sync-flow", requirePermission(PERM.AGENT_VOICE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -161,7 +169,7 @@ router.get("/call-types", async (req, res) => {
   }
 });
 
-router.post("/call-types", async (req, res) => {
+router.post("/call-types", requirePermission(PERM.AGENT_MANAGE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -195,11 +203,12 @@ router.post("/call-types", async (req, res) => {
   }
 });
 
-// Prompt edits change what the live agent says on every call, so they are
-// admin-only. Other call-type fields keep their existing (any-user) access.
+// Prompt edits change what the live agent says on every call: prompt.edit
+// (admins). Kept as an in-handler check as well as the route guard, because
+// PATCH /call-types/:type only needs it when the body carries prompt text.
 function requireAdminForPrompt(req, res) {
-  if (req.user?.role !== "admin") {
-    res.status(403).json({ error: "Only admins can edit the agent prompt" });
+  if (!hasPermission(req.user?.role, PERM.PROMPT_EDIT)) {
+    res.status(403).json({ error: "Only admins can edit the agent prompt", code: "forbidden", required: PERM.PROMPT_EDIT });
     return false;
   }
   return true;
@@ -219,7 +228,7 @@ function sendPromptError(res, err, label) {
   return res.status(500).json({ error: "Failed to update the agent prompt" });
 }
 
-router.patch("/call-types/:type", async (req, res) => {
+router.patch("/call-types/:type", callTypePatchPermission, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -299,7 +308,7 @@ router.get("/call-types/:type/prompt", async (req, res) => {
 });
 
 // Dry-run validation while the user types. Saves nothing.
-router.post("/call-types/:type/prompt/validate", async (req, res) => {
+router.post("/call-types/:type/prompt/validate", requirePermission(PERM.DATA_READ), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -312,7 +321,7 @@ router.post("/call-types/:type/prompt/validate", async (req, res) => {
   }
 });
 
-router.put("/call-types/:type/prompt", async (req, res) => {
+router.put("/call-types/:type/prompt", requirePermission(PERM.PROMPT_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -329,7 +338,7 @@ router.put("/call-types/:type/prompt", async (req, res) => {
   }
 });
 
-router.post("/call-types/:type/prompt/reset", async (req, res) => {
+router.post("/call-types/:type/prompt/reset", requirePermission(PERM.PROMPT_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -344,7 +353,7 @@ router.post("/call-types/:type/prompt/reset", async (req, res) => {
 });
 
 // Retry pushing the stored prompt to Retell (after a failed sync).
-router.post("/call-types/:type/prompt/sync", async (req, res) => {
+router.post("/call-types/:type/prompt/sync", requirePermission(PERM.PROMPT_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -371,7 +380,7 @@ router.get("/call-types/:type/prompt/revisions", async (req, res) => {
   }
 });
 
-router.post("/call-types/:type/prompt/revisions/:revisionId/restore", async (req, res) => {
+router.post("/call-types/:type/prompt/revisions/:revisionId/restore", requirePermission(PERM.PROMPT_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -387,7 +396,7 @@ router.post("/call-types/:type/prompt/revisions/:revisionId/restore", async (req
   }
 });
 
-router.delete("/call-types/:type", async (req, res) => {
+router.delete("/call-types/:type", requirePermission(PERM.AGENT_MANAGE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

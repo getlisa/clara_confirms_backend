@@ -97,6 +97,56 @@ async function resolveSupabaseUser(supabaseUserId, email) {
   return user;
 }
 
+// ── Live user state (migration 115) ─────────────────────────────────────────
+//
+// The role, active flag and token_version are read from the DB, not trusted
+// from the token: a token carries the role it was minted with, and without
+// this a demoted or removed colleague kept their old access for up to an hour
+// (refresh: 7 days). One indexed lookup per request, cached briefly per
+// instance; any change made through this process invalidates its own entry.
+
+const USER_STATE_TTL_MS = 30 * 1000;
+const userStateCache = new Map();
+
+async function loadUserState(userId) {
+  const key = String(userId);
+  const hit = userStateCache.get(key);
+  if (hit && Date.now() - hit.at < USER_STATE_TTL_MS) return hit.state;
+  const db = require("../db");
+  const { rows } = await db.query(
+    `SELECT id, company_id, email, role, is_active, is_deleted, is_owner, token_version
+       FROM users WHERE id = $1`,
+    [userId]
+  );
+  const state = rows[0] || null;
+  if (userStateCache.size >= CACHE_MAX_SIZE) userStateCache.delete(userStateCache.keys().next().value);
+  userStateCache.set(key, { state, at: Date.now() });
+  return state;
+}
+
+/** Drop a user's cached state — call after changing their role/active/token_version. */
+function invalidateUserState(userId) {
+  if (userId == null) userStateCache.clear();
+  else userStateCache.delete(String(userId));
+}
+
+/**
+ * req.user from a verified token, or null when the account may no longer use
+ * it: deleted, deactivated, or the token predates a token_version bump.
+ */
+async function liveUser(userId, tokenVersion) {
+  const u = await loadUserState(userId);
+  if (!u || u.is_deleted || !u.is_active) return null;
+  if (tokenVersion != null && Number(tokenVersion) !== Number(u.token_version ?? 0)) return null;
+  return {
+    userId: u.id,
+    email: u.email,
+    companyId: u.company_id,
+    role: u.role,
+    isOwner: u.is_owner === true,
+  };
+}
+
 /**
  * Verify custom JWT token
  * @param {string} token 
@@ -152,26 +202,19 @@ async function authenticate(req, res, next) {
   // Try custom JWT first
   const customPayload = verifyCustomToken(token);
   if (customPayload) {
-    req.user = {
-      userId: customPayload.userId,
-      email: customPayload.email,
-      companyId: customPayload.companyId,
-      role: customPayload.role,
-    };
+    const user = await liveUser(customPayload.userId, customPayload.tv ?? 0).catch(() => null);
+    if (!user) return res.status(401).json({ error: "Invalid or expired token", code: "session_revoked" });
+    req.user = user;
     return next();
   }
 
   // Try Supabase JWT
   const supabasePayload = verifySupabaseToken(token);
   if (supabasePayload) {
-    const user = await resolveSupabaseUser(supabasePayload.sub, supabasePayload.email);
+    const resolved = await resolveSupabaseUser(supabasePayload.sub, supabasePayload.email);
+    const user = resolved ? await liveUser(resolved.id, null).catch(() => null) : null;
     if (user) {
-      req.user = {
-        userId: user.id,
-        email: user.email,
-        companyId: user.company_id,
-        role: user.role,
-      };
+      req.user = user;
       return next();
     }
     logger.warn("Supabase user not found in DB", { sub: supabasePayload.sub });
@@ -198,26 +241,17 @@ async function optionalAuthenticate(req, res, next) {
   // Try custom JWT first
   const customPayload = verifyCustomToken(token);
   if (customPayload) {
-    req.user = {
-      userId: customPayload.userId,
-      email: customPayload.email,
-      companyId: customPayload.companyId,
-      role: customPayload.role,
-    };
+    req.user = await liveUser(customPayload.userId, customPayload.tv ?? 0).catch(() => null);
     return next();
   }
 
   // Try Supabase JWT
   const supabasePayload = verifySupabaseToken(token);
   if (supabasePayload) {
-    const user = await resolveSupabaseUser(supabasePayload.sub, supabasePayload.email);
+    const resolved = await resolveSupabaseUser(supabasePayload.sub, supabasePayload.email);
+    const user = resolved ? await liveUser(resolved.id, null).catch(() => null) : null;
     if (user) {
-      req.user = {
-        userId: user.id,
-        email: user.email,
-        companyId: user.company_id,
-        role: user.role,
-      };
+      req.user = user;
       return next();
     }
   }
@@ -296,6 +330,8 @@ function requireRole(roles) {
 }
 
 module.exports = {
+  invalidateUserState,
+  loadUserState,
   authenticate,
   optionalAuthenticate,
   getCompanyId,

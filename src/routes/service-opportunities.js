@@ -16,6 +16,7 @@ const { toE164 } = require("../utils/phone");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localizeRows, localizeFields } = require("../utils/timezone");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const isDev = process.env.NODE_ENV === "development";
 const SERVICE_OPPORTUNITY_CALL_TYPE = "service_opportunity_followup";
@@ -87,7 +88,7 @@ router.get("/service-lines", async (req, res) => {
  * call per group, dialing the customer. Two+ opportunities sharing all four
  * group by into a single call carrying all their contexts.
  */
-router.post("/schedule-calls", async (req, res) => {
+router.post("/schedule-calls", requirePermission(PERM.CALLS_MAKE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

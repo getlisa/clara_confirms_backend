@@ -14,6 +14,59 @@
 const { tool } = require("@langchain/core/tools");
 const toolDefsDb = require("../../db/copilot-tool-definitions");
 const logger = require("../../utils/logger");
+const db = require("../../db");
+const { PERMISSIONS: PERM, hasPermission, permissionForCallType } = require("../../auth/permissions");
+
+// What each WRITE tool requires (src/auth/permissions.js). The copilot calls
+// services directly, not the HTTP routes, so without this a Confirmer could do
+// through the copilot what the API refuses them. Read tools need data.read,
+// which every role has. make_call / schedule_call depend on the call type the
+// trigger resolves to: a confirmation call needs only confirmations.send.
+const TOOL_PERMISSIONS = {
+  set_todo_status:          PERM.TODOS_MANAGE,
+  update_agent_config:      PERM.AGENT_VOICE,
+  update_call_settings:     PERM.SETTINGS_EDIT,
+  set_call_trigger_enabled: PERM.SETTINGS_EDIT,
+  run_scheduler:            PERM.CALLS_MAKE,
+  make_call:                "call",
+  schedule_call:            "call",
+};
+
+async function requiredPermission(name, args, ctx) {
+  const p = TOOL_PERMISSIONS[name];
+  if (!p) return PERM.DATA_READ;
+  if (p !== "call") return p;
+  const { rows } = await db.query(
+    `SELECT call_type FROM call_trigger_configs WHERE company_id = $1 AND trigger_type = $2 LIMIT 1`,
+    [ctx?.companyId, String(args?.trigger_type || "")]
+  );
+  return permissionForCallType(rows[0]?.call_type ?? null);
+}
+
+/**
+ * Whether the tool may be OFFERED to the model for this role. Call tools are
+ * offered to anyone who can send confirmations; the call type decides at run
+ * time (guard below).
+ */
+function toolAllowedForRole(name, role) {
+  const p = TOOL_PERMISSIONS[name];
+  if (!p) return hasPermission(role, PERM.DATA_READ);
+  if (p === "call") return hasPermission(role, PERM.CONFIRMATIONS_SEND) || hasPermission(role, PERM.CALLS_MAKE);
+  return hasPermission(role, p);
+}
+
+/** Wrap a handler so it refuses, rather than runs, when the acting role lacks the permission. */
+function guarded(h) {
+  return async (args, config) => {
+    const ctx = config?.configurable?.ctx;
+    const needed = await requiredPermission(h.name, args, ctx);
+    if (!hasPermission(ctx?.role, needed)) {
+      logger.warn("copilot: tool refused for role", { tool: h.name, role: ctx?.role, needed });
+      return JSON.stringify({ status: "forbidden", message: `Your role doesn't allow this action (requires ${needed}).` });
+    }
+    return h.run(args, config);
+  };
+}
 
 const HANDLERS = [
   // read
@@ -59,11 +112,11 @@ async function build() {
 
   const chosen = HANDLERS.filter((h) => enabled.size === 0 || enabled.has(h.name));
   const tools = chosen.map((h) =>
-    tool(h.run, { name: h.name, description: h.description, schema: h.schema })
+    tool(guarded(h), { name: h.name, description: h.description, schema: h.schema })
   );
   const writeNames = new Set(chosen.filter((h) => h.isWrite).map((h) => h.name));
 
   return { tools, isWrite: (name) => writeNames.has(name) };
 }
 
-module.exports = { HANDLERS, build };
+module.exports = { HANDLERS, TOOL_PERMISSIONS, build, toolAllowedForRole, requiredPermission };

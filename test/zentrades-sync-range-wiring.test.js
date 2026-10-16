@@ -56,7 +56,7 @@ stub("db/servicetrade-credentials", stCredsStub);
 stub("db/inspectpoint-credentials", ipCredsStub);
 
 stub("auth/auth.middleware", {
-  authenticate: (req, _res, next) => { req.user = { companyId: 8, id: 1 }; next(); },
+  authenticate: (req, _res, next) => { req.user = { companyId: 8, id: 1, role: "admin" }; next(); },
 });
 
 const router = require("../src/routes/zentrades");

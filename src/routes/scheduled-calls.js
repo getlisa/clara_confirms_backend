@@ -14,9 +14,24 @@ const scheduledCallsDb = require("../db/scheduled-calls");
 const { CUSTOMER_CALL_TYPES } = scheduledCallsDb;
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localToUTC, toOffsetISOString, localizeFields, localizeRows } = require("../utils/timezone");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
+
+// Confirmation call types need confirmations.send (Confirmers may queue and
+// cancel them); every other call type needs calls.make.
+const scheduledCallCreatePermission = requireDynamicPermission(
+  (req) => (req.body?.call_type ? permissionForCallType(String(req.body.call_type)) : null),
+  "confirmations.send | calls.make"
+);
+const scheduledCallDeletePermission = requireDynamicPermission(async (req) => {
+  const { rows } = await db.query(
+    `SELECT call_type FROM scheduled_calls WHERE id = $1 AND company_id = $2`,
+    [Number(req.params.id), req.user.companyId]
+  );
+  return rows[0] ? permissionForCallType(rows[0].call_type) : null; // unknown id: the handler answers 404
+}, "confirmations.send | calls.make");
 
 // job_date is a DATE-only column — never passed through these.
 const SCHEDULED_CALL_TZ_FIELDS = ["scheduled_at", "last_attempted_at", "created_at", "updated_at", "callback_requested_at"];
@@ -89,7 +104,7 @@ router.get("/", async (req, res) => {
  * Manually schedule an outbound call.
  * scheduled_at is snapped to the next office-hours window if outside business hours.
  */
-router.post("/", async (req, res) => {
+router.post("/", scheduledCallCreatePermission, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -169,7 +184,7 @@ router.post("/", async (req, res) => {
  * DELETE /scheduled-calls/:id
  * Cancel a pending scheduled call. Only pending/in_progress calls can be cancelled.
  */
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", scheduledCallDeletePermission, async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

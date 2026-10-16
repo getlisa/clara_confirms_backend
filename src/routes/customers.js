@@ -14,6 +14,7 @@ const callSettingsDb = require("../db/call-settings");
 const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const { getCompanyTimezone, localizeFields, localizeRows } = require("../utils/timezone");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
@@ -107,7 +108,7 @@ router.get("/:id", async (req, res) => {
  *         address_line1?, city?, state?, zipcode?, country?,
  *         source?, additional_information? }
  */
-router.post("/", async (req, res) => {
+router.post("/", requirePermission(PERM.JOBS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -142,7 +143,7 @@ router.post("/", async (req, res) => {
  * previous client-side loop (`handleApplyStrategyToCustomers`) that
  * PATCHed every customer one at a time.
  */
-router.post("/bulk-apply-channel-strategy", async (req, res) => {
+router.post("/bulk-apply-channel-strategy", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -166,7 +167,7 @@ router.post("/bulk-apply-channel-strategy", async (req, res) => {
  * PATCH /customers/:id
  * Body: any subset of customer fields
  */
-router.patch("/:id", async (req, res) => {
+router.patch("/:id", requirePermission(PERM.JOBS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });

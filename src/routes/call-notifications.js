@@ -24,6 +24,7 @@ const sendsDb = require("../db/call-notification-sends");
 const { sendTestNow } = require("../services/call-notification/drain");
 const db = require("../db");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
@@ -69,7 +70,7 @@ router.get("/", async (req, res) => {
 });
 
 /** PATCH /call-notifications — `{ enabled: boolean }`. */
-router.patch("/", async (req, res) => {
+router.patch("/", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = requireCompany(req, res);
     if (!companyId) return;
@@ -105,7 +106,7 @@ router.get("/recipients", async (req, res) => {
  * by a separate PATCH once reviewed, so a half-filled form cannot start
  * emailing a real inbox. Same rule as /reports/recipients.
  */
-router.post("/recipients", async (req, res) => {
+router.post("/recipients", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = requireCompany(req, res);
     if (!companyId) return;
@@ -129,7 +130,7 @@ router.post("/recipients", async (req, res) => {
 });
 
 /** PATCH /call-notifications/recipients/:id — any subset of email/name/events/enabled. */
-router.patch("/recipients/:id", async (req, res) => {
+router.patch("/recipients/:id", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = requireCompany(req, res);
     if (!companyId) return;
@@ -158,7 +159,7 @@ router.patch("/recipients/:id", async (req, res) => {
   }
 });
 
-router.delete("/recipients/:id", async (req, res) => {
+router.delete("/recipients/:id", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = requireCompany(req, res);
     if (!companyId) return;
@@ -180,7 +181,7 @@ router.delete("/recipients/:id", async (req, res) => {
  * which is the whole thing being tested. Bypasses the event filter and the
  * dedup index, so it is repeatable and never consumes a real notification.
  */
-router.post("/test", async (req, res) => {
+router.post("/test", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = requireCompany(req, res);
     if (!companyId) return;

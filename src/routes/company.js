@@ -4,6 +4,7 @@ const { authenticate, getCompanyId } = require("../auth");
 const { syncFlowForCompany } = require("../services/retell-flow");
 const { getAreaCodesForState, getPrimaryAreaCode, suggestAreaCode } = require("../utils/area-code");
 const logger = require("../utils/logger");
+const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
 router.use(authenticate);
@@ -80,7 +81,7 @@ router.get("/area-codes", (req, res) => {
  * When state is updated and office_area_code is not explicitly provided,
  * the primary area code for that state is auto-set.
  */
-router.patch("/", async (req, res) => {
+router.patch("/", requirePermission(PERM.COMPANY_MANAGE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
@@ -174,7 +175,7 @@ router.patch("/", async (req, res) => {
 
 // ── PATCH /company/phone-number ───────────────────────────────────────────────
 
-router.patch("/phone-number", async (req, res) => {
+router.patch("/phone-number", requirePermission(PERM.COMPANY_MANAGE), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
