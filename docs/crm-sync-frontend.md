@@ -20,7 +20,8 @@ never on the role (`team-access-frontend.md`).
 
 | Endpoint | Purpose | Permission | § | Phase |
 |---|---|---|---|---|
-| `POST /jobs/:id/refresh` | **Refresh** one job and everything tied to it | `sync.run` | 2 | 1 |
+| `POST /jobs/:id/refresh` | **Refresh** one job and everything tied to it | `sync.run` | 2 | live |
+| `GET /jobs/:id` → `deficiencies` | structured deficiencies on the job and on each visit | `data.read` | 2a | live |
 | `GET /integrations/sync/status` | status pill + change detection | `data.read` | 3 | 2 |
 | `GET /integrations/sync/months` | Synced months panel | `data.read` | 4.1 | 2 |
 | `POST /integrations/sync/months` | **Sync** one or more months | `sync.run` | 4.2 | 2 |
@@ -69,7 +70,7 @@ never changed by a refresh.
 ```json
 // 200
 {
-  "job": { "...": "same shape as GET /jobs/:id — appointments, customer, location, contacts, deficiencies included" },
+  "job": { "...": "exactly what GET /jobs/:id returns — appointments, customer, contacts, and deficiencies (§2a)" },
   "changed": true,
   "changes": [
     { "entity": "appointment", "id": 88121, "action": "updated", "field": "scheduled_start",
@@ -103,6 +104,84 @@ never changed by a refresh.
   changed in {provider_label}." with **Load latest** / **Keep editing**.
 
 ---
+
+## 2a. Deficiencies on a job — `GET /jobs/:id` and the Refresh response — [live]
+
+The job detail, and the `job` in a Refresh response, return deficiencies as structured objects
+in two places. **Use these instead of reading `appointments[].services[]` rows with
+`kind: "deficiency_repair"`.** Those rows still exist, but they are offers attached to a
+visit, not the deficiency itself.
+
+### `job.deficiencies` — every open deficiency at the job's site
+
+```json
+"deficiency_summary": { "open": 3 },
+"deficiencies": [
+  {
+    "id": 100824,
+    "name": "Deficient - CaptiveAire Piranha 4.5 gal Kitchen",
+    "description": "Nozzle caps missing on two appliance nozzles",
+    "status": "verified",
+    "severity": "deficient",
+    "service_line": "Kitchen Suppression",
+    "service_line_id": 412,
+    "is_resolved": false,
+    "opened_at": "2026-10-14T14:38:18.000Z",
+    "resolved_at": null,
+    "source": "servicetrade",
+    "external_ref": "2776594249976321",
+    "asset_type": null,
+    "resolution_status": null,
+    "inspection_ref": null,
+    "detail": {},
+    "visit_ids": [1251138]
+  }
+]
+```
+
+| field | notes |
+|---|---|
+| `name` | the label to show. Already the best one available. |
+| `severity` | **ServiceTrade only:** `inoperable` (worst), `deficient`, `suggested`. `null` for InspectPoint. |
+| `status` | ServiceTrade: `new` / `verified`. InspectPoint: usually `null`. Don't build UI on it. |
+| `service_line` | the trade or system it belongs to ("Kitchen Suppression", "Sprinkler"). Use it as a group heading. |
+| `asset_type`, `detail` | **InspectPoint only.** `detail.asset_details` has six different shapes. Render it as described in `deficiencies-frontend.md` §4 (Question + Answer first). Empty `{}` for ServiceTrade. |
+| `visit_ids` | the visits of this job that list it (see below). Empty means it's at the site but no upcoming visit covers it. |
+
+Only **open** deficiencies are returned, at most 200, newest first. Resolved ones are
+left out. The full history per site stays at `GET /locations/:id/deficiencies`.
+
+### `appointments[].deficiencies` — the deficiencies that concern this visit
+
+Every visit has a `deficiencies` array, usually empty. Each item is the same object as
+above, without `visit_ids`, plus a `relation`:
+
+| `relation` | meaning | show as |
+|---|---|---|
+| `repair_offered` | Clara will offer to repair it on this visit (InspectPoint) | **"Repair offered on this visit"** |
+| `open_at_site` | it's open at the site, and this is the job's **next upcoming visit** | **"Open at this site"** |
+
+- Only the **next upcoming visit** gets `open_at_site` items. Past and later visits don't
+  repeat the whole list.
+- ServiceTrade deficiencies have no visit-level link in the CRM, so they always arrive as
+  `open_at_site` on the next visit.
+- A deficiency appears at most once per visit, and `repair_offered` wins.
+
+### Suggested layout
+
+**Job detail → "Deficiencies (3)" section** (hide it when `deficiency_summary.open === 0`):
+- Group by `service_line`.
+- Sort each group by severity, `inoperable` first.
+- Each row shows: a severity badge (red `inoperable`, orange `deficient`, grey `suggested`; none
+  for InspectPoint), `name`, a one-line `description`, and "Opened {relative opened_at}".
+- Expanding a row shows the full description and, for InspectPoint, the `detail.asset_details`
+  card.
+
+**Visit card / drawer → "Deficiencies on this visit (n)":** a compact list of the visit's
+`deficiencies` with the relation as a small tag. Hide it when the list is empty.
+
+**After a Refresh:** a `changes` entry with `entity: "deficiency"` means the job's
+`deficiencies` changed. Re-render from the returned `job`. Don't patch the list.
 
 ## 3. `GET /integrations/sync/status` — the pill — [Phase 2]
 

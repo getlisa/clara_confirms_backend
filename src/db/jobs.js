@@ -348,7 +348,13 @@ async function listJobTypes(companyId) {
   return rows.map((r) => r.job_type);
 }
 
-async function getJobById(id, companyId) {
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.withDeficiencies] — add structured deficiencies to the
+ *   job and to each visit (attachDeficiencies). Off by default: this read sits
+ *   on the voice-dispatch path, where every extra query is dead air.
+ */
+async function getJobById(id, companyId, { withDeficiencies = false } = {}) {
   const result = await db.query(
     `SELECT j.*,
             c.full_name     AS customer_name,
@@ -445,7 +451,75 @@ async function getJobById(id, companyId) {
 
   job.contacts = await getJobContacts(id, companyId, row);
 
+  if (withDeficiencies) await attachDeficiencies(companyId, job, row.location_id ?? null);
+
   return job;
+}
+
+// Visit statuses a deficiency can still be acted on at. Same set the
+// confirmation sweep treats as upcoming work.
+const OPEN_VISIT_STATUSES = new Set(["scheduled", "confirmed", "pending"]);
+
+/**
+ * Structured deficiencies on a job (docs/crm-sync-frontend.md §2a).
+ *
+ * `job.deficiencies` — every OPEN deficiency at the job's site (plus any tied
+ * to the job itself), in the same shape GET /locations/:id/deficiencies
+ * returns, with `severity`, `service_line` and `visit_ids` added.
+ *
+ * `appointment.deficiencies` — the ones that concern that visit, each with a
+ * `relation`:
+ *   - "repair_offered": the visit carries it as a deficiency_repair service
+ *     (InspectPoint projects a site's open deficiencies onto its next visit);
+ *   - "open_at_site": the job's NEXT upcoming visit also lists every other
+ *     open deficiency at the site. ServiceTrade has no visit-level link (10
+ *     service requests in the whole database point at a deficiency), so this
+ *     is how its deficiencies reach a visit at all.
+ *
+ * Capped at 200 per site, like the locations API.
+ */
+async function attachDeficiencies(companyId, job, locationId) {
+  const { presentDeficiency } = require("./locations");
+  const { rows } = await db.query(
+    `SELECT d.*, sl.name AS service_line_name
+       FROM deficiencies d
+       LEFT JOIN service_lines sl ON sl.id = d.service_line_id
+      WHERE d.company_id = $1 AND d.is_resolved = false
+        AND (d.job_id = $2 OR ($3::int IS NOT NULL AND d.location_id = $3))
+      ORDER BY d.opened_at DESC NULLS LAST, d.id DESC
+      LIMIT 200`,
+    [companyId, job.id, locationId]
+  );
+  const byId = new Map(rows.map((r) => [r.id, {
+    ...presentDeficiency(r),
+    severity: r.additional_information?.severity ?? null,
+    service_line: r.service_line_name ?? null,
+    visit_ids: [],
+  }]));
+
+  const now = Date.now();
+  const nextVisit = (job.appointments || [])
+    .filter((a) => OPEN_VISIT_STATUSES.has(a.status) && a.scheduled_start && new Date(a.scheduled_start).getTime() >= now)
+    .sort((a, b) => new Date(a.scheduled_start) - new Date(b.scheduled_start))[0] || null;
+
+  for (const appt of job.appointments || []) {
+    const linked = [];
+    const seen = new Set();
+    for (const svc of appt.services || []) {
+      const d = svc.deficiency_id != null ? byId.get(svc.deficiency_id) : null;
+      if (d && !seen.has(d.id)) { seen.add(d.id); linked.push({ ...d, relation: "repair_offered" }); }
+    }
+    if (nextVisit && appt.id === nextVisit.id) {
+      for (const d of byId.values()) {
+        if (!seen.has(d.id)) { seen.add(d.id); linked.push({ ...d, relation: "open_at_site" }); }
+      }
+    }
+    for (const d of linked) byId.get(d.id).visit_ids.push(appt.id);
+    appt.deficiencies = linked.map(({ visit_ids, ...d }) => d);
+  }
+
+  job.deficiencies = [...byId.values()];
+  job.deficiency_summary = { open: job.deficiencies.length };
 }
 
 /**
