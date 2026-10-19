@@ -81,6 +81,14 @@ const POST_CHAT_ANALYSIS_DATA = [
   },
 ];
 
+// The flow-level default and the silent Call Type Router node. Retell retires
+// gpt-4.1-nano on 10/20/2026 (replacement: gpt-5.6-luna) and auto-migrates
+// existing flows on that date — but every syncFlowForCompany re-sends this
+// value, so leaving the old id here would write a retired model back on the
+// next prompt edit / settings toggle / voice change.
+// https://docs.retellai.com/deprecation-notice/2026/10-20_model_replacements
+const ROUTER_MODEL = "gpt-5.6-luna";
+
 // ── Flow node builders ─────────────────────────────────────────────────────────
 
 function buildBranchNode(callTypes) {
@@ -89,7 +97,7 @@ function buildBranchNode(callTypes) {
     type: "branch",
     name: "Call Type Router",
     // Cheapest model — this node never speaks, only evaluates equations silently
-    model_choice: { type: "cascading", model: "gpt-4.1-nano" },
+    model_choice: { type: "cascading", model: ROUTER_MODEL },
     edges: callTypes.map((ct) => ({
       id: `edge_${ct.type}`,
       destination_node_id: nodeId(ct.type),
@@ -380,7 +388,7 @@ async function syncFlowForCompany(companyId) {
       start_node_id:             NODE_ROUTER,
       start_speaker:             "agent",
       default_dynamic_variables: defaultDynVars,
-      model_choice:              { type: "cascading", model: "gpt-4.1-nano" },
+      model_choice:              { type: "cascading", model: ROUTER_MODEL },
     });
     logger.info("Retell ConversationFlow updated", { companyId, flowId, nodeCount: nodes.length });
   } else {
@@ -389,7 +397,7 @@ async function syncFlowForCompany(companyId) {
       start_node_id:             NODE_ROUTER,
       start_speaker:             "agent",
       default_dynamic_variables: defaultDynVars,
-      model_choice:              { type: "cascading", model: "gpt-4.1-nano" },
+      model_choice:              { type: "cascading", model: ROUTER_MODEL },
     });
     flowId = flow.conversation_flow_id;
     logger.info("Retell ConversationFlow created", { companyId, flowId, nodeCount: nodes.length });
