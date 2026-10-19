@@ -18,9 +18,41 @@
 Base URL: `VITE_API_URL` · Auth: `Authorization: Bearer <token>` · gate on `user.permissions`,
 never on the role (`team-access-frontend.md`).
 
+---
+
+## 0. What to build NOW (updated 2026-10-19)
+
+These four have a live backend. **Build only these.** Everything else in this guide (§3–§9) is
+planned. Leave it alone until this section lists it.
+
+| # | Build | Where | Backend | Spec |
+|---|---|---|---|---|
+| 1 | **↻ Refresh button on every job.** An icon on every job row, card and calendar item, plus a labelled "Refresh from {CRM}" button on the job detail and visit drawer. Shows "Up to date" or a one-line summary of what changed, then re-renders the job from the response. | jobs list, calendar, job detail, visit drawer | **live** | §2 |
+| 2 | **Past inspections.** Hide past inspections from the main list. Add a "Past inspections (N)" button that opens a separate list, with a back link. | jobs page | **live** | §11 |
+| 3 | **Visit card: separate "Services" and "Deficiencies" sections.** Each has its own small heading and is shown only when its array is non-empty. Deficiencies are grouped into "Repair offered on this visit" and "Open at this site". | visit card, visit drawer | **live once PR #83 is deployed** | §2a |
+| 4 | **Job detail: "Deficiencies (N)" section.** Every open deficiency at the site, grouped by service line, with severity badges. Hidden when `deficiency_summary.open` is 0. | job detail | **live once PR #83 is deployed** | §2a |
+
+**Check before shipping:**
+- The ↻ button needs the `sync.run` permission. Hide it for users without it, and for jobs whose
+  `source` is `csv` or `manual`.
+- Use a client timeout of at least 30 s for Refresh. It usually answers in about 3 s.
+- Handle the Refresh errors in §2: 404 removed from the CRM, 409 reconnect, 429 wait N
+  seconds, 501 not supported, 502/504 CRM didn't respond. Keep showing the current data on any
+  error.
+- **Stop reading deficiencies out of `services`.** After PR #83, `services` holds only booked
+  work. Any existing code that filtered `kind === "deficiency_repair"` out of `services` must
+  read `visit.deficiencies` instead.
+- A calendar or date-range view keeps receiving past jobs (an explicit date range returns
+  everything in it). Only the default list hides them.
+
+**Not yet. Don't build:** the status pill (§3), the Synced months panel (§4), Refresh all now
+(§4.3), auto-updates (§5), and the removals in §7. Also don't build anything new on
+`servicetrade-sync-range-frontend.md` (custom range). Synced months will replace it.
+
 | Endpoint | Purpose | Permission | § | Phase |
 |---|---|---|---|---|
-| `POST /jobs/:id/refresh` | **Refresh** one job and everything tied to it | `sync.run` | 2 | 1 |
+| `POST /jobs/:id/refresh` | **Refresh** one job and everything tied to it | `sync.run` | 2 | live |
+| `GET /jobs/:id` → `deficiencies` | structured deficiencies on the job and on each visit | `data.read` | 2a | live |
 | `GET /integrations/sync/status` | status pill + change detection | `data.read` | 3 | 2 |
 | `GET /integrations/sync/months` | Synced months panel | `data.read` | 4.1 | 2 |
 | `POST /integrations/sync/months` | **Sync** one or more months | `sync.run` | 4.2 | 2 |
@@ -69,7 +101,7 @@ never changed by a refresh.
 ```json
 // 200
 {
-  "job": { "...": "same shape as GET /jobs/:id — appointments, customer, location, contacts, deficiencies included" },
+  "job": { "...": "exactly what GET /jobs/:id returns — appointments, customer, contacts, and deficiencies (§2a)" },
   "changed": true,
   "changes": [
     { "entity": "appointment", "id": 88121, "action": "updated", "field": "scheduled_start",
@@ -103,6 +135,115 @@ never changed by a refresh.
   changed in {provider_label}." with **Load latest** / **Keep editing**.
 
 ---
+
+## 2a. Deficiencies on a job — `GET /jobs/:id` and the Refresh response — [live]
+
+The job detail, and the `job` in a Refresh response, return deficiencies as structured objects
+in two places.
+
+**Services and deficiencies are separate entities.** A visit has both, either, or neither:
+
+| field on each visit | contains | empty when |
+|---|---|---|
+| `services` | **booked work only**: what the visit is for ("DOLE Ripening Room", "Annual Sprinkler Inspection"). Every item has `kind: "service"`. | nothing is booked on the visit |
+| `deficiencies` | faults at the site that concern this visit (below) | there are none |
+
+Both are **always arrays**, `[]` when there's nothing, never `null`, so `visit.services.map(...)`
+can't crash. **An empty array means: don't render that section at all.** No heading, no
+"None", no empty box. Deficiencies no longer appear inside `services`. The old
+`kind: "deficiency_repair"` rows are gone from this response and are now `deficiencies` items
+with `relation: "repair_offered"`.
+
+### `job.deficiencies` — every open deficiency at the job's site
+
+```json
+"deficiency_summary": { "open": 3 },
+"deficiencies": [
+  {
+    "id": 100824,
+    "name": "Deficient - CaptiveAire Piranha 4.5 gal Kitchen",
+    "description": "Nozzle caps missing on two appliance nozzles",
+    "status": "verified",
+    "severity": "deficient",
+    "service_line": "Kitchen Suppression",
+    "service_line_id": 412,
+    "is_resolved": false,
+    "opened_at": "2026-10-14T14:38:18.000Z",
+    "resolved_at": null,
+    "source": "servicetrade",
+    "external_ref": "2776594249976321",
+    "asset_type": null,
+    "resolution_status": null,
+    "inspection_ref": null,
+    "detail": {},
+    "visit_ids": [1251138]
+  }
+]
+```
+
+| field | notes |
+|---|---|
+| `name` | the label to show. Already the best one available. |
+| `severity` | **ServiceTrade only:** `inoperable` (worst), `deficient`, `suggested`. `null` for InspectPoint. |
+| `status` | ServiceTrade: `new` / `verified`. InspectPoint: usually `null`. Don't build UI on it. |
+| `service_line` | the trade or system it belongs to ("Kitchen Suppression", "Sprinkler"). Use it as a group heading. |
+| `asset_type`, `detail` | **InspectPoint only.** `detail.asset_details` has six different shapes. Render it as described in `deficiencies-frontend.md` §4 (Question + Answer first). Empty `{}` for ServiceTrade. |
+| `visit_ids` | the visits of this job that list it (see below). Empty means it's at the site but no upcoming visit covers it. |
+
+Only **open** deficiencies are returned, at most 200, newest first. Resolved ones are
+left out. The full history per site stays at `GET /locations/:id/deficiencies`.
+
+### `appointments[].deficiencies` — the deficiencies that concern this visit
+
+Every visit has a `deficiencies` array, usually empty. Each item is the same object as
+above, without `visit_ids`, plus a `relation`:
+
+| `relation` | meaning | show as |
+|---|---|---|
+| `repair_offered` | Clara will offer to repair it on this visit (InspectPoint) | **"Repair offered on this visit"** |
+| `open_at_site` | it's open at the site, and this is the job's **next upcoming visit** | **"Open at this site"** |
+
+- Only the **next upcoming visit** gets `open_at_site` items. Past and later visits don't
+  repeat the whole list.
+- ServiceTrade deficiencies have no visit-level link in the CRM, so they always arrive as
+  `open_at_site` on the next visit.
+- A deficiency appears at most once per visit, and `repair_offered` wins.
+
+### Suggested layout
+
+**Job detail → "Deficiencies (3)" section** (hide it when `deficiency_summary.open === 0`):
+- Group by `service_line`.
+- Sort each group by severity, `inoperable` first.
+- Each row shows: a severity badge (red `inoperable`, orange `deficient`, grey `suggested`; none
+  for InspectPoint), `name`, a one-line `description`, and "Opened {relative opened_at}".
+- Expanding a row shows the full description and, for InspectPoint, the `detail.asset_details`
+  card.
+
+**Visit card / drawer: two separate sections, each with a small heading, each shown only when
+non-empty:**
+
+```
+┌ Tue Oct 21 · 4:30–10:30 PM · Ultimate Fire ───────────────┐
+│ SERVICES                                                    │
+│   DOLE Ripening Room — Weekly inspection (about 6 hours)    │
+│ DEFICIENCIES (29)                                           │
+│   Repair offered on this visit (9)                          │
+│     Bulb Gaskets — Fail                                     │
+│     Caulking — Fail                    … show all           │
+│   Open at this site (20)                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+- **Services:** one line per item: `service_line`, then `description`. Skip the
+  description when it repeats the service line.
+- **Deficiencies:** grouped by `relation`, "Repair offered on this visit" first, then "Open at
+  this site". Show the first 3 per group, then "show all". Same row style as the job-level list
+  (severity badge, `name`).
+- Visit with services only: just the Services section. Deficiencies only: just the
+  Deficiencies section. Neither: no section at all.
+
+**After a Refresh:** a `changes` entry with `entity: "deficiency"` means the job's
+`deficiencies` changed. Re-render from the returned `job`. Don't patch the list.
 
 ## 3. `GET /integrations/sync/status` — the pill — [Phase 2]
 
