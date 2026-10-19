@@ -18,6 +18,37 @@
 Base URL: `VITE_API_URL` · Auth: `Authorization: Bearer <token>` · gate on `user.permissions`,
 never on the role (`team-access-frontend.md`).
 
+---
+
+## 0. What to build NOW (updated 2026-10-19)
+
+These four have a live backend. **Build only these.** Everything else in this guide (§3–§9) is
+planned. Leave it alone until this section lists it.
+
+| # | Build | Where | Backend | Spec |
+|---|---|---|---|---|
+| 1 | **↻ Refresh button on every job.** An icon on every job row, card and calendar item, plus a labelled "Refresh from {CRM}" button on the job detail and visit drawer. Shows "Up to date" or a one-line summary of what changed, then re-renders the job from the response. | jobs list, calendar, job detail, visit drawer | **live** | §2 |
+| 2 | **Past inspections.** Hide past inspections from the main list. Add a "Past inspections (N)" button that opens a separate list, with a back link. | jobs page | **live** | §11 |
+| 3 | **Visit card: separate "Services" and "Deficiencies" sections.** Each has its own small heading and is shown only when its array is non-empty. Deficiencies are grouped into "Repair offered on this visit" and "Open at this site". | visit card, visit drawer | **live once PR #83 is deployed** | §2a |
+| 4 | **Job detail: "Deficiencies (N)" section.** Every open deficiency at the site, grouped by service line, with severity badges. Hidden when `deficiency_summary.open` is 0. | job detail | **live once PR #83 is deployed** | §2a |
+
+**Check before shipping:**
+- The ↻ button needs the `sync.run` permission. Hide it for users without it, and for jobs whose
+  `source` is `csv` or `manual`.
+- Use a client timeout of at least 30 s for Refresh. It usually answers in about 3 s.
+- Handle the Refresh errors in §2: 404 removed from the CRM, 409 reconnect, 429 wait N
+  seconds, 501 not supported, 502/504 CRM didn't respond. Keep showing the current data on any
+  error.
+- **Stop reading deficiencies out of `services`.** After PR #83, `services` holds only booked
+  work. Any existing code that filtered `kind === "deficiency_repair"` out of `services` must
+  read `visit.deficiencies` instead.
+- A calendar or date-range view keeps receiving past jobs (an explicit date range returns
+  everything in it). Only the default list hides them.
+
+**Not yet. Don't build:** the status pill (§3), the Synced months panel (§4), Refresh all now
+(§4.3), auto-updates (§5), and the removals in §7. Also don't build anything new on
+`servicetrade-sync-range-frontend.md` (custom range). Synced months will replace it.
+
 | Endpoint | Purpose | Permission | § | Phase |
 |---|---|---|---|---|
 | `POST /jobs/:id/refresh` | **Refresh** one job and everything tied to it | `sync.run` | 2 | live |
