@@ -197,21 +197,81 @@ function timezoneLabel(tz) {
  * real Date arithmetic in the company's timezone, so DST transitions and
  * midnight crossings are handled by the formatter rather than by guesswork.
  */
-function formatArrivalWindow(iso, tz, minutes = 60) {
+function formatArrivalWindow(iso, tz, minutes = 60, minutesBefore = 0) {
   if (!iso) return null;
   const t = new Date(iso).getTime();
   if (Number.isNaN(t)) return null;
   // A whole hour reads as "8 AM", not "8:00 AM" — the window is nearly always
   // on the hour, and the text-to-speech voice says the trailing ":00" out loud.
-  const trim = (s) => (s ? s.replace(/:00(?=\s)/, "") : s);
-  const from = trim(formatSpokenTime(new Date(t).toISOString(), tz));
-  const to = trim(formatSpokenTime(new Date(t + minutes * 60_000).toISOString(), tz));
+  const from = trimHour(formatSpokenTime(new Date(t - minutesBefore * 60_000).toISOString(), tz));
+  const to = trimHour(formatSpokenTime(new Date(t + minutes * 60_000).toISOString(), tz));
   if (!from || !to) return null;
   // On a DST fall-back night the same wall-clock time occurs twice, so both
   // bounds can format identically — "between 1:00 AM and 1:00 AM" is worse than
   // saying nothing. Callers fall back to stating the scheduled time alone.
   if (from === to) return null;
   return `between ${from} and ${to}`;
+}
+
+const trimHour = (s) => (s ? s.replace(/:00(?=\s)/, "") : s);
+
+const ARRIVAL_DEFAULT_POLICY = { style: "window", minutesBefore: 0, minutesAfter: 60 };
+
+/** "30 minutes", "1 hour", "1 hour 30 minutes" — spoken, never "90 min". */
+function spokenDuration(minutes) {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  const parts = [];
+  if (h) parts.push(`${h} hour${h === 1 ? "" : "s"}`);
+  if (m) parts.push(`${m} minute${m === 1 ? "" : "s"}`);
+  return parts.join(" ");
+}
+
+/**
+ * How Clara tells the customer when the technician arrives, per the company's
+ * call_settings (migration 116). Returns every form a consumer needs, all
+ * computed here so no model does clock arithmetic:
+ *
+ *   style "window" (default)  → statement "The technician is expected to arrive
+ *     between 11 AM and 12 PM." — window = scheduled − before → scheduled + after.
+ *   "scheduled_with_tolerance" → "Your appointment is scheduled for 11 AM.
+ *     Please note that our technicians may arrive up to 30 minutes before or
+ *     after your scheduled appointment time." (asymmetric minutes are said as
+ *     such; 0/0 collapses to scheduled_only)
+ *   "scheduled_only"          → "Your appointment is scheduled for 11 AM."
+ *
+ * @returns {{style: string, window: string|null, statement: string|null, label: string|null}}
+ *   `window` is the "between X and Y" range (window style only), `statement`
+ *   the sentence to say, `label` a short form for UI cards. All null without a
+ *   time; a window that collapses on a DST fall-back night falls back to the
+ *   scheduled time.
+ */
+function formatArrivalStatement(iso, tz, policy = {}) {
+  const p = { ...ARRIVAL_DEFAULT_POLICY, ...Object.fromEntries(Object.entries(policy).filter(([, v]) => v != null)) };
+  const before = Math.max(0, Number(p.minutesBefore) || 0);
+  const after = Math.max(0, Number(p.minutesAfter) || 0);
+  const at = trimHour(formatSpokenTime(iso, tz));
+  if (!at) return { style: p.style, window: null, statement: null, label: null };
+  const scheduledOnly = { window: null, statement: `Your appointment is scheduled for ${at}.`, label: at };
+
+  if (p.style === "window") {
+    const window = formatArrivalWindow(iso, tz, after, before);
+    if (!window) return { style: p.style, ...scheduledOnly };
+    return { style: p.style, window, statement: `The technician is expected to arrive ${window}.`, label: window };
+  }
+  if (p.style === "scheduled_with_tolerance" && (before || after)) {
+    const range = before === after
+      ? `up to ${spokenDuration(before)} before or after`
+      : [before && `up to ${spokenDuration(before)} before`, after && `up to ${spokenDuration(after)} after`].filter(Boolean).join(" or ");
+    const short = before === after ? `±${before} min` : [before && `−${before}`, after && `+${after}`].filter(Boolean).join(" / ") + " min";
+    return {
+      style: p.style,
+      window: null,
+      statement: `Your appointment is scheduled for ${at}. Please note that our technicians may arrive ${range} your scheduled appointment time.`,
+      label: `${at} (${short})`,
+    };
+  }
+  return { style: p.style, ...scheduledOnly };
 }
 
 /**
@@ -252,6 +312,7 @@ function toLocalDateOnly(input, tz) {
 module.exports = {
   formatSpokenTime,
   formatArrivalWindow,
+  formatArrivalStatement,
   timezoneLabel,
   DEFAULT_TZ,
   getCompanyTimezone,

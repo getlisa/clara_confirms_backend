@@ -484,9 +484,22 @@ test("the context exposes the window on each appointment", async () => {
 test("the chat prompt states the window and forbids computing it", async () => {
   const ctx = await ctxFor({ services: [service("Backflow", "Annual Backflow Inspection")] });
   const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
-  assert.match(out, /- Arrival window for next visit: between /);
+  assert.match(out, /- Arrival time for next visit, in the company's wording: "The technician is expected to arrive between /);
   assert.match(out, /pre-computed — always use this, never calculate it yourself/);
   assert.doesNotMatch(out, /either side/,
-    "the window is forward-looking now; 'either side' would promise an arrival before the scheduled time");
-  assert.match(out, /within one hour AFTER the scheduled time — never earlier than scheduled/);
+    "the default window is forward-looking; 'either side' would promise an arrival before the scheduled time");
+  assert.match(out, /The tech arrives within the window above\. Never state a different range\./);
+  assert.match(out, /Do not calculate any time, window or tolerance yourself/);
+});
+
+test("with the scheduled-time-±-tolerance setting, the chat prompt says it that way and forbids a range", async () => {
+  const ctx = await ctxFor({ services: [service("Backflow", "Annual Backflow Inspection")] });
+  const next = nextOf(ctx);
+  const { formatArrivalStatement } = require("../src/utils/timezone");
+  const a = formatArrivalStatement(next.scheduled_start, TZ, { style: "scheduled_with_tolerance", minutesBefore: 30, minutesAfter: 30 });
+  Object.assign(next, { arrival_style: a.style, arrival_window_spoken: a.window, arrival_statement_spoken: a.statement });
+  const out = prompt.build({ ...ctx, phase: "confirming" }, { companyName: "Clara Fire" });
+  assert.match(out, /Please note that our technicians may arrive up to 30 minutes before or after your scheduled appointment time\./);
+  assert.match(out, /Never turn it into a "between X and Y" range, and never change the minutes\./);
+  assert.doesNotMatch(out, /within the window above/);
 });
