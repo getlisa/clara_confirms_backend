@@ -382,6 +382,38 @@ function normalizeServiceLine(row, { companyId }) {
 }
 
 /** servicetrade_deficiencies → platform `deficiencies` */
+/**
+ * servicetrade_assets → platform `assets` (migration 117).
+ * `location_in_site` is lifted out of the per-type properties because it is
+ * the one field every consumer needs (it's how Clara says WHERE the equipment
+ * is). The parent is resolved in a second pass (it's another asset), so its
+ * CRM id rides in additional_information.
+ */
+function normalizeAsset(row, { companyId, locationId = null, serviceLineId = null }) {
+  if (!row) return null;
+  const p = row.payload || {};
+  const props = p.properties && typeof p.properties === "object" ? p.properties : {};
+  const where = typeof props.location_in_site === "string" ? props.location_in_site.trim() : "";
+  return {
+    companyId,
+    externalRef: String(row.servicetrade_id),
+    source: "servicetrade",
+    locationId,
+    serviceLineId,
+    type: row.type || p.type || null,
+    typeLabel: p.display || null,
+    name: row.name || p.name || null,
+    status: row.status || p.status || null,
+    locationInSite: where || null,
+    properties: props,
+    isActive: (row.status || p.status || "active") === "active",
+    additionalInformation: {
+      servicetrade_asset_id: row.servicetrade_id,
+      parent_ref: p.parent?.id != null ? String(p.parent.id) : null,
+    },
+  };
+}
+
 // ServiceTrade's own terminal states: `status` is the last reported status
 // (new / verified / invalid / fixed), `resolution` the lifecycle
 // (… / fixed / rejected / invalid). Either one being terminal means there's
@@ -396,7 +428,7 @@ const RESOLVED_DEFICIENCY_RESOLUTIONS = new Set(["fixed", "rejected", "invalid"]
  * request may carry less, so everything optional stays null and the upsert
  * COALESCEs location/service line rather than wiping them.
  */
-function normalizeDeficiency(row, { companyId, locationId = null, serviceLineId = null }) {
+function normalizeDeficiency(row, { companyId, locationId = null, serviceLineId = null, assetId = null }) {
   if (!row) return null;
   const p = row.payload || {};
   const status = p.status || null;
@@ -412,6 +444,7 @@ function normalizeDeficiency(row, { companyId, locationId = null, serviceLineId 
     description: row.description || null,
     locationId,
     serviceLineId,
+    assetId,
     status,
     isResolved,
     openedAt:    toIso(p.reportedOn ?? p.created),
@@ -420,6 +453,7 @@ function normalizeDeficiency(row, { companyId, locationId = null, serviceLineId 
       servicetrade_deficiency_id: row.servicetrade_id,
       severity: p.severity || null,
       resolution,
+      proposed_fix: typeof p.proposedFix === "string" && p.proposedFix.trim() ? p.proposedFix.trim() : null,
     },
   };
 }
@@ -548,7 +582,7 @@ function normalizeServiceOpportunity(row) {
  * table, so this returns null if unresolved (mirrors normalizeServiceOpportunity's
  * location_id-required pattern).
  */
-function normalizeAppointmentService(row, { companyId, appointmentId, jobId, serviceLineId }) {
+function normalizeAppointmentService(row, { companyId, appointmentId, jobId, serviceLineId, assetId = null }) {
   if (!row) return null;
   const warnings = [];
   if (!appointmentId) {
@@ -570,6 +604,7 @@ function normalizeAppointmentService(row, { companyId, appointmentId, jobId, ser
     duration:       row.duration,
     estimatedPrice: row.estimated_price,
     asset:          row.asset,
+    assetId:        assetId || null,
     additionalInformation: {
       servicetrade_service_request_id: row.servicetrade_id,
       servicetrade_appointment_id: row.servicetrade_appointment_id,
@@ -610,6 +645,7 @@ function mapAppointmentStatus(s) {
 }
 
 module.exports = {
+  normalizeAsset,
   normalizeCustomer,
   normalizeJob,
   normalizeAppointment,

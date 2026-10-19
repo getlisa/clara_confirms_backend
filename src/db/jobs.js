@@ -492,9 +492,11 @@ async function attachDeficiencies(companyId, job, locationId) {
     .filter((svc) => svc.kind === "deficiency_repair" && svc.deficiency_id != null)
     .map((svc) => svc.deficiency_id)))];
   const { rows } = await db.query(
-    `SELECT d.*, sl.name AS service_line_name
+    `SELECT d.*, sl.name AS service_line_name,
+            ast.type AS asset_type, ast.type_label AS asset_type_label, ast.location_in_site AS asset_location_in_site
        FROM deficiencies d
        LEFT JOIN service_lines sl ON sl.id = d.service_line_id
+       LEFT JOIN assets ast ON ast.id = d.asset_id
       WHERE d.company_id = $1
         AND ((d.is_resolved = false AND (d.job_id = $2 OR ($3::int IS NOT NULL AND d.location_id = $3)))
              OR d.id = ANY($4::int[]))
@@ -604,10 +606,15 @@ async function fetchServicesByAppointment(companyId, appointmentIds) {
             -- (migration 110). job-confirmation-context partitions on it; without
             -- it selected here, repairs fall through as ordinary services and
             -- land in the agent opening line.
-            aps.kind, aps.asset, aps.deficiency_id,
-            sl.name AS service_line_name, sl.trade AS service_line_trade
+            aps.kind, aps.asset, aps.deficiency_id, aps.service_line_id, aps.asset_id,
+            sl.name AS service_line_name, sl.trade AS service_line_trade,
+            -- The equipment this service is for (migration 117). Type and
+            -- where it sits in the site — never the asset name, which carries
+            -- make/model ("Alarm System - Notifier NFS-320C …").
+            ast.type AS asset_type, ast.type_label AS asset_type_label, ast.location_in_site AS asset_location_in_site
        FROM appointment_services aps
        LEFT JOIN service_lines sl ON sl.id = aps.service_line_id
+       LEFT JOIN assets ast ON ast.id = aps.asset_id
       WHERE aps.company_id = $1 AND aps.appointment_id = ANY($2::int[])
       ORDER BY aps.appointment_id, aps.id`,
     [companyId, appointmentIds]
@@ -624,6 +631,11 @@ async function fetchServicesByAppointment(companyId, appointmentIds) {
       kind: r.kind || "service",
       asset: r.asset || null,
       deficiency_id: r.deficiency_id ?? null,
+      service_line_id: r.service_line_id ?? null,
+      asset_id: r.asset_id ?? null,
+      equipment: r.asset_id && r.asset_type !== "location"
+        ? { type: r.asset_type ?? null, type_label: r.asset_type_label ?? null, location_in_site: r.asset_location_in_site ?? null }
+        : null,
       service_line_name: serviceLineName,
       service_line_trade: serviceLineTrade,
       // `service_line` is the NAME, and must keep being emitted: five call

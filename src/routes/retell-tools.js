@@ -1254,6 +1254,32 @@ router.post("/resolve_service_link_contact", async (req, res) => {
   }
 });
 
+// ── RECORD REPAIR REQUEST ────────────────────────────────────────────────────
+// The customer accepted the offer to repair open deficiencies on the visit.
+// Records it for the office (todo + ServiceTrade job comment when write-back is
+// on). It does not book anything — see services/repair-requests.js.
+router.post("/record_repair_request", async (req, res) => {
+  if (!verifyToolSecret(req, res)) return;
+  try {
+    const companyId = getCompanyId(req);
+    const { job_id, items, notes } = getArgs(req);
+    if (!companyId || !job_id) return res.status(400).json({ error: "company_id and job_id are required" });
+    const { recordRepairRequest } = require("../services/repair-requests");
+    const result = await recordRepairRequest({
+      companyId, jobId: job_id, items, notes: notes || null, retellCallId: getConversationId(req),
+    });
+    if (!result.ok) return res.status(result.status || 400).json({ success: false, error: result.error });
+    return res.json({
+      success: true,
+      recorded_items: result.items,
+      message: "Recorded for the office team. Tell the customer you've passed it to the team — it is NOT booked or scheduled.",
+    });
+  } catch (err) {
+    logger.error("Tool record_repair_request failed", { error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── REPORT CUSTOMER INTENT (chat only — see chat-links state machine) ───────
 // Lets the agent signal a clear decision before the corresponding action tool
 // actually fires (e.g. "wants_reschedule" before a date is collected). Harmless

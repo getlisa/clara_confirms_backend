@@ -39,7 +39,7 @@ class ServiceTradeProvider extends CrmProvider {
       "customers", "jobs", "appointments", "technicians", "contacts", "offices", "tags", "locations",
       "crm_users", "projects", "scheduling_comments", "job_notes", "appointment_notes",
       "service_lines", "deficiencies", "change_orders", "contracts", "service_recurrences",
-      "service_requests", "service_opportunities",
+      "service_requests", "service_opportunities", "assets",
     ];
   }
 
@@ -244,7 +244,7 @@ class ServiceTradeProvider extends CrmProvider {
     const counts = {
       customers: 0, technicians: 0, crmUsers: 0, projects: 0, jobs: 0, appointments: 0,
       contacts: 0, offices: 0, tags: 0, locations: 0,
-      serviceLines: 0, deficiencies: 0, changeOrders: 0, contracts: 0, serviceRecurrences: 0,
+      serviceLines: 0, assets: 0, deficiencies: 0, changeOrders: 0, contracts: 0, serviceRecurrences: 0,
       serviceRequests: 0, serviceOpportunities: 0, appointmentServices: 0,
       schedulingComments: 0, jobNotes: 0, jobComments: 0, appointmentNotes: 0,
       confirmationAssessments: 0,
@@ -393,6 +393,8 @@ class ServiceTradeProvider extends CrmProvider {
     counts.serviceLines        = await this._normalizeServiceLines(companyId, engine);
     if (engine) await engine.emit("entity_done", { entity: "service_lines", count: counts.serviceLines });
 
+    // Assets before deficiencies and appointment services: both link to them.
+    counts.assets              = await this._normalizeAssets(companyId, engine, { updatedSince: sinceTs });
     counts.deficiencies        = await this._normalizeDeficiencies(companyId, engine);
     if (engine) await engine.emit("entity_done", { entity: "deficiencies", count: counts.deficiencies });
 
@@ -1068,17 +1070,53 @@ class ServiceTradeProvider extends CrmProvider {
     return argsList.length;
   }
 
-  async _normalizeDeficiencies(companyId, engine = null) {
-    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_deficiencies");
+  /**
+   * servicetrade_assets → platform `assets` (migration 117), then the parent
+   * link in one statement (a parent is itself an asset, so it can only be
+   * resolved once every asset of the pass exists).
+   */
+  async _normalizeAssets(companyId, engine = null, { updatedSince = null } = {}) {
+    // Watermark-filtered like jobs/contacts: a big account holds tens of
+    // thousands of assets and normalizeAll runs on every refresh/webhook drain.
+    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_assets", { updatedSince });
+    if (!raw.length) return 0;
     const [locationsMap, serviceLinesMap] = await Promise.all([
       refMap(companyId, "locations"),
       refMap(companyId, "service_lines"),
     ]);
     const argsList = raw.map((row) => {
       const p = row.payload || {};
+      const locationRef = row.servicetrade_location_id ?? p.location?.id;
+      const locationId = locationRef != null ? (locationsMap.get(String(locationRef)) ?? null) : null;
+      const serviceLineId = p.serviceLine?.id != null ? (serviceLinesMap.get(String(p.serviceLine.id)) ?? null) : null;
+      return normalize.normalizeAsset(row, { companyId, locationId, serviceLineId });
+    }).filter(Boolean);
+    await db.bulkUpsertByExternalRef("assets", ASSET_FIELDS, argsList);
+    await db.query(
+      `UPDATE assets a SET parent_id = p.id
+         FROM assets p
+        WHERE a.company_id = $1 AND p.company_id = $1 AND a.source = 'servicetrade' AND p.source = 'servicetrade'
+          AND p.external_ref = a.additional_information->>'parent_ref'
+          AND a.parent_id IS DISTINCT FROM p.id`,
+      [companyId]
+    );
+    logger.info("ServiceTradeProvider: normalized assets", { companyId, count: argsList.length });
+    return argsList.length;
+  }
+
+  async _normalizeDeficiencies(companyId, engine = null) {
+    const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_deficiencies");
+    const [locationsMap, serviceLinesMap, assetsMap] = await Promise.all([
+      refMap(companyId, "locations"),
+      refMap(companyId, "service_lines"),
+      refMap(companyId, "assets"),
+    ]);
+    const argsList = raw.map((row) => {
+      const p = row.payload || {};
       const locationId = p.location?.id != null ? (locationsMap.get(String(p.location.id)) ?? null) : null;
       const serviceLineId = p.serviceLine?.id != null ? (serviceLinesMap.get(String(p.serviceLine.id)) ?? null) : null;
-      return normalize.normalizeDeficiency(row, { companyId, locationId, serviceLineId });
+      const assetId = p.asset?.id != null ? (assetsMap.get(String(p.asset.id)) ?? null) : null;
+      return normalize.normalizeDeficiency(row, { companyId, locationId, serviceLineId, assetId });
     }).filter(Boolean);
     await db.bulkUpsertByExternalRef("deficiencies", DEFICIENCY_FIELDS, argsList);
     logger.info("ServiceTradeProvider: normalized deficiencies", { companyId, count: argsList.length });
@@ -1204,17 +1242,22 @@ class ServiceTradeProvider extends CrmProvider {
     const raw = await db.fetchAllByCompanyChunked(companyId, "servicetrade_service_requests", {
       extraWhere: "servicetrade_appointment_id IS NOT NULL",
     });
-    const [appointmentsMap, jobsMap, serviceLinesMap] = await Promise.all([
+    const [appointmentsMap, jobsMap, serviceLinesMap, assetsMap] = await Promise.all([
       refMap(companyId, "appointments"),
       refMap(companyId, "jobs"),
       refMap(companyId, "service_lines"),
+      refMap(companyId, "assets"),
     ]);
     const argsList = raw
       .map((row) => {
         const appointmentId = row.servicetrade_appointment_id != null ? (appointmentsMap.get(String(row.servicetrade_appointment_id)) ?? null) : null;
         const jobId         = row.servicetrade_job_id          != null ? (jobsMap.get(String(row.servicetrade_job_id))                   ?? null) : null;
         const serviceLineId = row.servicetrade_service_line_id != null ? (serviceLinesMap.get(String(row.servicetrade_service_line_id))  ?? null) : null;
-        return normalize.normalizeAppointmentService(row, { companyId, appointmentId, jobId, serviceLineId });
+        // The equipment this service is for — the {id,name,type} stub the
+        // service request embeds, resolved to the synced asset.
+        const assetRef      = row.asset?.id ?? null;
+        const assetId       = assetRef != null ? (assetsMap.get(String(assetRef)) ?? null) : null;
+        return normalize.normalizeAppointmentService(row, { companyId, appointmentId, jobId, serviceLineId, assetId });
       })
       .filter(Boolean);
     await db.bulkUpsertByExternalRef("appointment_services", APPOINTMENT_SERVICE_FIELDS, argsList);
@@ -1492,6 +1535,7 @@ const DEFICIENCY_FIELDS = [
   { column: "status", key: "status", updateExpr: "status = COALESCE(EXCLUDED.status, deficiencies.status)" },
   { column: "is_resolved", key: "isResolved", transform: (v) => v === true },
   { column: "opened_at", key: "openedAt", updateExpr: "opened_at = COALESCE(EXCLUDED.opened_at, deficiencies.opened_at)" },
+  { column: "asset_id", key: "assetId", updateExpr: "asset_id = COALESCE(EXCLUDED.asset_id, deficiencies.asset_id)" },
   { column: "resolved_at", key: "resolvedAt" },
 ];
 
@@ -1568,6 +1612,19 @@ const APPOINTMENT_SERVICE_FIELDS = [
   { column: "duration", key: "duration" },
   { column: "estimated_price", key: "estimatedPrice" },
   { column: "asset", key: "asset", jsonb: true },
+  { column: "asset_id", key: "assetId" },
+];
+
+const ASSET_FIELDS = [
+  { column: "location_id", key: "locationId" },
+  { column: "service_line_id", key: "serviceLineId", updateExpr: "service_line_id = COALESCE(EXCLUDED.service_line_id, assets.service_line_id)" },
+  { column: "type", key: "type" },
+  { column: "type_label", key: "typeLabel" },
+  { column: "name", key: "name" },
+  { column: "status", key: "status" },
+  { column: "location_in_site", key: "locationInSite" },
+  { column: "properties", key: "properties", jsonb: true },
+  { column: "is_active", key: "isActive", transform: (v) => v !== false },
 ];
 
 /**

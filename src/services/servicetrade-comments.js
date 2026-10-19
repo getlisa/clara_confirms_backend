@@ -545,7 +545,44 @@ async function postConfirmationAgentComment({ companyId, jobId, threadId, summar
   }
 }
 
+/**
+ * "Customer requested repair of: …" on the ServiceTrade JOB, when the customer
+ * accepts Clara's repair offer (record_repair_request). Only when the company
+ * has CRM comment write-back on. Never throws — the todo is the record of
+ * truth; this is a courtesy copy for the office working in ServiceTrade.
+ *
+ * @returns {Promise<{posted: boolean, reason?: string, commentId?: number}>}
+ */
+async function postRepairRequestComment({ companyId, jobId, items, customerName = null, retellCallId = null }) {
+  try {
+    if (!(await isCommentWritebackEnabled(companyId))) return { posted: false, reason: "writeback_off" };
+    const { rows } = await db.query(
+      `SELECT external_ref FROM jobs WHERE id = $1 AND company_id = $2 AND source = 'servicetrade'`,
+      [jobId, companyId]
+    );
+    const jobRef = rows[0]?.external_ref;
+    if (!isNumericRef(jobRef)) return { posted: false, reason: "not_servicetrade" };
+    const content = [
+      `${customerName || "The customer"} asked for these open deficiencies to be repaired on the upcoming visit (via Clara):`,
+      ...items.map((t) => `• ${t}`),
+      "Please arrange it with the technician and follow up on pricing.",
+    ].join("\n");
+    const body = buildCommentBody({ entityId: jobRef, entityType: 3, content });
+    const res = await stLoggedRequest(companyId, "POST", "/comment", { body, context: "comment.repair_request" });
+    if (!res.ok) {
+      logger.error("servicetrade comment (repair request): POST failed", { companyId, jobId, status: res.status, messages: res.messages });
+      return { posted: false, reason: `servicetrade_${res.status}` };
+    }
+    logger.info("servicetrade comment (repair request): posted", { companyId, jobId, retellCallId, commentId: res.data?.id ?? null });
+    return { posted: true, commentId: res.data?.id ?? null };
+  } catch (err) {
+    logger.error("servicetrade comment (repair request) failed", { companyId, jobId, error: err.message });
+    return { posted: false, reason: "error" };
+  }
+}
+
 module.exports = {
+  postRepairRequestComment,
   postCallComment,
   postConfirmationAgentComment,
   appliesToCallType,

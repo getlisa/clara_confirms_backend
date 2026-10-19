@@ -231,3 +231,35 @@ test("a targeted (webhook / refresh) run never runs the account-wide deficiency 
   await stEngine.runSync(8, { jobIds: [], contactIds: ["101"] });
   assert.equal(defCalls().length, 0);
 });
+
+// ── Assets in the regular sync (migration 117) ──────────────────────────────
+
+const assetCalls = () => stCalls.filter((c) => c.path.startsWith("/asset?")).map((c) => new URLSearchParams(c.path.split("?")[1]));
+
+test("an incremental run reads assets changed since the cursor; a full run asks for 'updated since the epoch' (/asset refuses an unfiltered list)", async () => {
+  reset();
+  await stEngine.runSync(8, {});
+  assert.equal(assetCalls()[0].get("updatedAfter"), String(CURSOR - 5 * 60));
+  reset();
+  await stEngine.runSync(8, { full: true });
+  assert.equal(assetCalls()[0].get("updatedAfter"), "0");
+});
+
+test("only assets at locations the platform holds are written", async () => {
+  reset();
+  known.locations.add("900");
+  const base = stImpl;
+  stImpl = async (c, m, path) => path.startsWith("/asset?")
+    ? ok({ assets: [
+        { id: 1, type: "alarm", name: "Alarm System - Notifier", location: { id: 900 }, serviceLine: { id: 5, name: "Alarm Systems" } },
+        { id: 2, type: "backflow", location: { id: 777 } },
+      ] })
+    : base(c, m, path);
+  const writes = [];
+  const syncDbStub = require("../src/db/servicetrade-sync");
+  const orig = syncDbStub.upsertAssetsBatch;
+  syncDbStub.upsertAssetsBatch = async (_c, rows) => { writes.push(...rows); };
+  try { await stEngine.runSync(8, {}); } finally { syncDbStub.upsertAssetsBatch = orig; }
+  assert.deepEqual(writes.map((r) => r.servicetrade_id), [1]);
+  assert.equal(writes[0].servicetrade_location_id, 900);
+});

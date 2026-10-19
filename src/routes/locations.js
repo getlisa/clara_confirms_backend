@@ -89,6 +89,24 @@ router.get("/:id", async (req, res) => {
  * whole location, and so "show resolved too" is possible — the location detail
  * deliberately returns open ones only.
  */
+/**
+ * GET /locations/:id/assets — the equipment at this site (migration 117), for
+ * the location page's equipment list.
+ */
+router.get("/:id/assets", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    const location = await locationsDb.getById(Number(req.params.id), companyId);
+    if (!location) return res.status(404).json({ error: "Location not found" });
+    const assets = await locationsDb.listAssets(companyId, Number(req.params.id));
+    return res.json({ assets, total: assets.length });
+  } catch (err) {
+    logger.error("GET /locations/:id/assets failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to load equipment" });
+  }
+});
+
 router.get("/:id/deficiencies", async (req, res) => {
   try {
     const companyId = getCompanyId(req);

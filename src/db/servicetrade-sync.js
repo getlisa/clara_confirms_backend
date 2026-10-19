@@ -490,6 +490,30 @@ async function upsertDeficienciesBatch(companyId, rows) {
   }
 }
 
+/** Raw ServiceTrade assets (migration 117) — the equipment at a location. */
+async function upsertAssetsBatch(companyId, rows) {
+  if (rows.length === 0) return;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 0;
+    chunk.forEach((r) => {
+      values.push(`($${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}, $${++idx}::jsonb, NOW())`);
+      params.push(companyId, r.servicetrade_id, r.servicetrade_location_id ?? null, r.type ?? null, r.name ?? null, r.status ?? null,
+        r.payload ? JSON.stringify(r.payload) : "{}");
+    });
+    await db.query(
+      `INSERT INTO servicetrade_assets (company_id, servicetrade_id, servicetrade_location_id, type, name, status, payload, updated_at)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (company_id, servicetrade_id) DO UPDATE SET
+         servicetrade_location_id = EXCLUDED.servicetrade_location_id, type = EXCLUDED.type, name = EXCLUDED.name,
+         status = EXCLUDED.status, payload = EXCLUDED.payload, updated_at = NOW()`,
+      params
+    );
+  }
+}
+
 async function upsertChangeOrdersBatch(companyId, rows) {
   if (rows.length === 0) return;
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
@@ -887,6 +911,7 @@ async function deleteAllSyncData(companyId) {
   await db.query("DELETE FROM servicetrade_contracts           WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_change_orders       WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_deficiencies        WHERE company_id = $1", [companyId]);
+  await db.query("DELETE FROM servicetrade_assets              WHERE company_id = $1", [companyId]);
   await db.query("DELETE FROM servicetrade_service_lines       WHERE company_id = $1", [companyId]);
   // Before servicetrade_jobs — job comments are the largest raw table on a
   // real account (734 rows for 164 jobs) and were missed when the table was
@@ -979,6 +1004,7 @@ module.exports = {
   upsertTagsBatch,
   upsertServiceLinesBatch,
   upsertDeficienciesBatch,
+  upsertAssetsBatch,
   upsertChangeOrdersBatch,
   upsertContractsBatch,
   upsertServiceRecurrencesBatch,
