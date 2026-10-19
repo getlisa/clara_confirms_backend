@@ -108,9 +108,20 @@ never changed by a refresh.
 ## 2a. Deficiencies on a job — `GET /jobs/:id` and the Refresh response — [live]
 
 The job detail, and the `job` in a Refresh response, return deficiencies as structured objects
-in two places. **Use these instead of reading `appointments[].services[]` rows with
-`kind: "deficiency_repair"`.** Those rows still exist, but they are offers attached to a
-visit, not the deficiency itself.
+in two places.
+
+**Services and deficiencies are separate entities.** A visit has both, either, or neither:
+
+| field on each visit | contains | empty when |
+|---|---|---|
+| `services` | **booked work only**: what the visit is for ("DOLE Ripening Room", "Annual Sprinkler Inspection"). Every item has `kind: "service"`. | nothing is booked on the visit |
+| `deficiencies` | faults at the site that concern this visit (below) | there are none |
+
+Both are **always arrays**, `[]` when there's nothing, never `null`, so `visit.services.map(...)`
+can't crash. **An empty array means: don't render that section at all.** No heading, no
+"None", no empty box. Deficiencies no longer appear inside `services`. The old
+`kind: "deficiency_repair"` rows are gone from this response and are now `deficiencies` items
+with `relation: "repair_offered"`.
 
 ### `job.deficiencies` — every open deficiency at the job's site
 
@@ -177,8 +188,28 @@ above, without `visit_ids`, plus a `relation`:
 - Expanding a row shows the full description and, for InspectPoint, the `detail.asset_details`
   card.
 
-**Visit card / drawer → "Deficiencies on this visit (n)":** a compact list of the visit's
-`deficiencies` with the relation as a small tag. Hide it when the list is empty.
+**Visit card / drawer: two separate sections, each with a small heading, each shown only when
+non-empty:**
+
+```
+┌ Tue Oct 21 · 4:30–10:30 PM · Ultimate Fire ───────────────┐
+│ SERVICES                                                    │
+│   DOLE Ripening Room — Weekly inspection (about 6 hours)    │
+│ DEFICIENCIES (29)                                           │
+│   Repair offered on this visit (9)                          │
+│     Bulb Gaskets — Fail                                     │
+│     Caulking — Fail                    … show all           │
+│   Open at this site (20)                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+- **Services:** one line per item: `service_line`, then `description`. Skip the
+  description when it repeats the service line.
+- **Deficiencies:** grouped by `relation`, "Repair offered on this visit" first, then "Open at
+  this site". Show the first 3 per group, then "show all". Same row style as the job-level list
+  (severity badge, `name`).
+- Visit with services only: just the Services section. Deficiencies only: just the
+  Deficiencies section. Neither: no section at all.
 
 **After a Refresh:** a `changes` entry with `entity: "deficiency"` means the job's
 `deficiencies` changed. Re-render from the returned `job`. Don't patch the list.

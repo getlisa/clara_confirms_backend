@@ -55,7 +55,7 @@ test("job.deficiencies lists every open deficiency at the site, structured, with
   assert.deepEqual(job.deficiencies.find((d) => d.id === 101).visit_ids.sort(), [2, 3]);
   const q = queries.find((x) => /FROM deficiencies d/.test(x.sql));
   assert.match(q.sql, /is_resolved = false/);
-  assert.deepEqual(q.params, [16, 7, 40], "the job's site (location) and the job itself");
+  assert.deepEqual(q.params.slice(0, 3), [16, 7, 40], "the job's site (location) and the job itself");
 });
 
 test("each visit carries its deficiencies with a relation", async () => {
@@ -84,4 +84,45 @@ test("without the opt-in (the voice-dispatch path) no deficiency query runs and 
   assert.equal(queries.some((q) => /FROM deficiencies d/.test(q.sql)), false);
   assert.equal("deficiencies" in job, false);
   assert.equal("deficiencies" in job.appointments[0], false);
+});
+
+// ── Services and deficiencies are separate entities ─────────────────────────
+
+test("a visit's services hold booked work only — repair rows move to visit.deficiencies", async () => {
+  reset();
+  fixture.services = [
+    { appointment_id: 3, kind: "deficiency_repair", deficiency_id: 101, description: "Bulb Gaskets — Fail" },
+    { appointment_id: 3, kind: "service", description: "Weekly DOLE Ripening Room inspection" },
+  ];
+  const job = await jobsDb.getJobById(7, 16, { withDeficiencies: true });
+  const visit = job.appointments.find((a) => a.id === 3);
+  assert.deepEqual(visit.services.map((s) => s.kind), ["service"]);
+  assert.deepEqual(visit.deficiencies.map((d) => [d.id, d.relation]), [[101, "repair_offered"], [102, "open_at_site"]]);
+});
+
+test("a visit with neither has empty arrays (the UI hides both sections)", async () => {
+  reset();
+  fixture.services = [];
+  fixture.deficiencies = [];
+  const job = await jobsDb.getJobById(7, 16, { withDeficiencies: true });
+  for (const a of job.appointments) {
+    assert.deepEqual(a.deficiencies, []);
+    assert.ok(Array.isArray(a.services));
+  }
+  assert.deepEqual(job.deficiencies, []);
+});
+
+test("the deficiency query also fetches every deficiency a repair row points at, so the cap can't drop one", async () => {
+  reset();
+  queries.length = 0;
+  await jobsDb.getJobById(7, 16, { withDeficiencies: true });
+  const q = queries.find((x) => /FROM deficiencies d/.test(x.sql));
+  assert.match(q.sql, /OR d\.id = ANY\(\$4::int\[\]\)/);
+  assert.deepEqual(q.params[3], [101]);
+});
+
+test("the agent's read (no opt-in) still carries the repair rows it offers on calls", async () => {
+  reset();
+  const job = await jobsDb.getJobById(7, 16);
+  assert.ok(job.appointments.find((a) => a.id === 2).services.some((s) => s.kind === "deficiency_repair"));
 });

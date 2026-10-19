@@ -476,19 +476,31 @@ const OPEN_VISIT_STATUSES = new Set(["scheduled", "confirmed", "pending"]);
  *     service requests in the whole database point at a deficiency), so this
  *     is how its deficiencies reach a visit at all.
  *
- * Capped at 200 per site, like the locations API.
+ * Capped at 200 per site, like the locations API — plus any deficiency a
+ * visit's repair row points at, so the cap can never drop one off a visit.
+ *
+ * It also SEPARATES the two entities in the response: a deficiency_repair
+ * row is a deficiency, not a service, so it leaves `appt.services` (which is
+ * left with booked work only) and lives on `appt.deficiencies`. Only this
+ * opt-in API path does that — the agent's context (job-confirmation-context)
+ * reads getJobById without the option and still sees the repair rows it
+ * offers on calls.
  */
 async function attachDeficiencies(companyId, job, locationId) {
   const { presentDeficiency } = require("./locations");
+  const repairIds = [...new Set((job.appointments || []).flatMap((a) => (a.services || [])
+    .filter((svc) => svc.kind === "deficiency_repair" && svc.deficiency_id != null)
+    .map((svc) => svc.deficiency_id)))];
   const { rows } = await db.query(
     `SELECT d.*, sl.name AS service_line_name
        FROM deficiencies d
        LEFT JOIN service_lines sl ON sl.id = d.service_line_id
-      WHERE d.company_id = $1 AND d.is_resolved = false
-        AND (d.job_id = $2 OR ($3::int IS NOT NULL AND d.location_id = $3))
+      WHERE d.company_id = $1
+        AND ((d.is_resolved = false AND (d.job_id = $2 OR ($3::int IS NOT NULL AND d.location_id = $3)))
+             OR d.id = ANY($4::int[]))
       ORDER BY d.opened_at DESC NULLS LAST, d.id DESC
       LIMIT 200`,
-    [companyId, job.id, locationId]
+    [companyId, job.id, locationId, repairIds]
   );
   const byId = new Map(rows.map((r) => [r.id, {
     ...presentDeficiency(r),
@@ -516,6 +528,8 @@ async function attachDeficiencies(companyId, job, locationId) {
     }
     for (const d of linked) byId.get(d.id).visit_ids.push(appt.id);
     appt.deficiencies = linked.map(({ visit_ids, ...d }) => d);
+    // Booked work only — the repair rows are now appt.deficiencies.
+    appt.services = (appt.services || []).filter((svc) => (svc.kind || "service") !== "deficiency_repair");
   }
 
   job.deficiencies = [...byId.values()];
