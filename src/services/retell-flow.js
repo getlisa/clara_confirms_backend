@@ -81,13 +81,14 @@ const POST_CHAT_ANALYSIS_DATA = [
   },
 ];
 
-// The flow-level default and the silent Call Type Router node. Retell retires
-// gpt-4.1-nano on 10/20/2026 (replacement: gpt-5.6-luna) and auto-migrates
-// existing flows on that date — but every syncFlowForCompany re-sends this
-// value, so leaving the old id here would write a retired model back on the
-// next prompt edit / settings toggle / voice change.
+// The flow-level default and the silent Call Type Router node. Retell retired
+// gpt-4.1-nano on 10/20/2026 and auto-migrated flows to gpt-5.6-luna; luna
+// costs more than this node needs (it never speaks, only evaluates the call-type
+// branch), so gpt-4.1 — not deprecated — is used instead. Every
+// syncFlowForCompany re-sends this value, so it also replaces the auto-migrated
+// luna on each company's next sync.
 // https://docs.retellai.com/deprecation-notice/2026/10-20_model_replacements
-const ROUTER_MODEL = "gpt-5.6-luna";
+const ROUTER_MODEL = "gpt-4.1";
 
 // ── Flow node builders ─────────────────────────────────────────────────────────
 
@@ -96,7 +97,7 @@ function buildBranchNode(callTypes) {
     id: NODE_ROUTER,
     type: "branch",
     name: "Call Type Router",
-    // Cheapest model — this node never speaks, only evaluates equations silently
+    // This node never speaks, only evaluates equations silently — see ROUTER_MODEL.
     model_choice: { type: "cascading", model: ROUTER_MODEL },
     edges: callTypes.map((ct) => ({
       id: `edge_${ct.type}`,
