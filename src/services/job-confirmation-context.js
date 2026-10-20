@@ -25,8 +25,8 @@
 const jobsDb = require("../db/jobs");
 const jobTypeInstructionsDb = require("../db/job-type-instructions");
 const db = require("../db");
+const { getCompanyTimezone, formatSpokenDateTime, formatSpokenDateOnly, formatArrivalStatement } = require("../utils/timezone");
 const callSettingsDb = require("../db/call-settings");
-const { getCompanyTimezone, formatSpokenDateTime, formatSpokenDateOnly, formatArrivalWindow } = require("../utils/timezone");
 const logger = require("../utils/logger");
 
 /**
@@ -51,6 +51,25 @@ const MAX_PAST_APPOINTMENTS = 5;
 // "between 8 AM and 9 AM" — rather than straddling it, which would have told
 // the customer the crew might arrive before the time they were given.
 const ARRIVAL_WINDOW_MINUTES = 60;
+
+async function loadArrivalPolicy(companyId) {
+  const s = await callSettingsDb.getByCompanyId(companyId).catch(() => null);
+  return {
+    style: s?.arrival_time_style ?? "window",
+    minutesBefore: s?.arrival_minutes_before ?? 0,
+    minutesAfter: s?.arrival_minutes_after ?? ARRIVAL_WINDOW_MINUTES,
+  };
+}
+
+function arrivalFields(iso, tz, policy) {
+  const a = formatArrivalStatement(iso, tz, policy);
+  return {
+    arrival_style: a.style,
+    arrival_window_spoken: a.window,
+    arrival_statement_spoken: a.statement,
+    arrival_label: a.label,
+  };
+}
 
 /** Distinct, non-empty, order-preserving. */
 // One site in the live tenant has 29 open deficiencies; the median is 3.
@@ -332,6 +351,9 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
   const now = opts.now instanceof Date ? opts.now : new Date();
   const tz = opts.tz || (await getCompanyTimezone(companyId));
   const job = opts.job || (await jobsDb.getJobById(numericJobId, companyId));
+  // How this company wants the visit time stated (migration 116). A settings
+  // read failure falls back to the default window rather than failing the call.
+  const arrivalPolicy = opts.arrivalPolicy || (await loadArrivalPolicy(companyId));
   if (!job) return { ok: false, status: 404, code: "job_not_found", error: "Job not found" };
 
   const all = Array.isArray(job.appointments) ? job.appointments : [];
@@ -441,7 +463,13 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     // crew does not land on the minute. Precomputed because a model doing this
     // arithmetic gets hour and noon boundaries wrong. null on a DST fall-back
     // night, where both bounds are the same wall-clock time.
-    arrival_window_spoken: formatArrivalWindow(appt.scheduled_start, tz, ARRIVAL_WINDOW_MINUTES),
+    // Per the company's arrival-time setting: `arrival_window_spoken` is the
+    // "between X and Y" range (window style only, else null — kept for the
+    // agents' existing wording); `arrival_statement_spoken` is the sentence to
+    // say for EVERY style, e.g. "Your appointment is scheduled for 11 AM.
+    // Please note that our technicians may arrive up to 30 minutes before or
+    // after your scheduled appointment time." `arrival_label` is the short UI form.
+    ...arrivalFields(appt.scheduled_start, tz, arrivalPolicy),
     customer_confirmed: appt.customer_confirmed === true,
     technician_confirmed: appt.technician_confirmed === true,
     // Kept for back-compat; explicitly "the lead", not "the technician".

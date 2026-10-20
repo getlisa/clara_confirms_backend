@@ -289,7 +289,7 @@ test("onsite expectations are sequenced AFTER confirming, not before — CASE A"
   });
   const confirmedIdx = out.indexOf("You're all set");
   const onsiteRefIdx = out.indexOf("Deliver onsite expectations and ask the noise/access question");
-  const arrivalRefIdx = out.indexOf("Deliver the arrival window (see ARRIVAL WINDOW below)");
+  const arrivalRefIdx = out.indexOf("Deliver the arrival time (see ARRIVAL TIME below)");
   assert.ok(confirmedIdx > -1 && onsiteRefIdx > -1 && arrivalRefIdx > -1, "all three markers must be present");
   assert.ok(confirmedIdx < onsiteRefIdx, "onsite expectations must be referenced AFTER the confirmation message, not before");
   assert.ok(onsiteRefIdx < arrivalRefIdx, "onsite expectations must come before the arrival window");

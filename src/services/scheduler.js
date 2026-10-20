@@ -280,6 +280,10 @@ async function runDispatcher(batchSize = 10, { companyId = null, respectAutoFlag
             // exact. Precomputed in the context — never ask the agent to do
             // clock arithmetic.
             dynVars.next_arrival_window = next.arrival_window_spoken || "";
+            // The full sentence for the company's arrival-time setting
+            // (window / scheduled time ± tolerance / scheduled time only) —
+            // what the default prompt now tells the agent to say.
+            dynVars.next_arrival_statement = next.arrival_statement_spoken || "";
             dynVars.next_appointment_id = String(next.appointment_id);
             // The whole crew, not just appointments.technician_id — most
             // multi-service visits send two to four technicians.

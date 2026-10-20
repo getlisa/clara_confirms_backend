@@ -291,9 +291,9 @@ const APPOINTMENT_DATA = (d) => {
     ? `- Next appointment: ID ${next.appointment_id} | ${next.scheduled_start_spoken}${next.service_summary ? ` | ${next.service_summary}` : ""}${next.technician_summary ? ` | Tech: ${next.technician_summary}` : ""}`
     : "- Next appointment: none booked";
 
-  const windowLine = next?.arrival_window_spoken
-    ? `- Arrival window for next visit: ${next.arrival_window_spoken}${d.zone ? ` ${d.zone}` : ""} (pre-computed — always use this, never calculate it yourself)`
-    : "- Arrival window for next visit: not available — state the scheduled time alone";
+  const windowLine = next?.arrival_statement_spoken
+    ? `- Arrival time for next visit, in the company's wording: "${next.arrival_statement_spoken}"${d.zone ? ` (${d.zone})` : ""} (pre-computed — always use this, never calculate it yourself)`
+    : "- Arrival time for next visit: not available — state the scheduled time alone";
 
   const nextDetail = next
     ? `- What the next visit covers (service line — description):
@@ -456,7 +456,7 @@ confirm_appointment or reschedule_appointment succeeds, or once the customer
 says an already-confirmed date still works (CASE B) — never in the opening
 message (see YOUR OPENING MESSAGE above). For a brand-new visit (CASE C),
 deliver it while helping them pick a time, since nothing is confirmed yet to
-wait for. Do the following, in order, before the arrival window:
+wait for. Do the following, in order, before the arrival time:
 
 ${d.serviceLineDescriptions.length ? `DELIVER ONSITE EXPECTATIONS
 Every confirmation must tell the customer what to expect: building access, noise, and rough duration. The site needs this to prepare — giving tenants notice, unlocking units, expecting the panel to sound. Don't wait to be asked.
@@ -504,7 +504,7 @@ findings, NOT repair work, and NOT optional — they are things the site has to
 have done before the technician arrives, or the visit cannot go ahead.
 
 Deliver these LAST, once the visit is settled and after onsite expectations and
-the arrival window — never in the opening message. They are the one thing the
+the arrival time — never in the opening message. They are the one thing the
 customer has to act on themselves after this conversation ends, so they are
 what you leave them with.
 
@@ -560,7 +560,7 @@ If they CONFIRM:
 → Send: "Thanks for confirming — one moment while I get that updated."
 → Call confirm_appointment with appointment_id = ${d.confirmTargetId}.
 → Once done: "You're all set — your [service] on [date] is confirmed."
-${optLine(d.hasOnsiteContent, "→ Deliver onsite expectations and ask the noise/access question (see ONSITE EXPECTATIONS below).")}→ Deliver the arrival window (see ARRIVAL WINDOW below).
+${optLine(d.hasOnsiteContent, "→ Deliver onsite expectations and ask the noise/access question (see ONSITE EXPECTATIONS below).")}→ Deliver the arrival time (see ARRIVAL TIME below).
 → Go to ${d.nextAfterConfirmation}.
 
 If they want to RESCHEDULE:
@@ -570,7 +570,7 @@ If they want to RESCHEDULE:
 ${optLine(d.zoneShort, `→ Confirm the zone: "Just to confirm, that's [time] ${d.zoneShort} — right?"`)}→ Send: "Got it — one moment while I move that over for you."
 → Call reschedule_appointment with that appointment_id and the new scheduled_start (YYYY-MM-DDTHH:MM:SS${d.zone ? `, ${d.zone}` : ""}).
 → Once done: "Done — I've moved that to [new date and time]."
-${optLine(d.hasOnsiteContent, "→ Deliver onsite expectations and ask the noise/access question (see ONSITE EXPECTATIONS below).")}→ Deliver the arrival window.
+${optLine(d.hasOnsiteContent, "→ Deliver onsite expectations and ask the noise/access question (see ONSITE EXPECTATIONS below).")}→ Deliver the arrival time.
 → Note: rescheduling one appointment does not move the others. Say so if they seem to expect it.
 
 If they want to CANCEL:
@@ -593,7 +593,7 @@ const CASE_B = (d) => `── CASE B: everything is already confirmed ──
 Don't ask for confirmation as if nothing's on file.
 → "Good news — everything on this job is already confirmed. The next visit is [date] for [service]. I just wanted to make sure that still works for you."
 → Still deliver the onsite expectations and ask the noise/access question — the property needs to know what to expect even if the date is settled.
-→ If it still works: deliver the arrival window, then go to ${d.hasServiceLink ? "SERVICE LINK" : "ENDING THE CONVERSATION"}. No tool call needed.
+→ If it still works: deliver the arrival time, then go to ${d.hasServiceLink ? "SERVICE LINK" : "ENDING THE CONVERSATION"}. No tool call needed.
 → If it doesn't: handle as a reschedule or cancel (CASE A).
 → SKIP OTHER APPOINTMENTS ON THIS JOB.
 `;
@@ -605,27 +605,47 @@ const CASE_C = (d) => `── CASE C: no upcoming appointments ──
 → "Do you have a preferred date and time for [service]?"
 ${optLine(d.zoneShort, `→ Confirm ${d.zoneShort} before booking.`)}→ Check who you're speaking with first, if you haven't already this conversation (see WHO YOU'RE TALKING TO above) — before you write anything.
 → If they give a time: send "Perfect — one moment while I get that on the schedule." then call create_appointment with job_id=${d.jobId} and scheduled_start (YYYY-MM-DDTHH:MM:SS${d.zone ? `, ${d.zone}` : ""}). Once done: "You're all set — I've got you down for [date and time]. Our team will be there."
-→ Deliver the arrival window.
+→ Deliver the arrival time.
 → If they say "anytime": "Our scheduling team will reach out soon to lock in a time." Do NOT create an appointment. Move to ENDING THE CONVERSATION.
 → SKIP OTHER APPOINTMENTS ON THIS JOB.
 `;
 
-const ARRIVAL_WINDOW = (d) => `${BAR}
-ARRIVAL WINDOW
+// How the visit time is stated follows the company's arrival-time setting
+// (call_settings, migration 116), precomputed in job-confirmation-context as
+// arrival_statement_spoken. The per-style rules below only stop the model from
+// "improving" the wording into something the company didn't choose.
+const ARRIVAL_STYLE_RULES = {
+  window: [
+    "The scheduled time is the planned arrival, not a guaranteed exact time.",
+    "The tech arrives within the window above. Never state a different range.",
+  ],
+  scheduled_with_tolerance: [
+    "State the scheduled time as THE appointment time.",
+    "Then say the technicians may arrive up to the stated minutes before or after it, exactly as above. Never turn it into a \"between X and Y\" range, and never change the minutes.",
+  ],
+  scheduled_only: [
+    "State the scheduled time as the appointment time. Do not add an arrival window or a tolerance.",
+  ],
+};
+
+const ARRIVAL_WINDOW = (d) => {
+  const statement = d.next?.arrival_statement_spoken || null;
+  const rules = ARRIVAL_STYLE_RULES[d.next?.arrival_style] || ARRIVAL_STYLE_RULES.window;
+  return `${BAR}
+ARRIVAL TIME
 ${BAR}
 
 Send this after every confirm, reschedule, or create${d.hasOnsiteContent ? " — right after onsite expectations and the noise/access question (see ONSITE EXPECTATIONS above)" : ""} — before ${d.nextAfterConfirmation}.
 
-${d.next?.arrival_window_spoken
-  ? `Use the pre-computed window — ${d.next.arrival_window_spoken}${d.zone ? ` ${d.zone}` : ""} — do not calculate it yourself. The tech arrives within one hour AFTER the scheduled time — never earlier than scheduled.`
-  : "No window could be computed for this visit — state the scheduled time alone, and say the tech will be in touch if they are running behind."}
-${optLine(d.next?.arrival_window_spoken && d.next?.scheduled_start_spoken,
-  `Say something like: "Just a heads up — the tech is planned to arrive at ${d.next?.scheduled_start_spoken}, so expect them ${d.next?.arrival_window_spoken}${d.zoneShort ? ` ${d.zoneShort}` : ""}. If they're running behind they'll reach out and keep you posted."`)}
-Three things must come through:
-1. The scheduled time is the planned arrival — not a guaranteed exact time.
-2. The tech arrives within one hour after that time — never earlier than scheduled.
-3. If there's a delay, the tech will contact them.
+${statement
+  ? `Say it in this wording — it is exactly how the company wants arrival explained${d.zoneShort ? ` (times are ${d.zoneShort})` : ""}:
+"${statement}"
+Do not calculate any time, window or tolerance yourself.`
+  : "No arrival time could be computed for this visit — state the scheduled time alone, and say the tech will be in touch if they are running behind."}
+What must come through:
+${[...rules, "If there's a delay, the tech will contact them."].map((r, i) => `${i + 1}. ${r}`).join("\n")}
 `;
+};
 
 /**
  * The ONLY section built when isProposeRemainingTurn — see build() below.

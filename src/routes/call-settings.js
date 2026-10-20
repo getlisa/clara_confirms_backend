@@ -4,7 +4,7 @@ const { authenticate, getCompanyId } = require("../auth");
 const logger = require("../utils/logger");
 const db = require("../db");
 const retell = require("../services/retell");
-const { getCompanyTimezone, localizeFields } = require("../utils/timezone");
+const { getCompanyTimezone, localizeFields, formatArrivalStatement } = require("../utils/timezone");
 const { requirePermission, requireDynamicPermission, permissionForCallType, PERMISSIONS: PERM } = require("../auth/permissions");
 
 const router = express.Router();
@@ -47,6 +47,51 @@ async function syncVoicemailToRetell(companyId, settings) {
   }
 }
 
+/**
+ * GET /call-settings/arrival-preview?style=&minutes_before=&minutes_after=
+ * The exact sentence Clara would say for a sample 11:00 AM visit, built by the
+ * same function the agents use — so the settings page can show a live preview
+ * without re-implementing the wording. Any omitted param uses the saved value.
+ */
+router.get("/arrival-preview", async (req, res) => {
+  try {
+    const companyId = getCompanyId(req);
+    if (!companyId) return res.status(403).json({ error: "Company context required" });
+    const saved = await callSettingsDb.getByCompanyId(companyId);
+    const style = req.query.style ?? saved.arrival_time_style ?? "window";
+    if (!callSettingsDb.ARRIVAL_TIME_STYLES.includes(style)) {
+      return res.status(400).json({ error: `style must be one of ${callSettingsDb.ARRIVAL_TIME_STYLES.join(", ")}` });
+    }
+    const minutes = (v, fallback) => (v === undefined ? fallback : Number(v));
+    const minutesBefore = minutes(req.query.minutes_before, saved.arrival_minutes_before ?? 0);
+    const minutesAfter = minutes(req.query.minutes_after, saved.arrival_minutes_after ?? 60);
+    for (const v of [minutesBefore, minutesAfter]) {
+      if (!Number.isInteger(v) || v < 0 || v > 240) return res.status(400).json({ error: "minutes must be whole numbers from 0 to 240" });
+    }
+    // A fixed 11:00 AM in the company's own zone, so the preview reads like a real visit.
+    const tz = await getCompanyTimezone(companyId);
+    const sample = sampleElevenAm(tz);
+    const a = formatArrivalStatement(sample, tz, { style, minutesBefore, minutesAfter });
+    return res.json({ style, minutes_before: minutesBefore, minutes_after: minutesAfter, sample_time: "11:00 AM", statement: a.statement, label: a.label });
+  } catch (err) {
+    logger.error("GET /call-settings/arrival-preview failed", { error: err.message });
+    return res.status(500).json({ error: "Failed to build the preview" });
+  }
+});
+
+/** Tomorrow 11:00 AM local time in `tz`, as an ISO instant. */
+function sampleElevenAm(tz) {
+  const day = new Date(Date.now() + 86400000);
+  const ymd = day.toLocaleDateString("en-CA", { timeZone: tz });            // YYYY-MM-DD
+  const offsetMin = (() => {
+    const at = new Date(`${ymd}T11:00:00Z`);
+    const local = new Date(at.toLocaleString("en-US", { timeZone: tz }));
+    const utc = new Date(at.toLocaleString("en-US", { timeZone: "UTC" }));
+    return Math.round((utc - local) / 60000);
+  })();
+  return new Date(new Date(`${ymd}T11:00:00Z`).getTime() + offsetMin * 60000).toISOString();
+}
+
 router.get("/", async (req, res) => {
   try {
     const companyId = getCompanyId(req);
@@ -64,7 +109,7 @@ router.patch("/", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
-    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled, crm_comment_writeback_enabled, service_link_enabled, channel_strategy, sms_on_callback_enabled, chat_link_delivery_method, confirmation_contact_types, job_confirmation_inference_enabled, deficiency_mention_enabled, deficiency_offer_repair, deficiency_mention_limit } = req.body;
+    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled, crm_comment_writeback_enabled, service_link_enabled, channel_strategy, sms_on_callback_enabled, chat_link_delivery_method, confirmation_contact_types, job_confirmation_inference_enabled, arrival_time_style, arrival_minutes_before, arrival_minutes_after, deficiency_mention_enabled, deficiency_offer_repair, deficiency_mention_limit } = req.body;
     const fields = {};
     if (business_hours_start !== undefined) fields.business_hours_start = business_hours_start;
     if (business_hours_end   !== undefined) fields.business_hours_end   = business_hours_end;
@@ -110,6 +155,23 @@ router.patch("/", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
       if (typeof crm_comment_writeback_enabled !== "boolean")
         return res.status(400).json({ error: "crm_comment_writeback_enabled must be a boolean" });
       fields.crm_comment_writeback_enabled = crm_comment_writeback_enabled;
+    }
+    // How Clara states the visit time (migration 116).
+    if (arrival_time_style !== undefined) {
+      if (!callSettingsDb.ARRIVAL_TIME_STYLES.includes(arrival_time_style))
+        return res.status(400).json({ error: `arrival_time_style must be one of ${callSettingsDb.ARRIVAL_TIME_STYLES.join(", ")}` });
+      fields.arrival_time_style = arrival_time_style;
+    }
+    const validMinutes = (v) => Number.isInteger(v) && v >= 0 && v <= 240;
+    if (arrival_minutes_before !== undefined) {
+      if (!validMinutes(arrival_minutes_before))
+        return res.status(400).json({ error: "arrival_minutes_before must be a whole number of minutes from 0 to 240" });
+      fields.arrival_minutes_before = arrival_minutes_before;
+    }
+    if (arrival_minutes_after !== undefined) {
+      if (!validMinutes(arrival_minutes_after))
+        return res.status(400).json({ error: "arrival_minutes_after must be a whole number of minutes from 0 to 240" });
+      fields.arrival_minutes_after = arrival_minutes_after;
     }
     // Open deficiencies on a call (migration 117).
     if (deficiency_mention_enabled !== undefined) {

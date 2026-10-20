@@ -59,7 +59,9 @@ function buildAppointmentCard(appt, job, serviceLink = null, onsiteInstructionsA
     location_name: job?.location_name ?? null,
     scheduled_start: appt.scheduled_start ?? null,
     scheduled_start_label: appt.scheduled_start_spoken ?? null,
-    arrival_window_label: appt.arrival_window_spoken ?? null,
+    // The short form of the company's arrival-time setting: "between 8 AM and
+    // 9 AM", "11 AM (±30 min)" or "11 AM". Name kept for the chat widget.
+    arrival_window_label: appt.arrival_label ?? appt.arrival_window_spoken ?? null,
     service_line: appt.service_line ?? null,
     service_requests: (appt.service_details || []).map((d) => ({ line: d.service_line ?? null, description: d.description ?? null })),
     technicians: (appt.technicians || []).map((t) => ({ name: t.name ?? null, phone: t.phone ?? null, email: t.email ?? null })),
