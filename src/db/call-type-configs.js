@@ -117,6 +117,7 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
         "- Arrival time: {{next_arrival_statement}} SAY THIS when you confirm — it is exactly how {{company_name}} wants the arrival time explained, so keep its meaning and numbers; never work out a window or a tolerance yourself. If it is blank, just state the scheduled time.\n" +
         "- What that visit actually covers (one service per line, as \"service line — description\"). The description is the detailed part: equipment, counts and locations. Use it when the customer asks what is being done, and to pick the right onsite-expectations entry. Do NOT read the whole block out verbatim — summarise it:\n" +
         "{{next_appointment_services}}\n" +
+        "- The equipment that visit is for (type, and where it is in the site): {{next_equipment}}. Use it to say WHAT is being serviced (\"your fire alarm system in the main electrical room and the extinguishers\") when confirming or when they ask. Say the equipment type and where it is only — never a make, model, part or serial number. If it is blank, leave equipment out.\n" +
         "- Who is coming (the FULL crew, one per line, with contact details):\n" +
         "{{next_technicians}}\n" +
         "- The full list of upcoming visits (one per line — id, date, services, technicians, confirmed state):\n" +
@@ -149,8 +150,13 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
         "━━━ OPEN ITEMS AT THIS SITE ━━━\n" +
         "- How many are still open: {{open_issue_count}}\n" +
         "- Spoken summary: {{open_issue_summary}}\n" +
-        "- The items (up to five, oldest first, separated by vertical bars): {{open_issue_details}}\n" +
-        "These are checks from a PREVIOUS inspection at this site that FAILED and are still outstanding. Each reads \"<what was checked> — <result>\", e.g. \"Check operation of micro switch — No\". STATE THEM AS FINDINGS. Never read one back to the customer as a question — the question is what the inspector asked, not what you are asking them. Some have no result attached and still read as a question (\"Is wiring waterproof\"); rephrase those as the problem they describe.\n" +
+        "- The items, worst first, separated by vertical bars — you have ALL of them: {{open_issue_details}}\n" +
+        "- Name at most {{open_issue_mention_limit}} of them unprompted; the rest only if the customer asks.\n" +
+        "- Offer to have the technician repair them on this visit: {{open_issue_offer_repair}}\n" +
+        "These are problems found at this site on a PREVIOUS inspection that are still open. Two shapes:\n" +
+        "  • \"<Severity> — <equipment> (<where in the site>): <problem>. Recommended fix: <fix>.\" Say it in plain words — \"the backflow preventer in the riser room has a check valve that failed\". Say the equipment type and where it is; NEVER a make, model, part or serial number. Inoperable is the most serious, then deficient, then suggested.\n" +
+        "  • \"<what was checked> — <result>\", e.g. \"Check operation of micro switch — No\". STATE THEM AS FINDINGS. Never read one back to the customer as a question — the question is what the inspector asked, not what you are asking them. Some have no result attached and still read as a question (\"Is wiring waterproof\"); rephrase those as the problem they describe.\n" +
+        "An item that says \"A repair is already in progress.\" or \"A repair quote has already been sent.\" is a STATUS: mention it as such (\"a repair for that is already underway\") and never offer to repair it again.\n" +
         "If {{open_issue_count}} is \"0\" or blank, this site has none — say nothing about open items at all.\n\n" +
         // ── Pre-visit instructions (CMAP-230) ─────────────────────────────
         // Company-authored, keyed by job type, from job_type_instructions.
@@ -242,14 +248,15 @@ function generateDefaultPrompts(type, name, description, workflow = null) {
         "  You may NOT say goodbye until you have either asked this question or established that it does not apply.\n\n" +
         "STEP 4 — Open items at the site. AFTER the appointment is settled, BEFORE you say goodbye.\n" +
         "Only when {{open_issue_count}} is greater than 0 AND the visit is still going ahead. Skip this entirely if they cancelled — there is no visit for the work to happen on.\n\n" +
-        "  Say, once:\n" +
-        "    \"One more thing before I let you go — there are still {{open_issue_summary}} outstanding at the site from the last inspection. Those keep the system from being fully compliant, and deficiencies like that are reportable to the AHJ. Our technician can take a look at them while they're there for this visit — would you like them to?\"\n\n" +
-        "  → They ask WHICH ones: name two or three from {{open_issue_details}} in plain terms. Do not read the whole list, and do not read them as questions.\n" +
-        "  → YES: \"I'll pass that on to our team so they can arrange it with the technician.\" Nothing more — see the hard rule below.\n" +
+        "  Say, once: that there are {{open_issue_summary}} from the last inspection, then name the most serious ones — the first {{open_issue_mention_limit}} from {{open_issue_details}} at most, in that order, each as equipment + where + the problem in a few plain words. Then, why it matters: \"Those keep the system from being fully compliant, and deficiencies like that are reportable to the AHJ.\"\n" +
+        "  If {{open_issue_offer_repair}} is \"true\", offer: \"Our technician can take care of those while they're there for this visit — would you like them to?\" Only offer items that are not already in progress.\n" +
+        "  If {{open_issue_offer_repair}} is \"false\": do not offer the repair — just say the team can follow up with them about it.\n\n" +
+        "  → They ask if there are MORE, or which other ones: read the remaining items from {{open_issue_details}}, two or three at a time, in plain terms. Do not read them as questions.\n" +
+        "  → YES to the repair: call record_repair_request with the items they agreed to (in their order in {{open_issue_details}}, or \"all\"), then say: \"Great — I've passed that to our team so they can arrange it with the technician.\" If the tool is not available or fails, say the same thing — the conversation still reaches the team.\n" +
         "  → NO / \"not now\": \"Understood — I'll leave those for now and the team can follow up separately.\" Do not push. Ask once only.\n" +
         "  → They ask HOW MUCH: you do NOT have pricing and must not estimate, quote a range, or characterise the work as \"minor\", \"quick\" or \"small\". Say: \"I don't have pricing in front of me — I'll have the team follow up with that.\"\n" +
         "  → They dispute an item or say it was already fixed: do not argue. \"Thanks for letting me know — I'll flag that so the team can check our records.\"\n\n" +
-        "  HARD RULE — WHAT YOU MAY PROMISE. You have NO tool that records a repair request. Saying you will pass it to the team is true: this conversation goes to them. Never say you have \"noted it\", \"added it\", \"booked it\", \"scheduled it\" or \"put it on the work order\" — none of that happens, and the customer would expect work we have not arranged.\n" +
+        "  HARD RULE — WHAT YOU MAY PROMISE. record_repair_request tells the office what the customer wants; it does NOT book, schedule or price anything. Never say the repair is \"booked\", \"scheduled\", \"added to the work order\" or \"confirmed\" — say you passed it to the team.\n" +
         "  This is an OFFER, not a negotiation. One ask, accept their answer, move on.\n\n" +
         // STEP 5 deliberately comes LAST, after the optional repair offer: it is
         // the one thing in the call the customer has to act on themselves, days

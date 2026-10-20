@@ -81,6 +81,15 @@ const POST_CHAT_ANALYSIS_DATA = [
   },
 ];
 
+// The flow-level default and the silent Call Type Router node. Retell retired
+// gpt-4.1-nano on 10/20/2026 and auto-migrated flows to gpt-5.6-luna; luna
+// costs more than this node needs (it never speaks, only evaluates the call-type
+// branch), so gpt-4.1 — not deprecated — is used instead. Every
+// syncFlowForCompany re-sends this value, so it also replaces the auto-migrated
+// luna on each company's next sync.
+// https://docs.retellai.com/deprecation-notice/2026/10-20_model_replacements
+const ROUTER_MODEL = "gpt-4.1";
+
 // ── Flow node builders ─────────────────────────────────────────────────────────
 
 function buildBranchNode(callTypes) {
@@ -88,8 +97,8 @@ function buildBranchNode(callTypes) {
     id: NODE_ROUTER,
     type: "branch",
     name: "Call Type Router",
-    // Cheapest model — this node never speaks, only evaluates equations silently
-    model_choice: { type: "cascading", model: "gpt-4.1-nano" },
+    // This node never speaks, only evaluates equations silently — see ROUTER_MODEL.
+    model_choice: { type: "cascading", model: ROUTER_MODEL },
     edges: callTypes.map((ct) => ({
       id: `edge_${ct.type}`,
       destination_node_id: nodeId(ct.type),
@@ -380,7 +389,7 @@ async function syncFlowForCompany(companyId) {
       start_node_id:             NODE_ROUTER,
       start_speaker:             "agent",
       default_dynamic_variables: defaultDynVars,
-      model_choice:              { type: "cascading", model: "gpt-4.1-nano" },
+      model_choice:              { type: "cascading", model: ROUTER_MODEL },
     });
     logger.info("Retell ConversationFlow updated", { companyId, flowId, nodeCount: nodes.length });
   } else {
@@ -389,7 +398,7 @@ async function syncFlowForCompany(companyId) {
       start_node_id:             NODE_ROUTER,
       start_speaker:             "agent",
       default_dynamic_variables: defaultDynVars,
-      model_choice:              { type: "cascading", model: "gpt-4.1-nano" },
+      model_choice:              { type: "cascading", model: ROUTER_MODEL },
     });
     flowId = flow.conversation_flow_id;
     logger.info("Retell ConversationFlow created", { companyId, flowId, nodeCount: nodes.length });

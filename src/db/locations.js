@@ -36,8 +36,15 @@ async function listDeficiencies(companyId, locationId, { openOnly = true, status
     db.query(
       `SELECT id, ref_number, name, description, status, is_resolved,
               opened_at, resolved_at, source, external_ref, additional_information,
-              service_line_id, external_parent_ref, detail
+              service_line_id, external_parent_ref, detail,
+              eq.asset_type, eq.asset_type_label, eq.asset_location_in_site
          FROM deficiencies
+         -- Lateral so the shared WHERE (unqualified company_id/status/…) stays
+         -- unambiguous: only these three asset columns come into scope.
+         LEFT JOIN LATERAL (
+           SELECT a.type AS asset_type, a.type_label AS asset_type_label, a.location_in_site AS asset_location_in_site
+             FROM assets a WHERE a.id = deficiencies.asset_id
+         ) eq ON true
         WHERE ${where}
         ORDER BY opened_at DESC NULLS LAST, id DESC
         LIMIT $${i} OFFSET $${i + 1}`,
@@ -80,7 +87,34 @@ function presentDeficiency(row) {
     // build a job link from it.
     inspection_ref: row.external_parent_ref ?? null,
     detail: row.detail || {},
+    // ServiceTrade (migration 117): severity, what the CRM proposes, whether a
+    // repair/quote is already underway, and the equipment it was found on.
+    severity: extra.severity ?? null,
+    resolution: typeof extra.resolution === "string" ? extra.resolution : null,
+    proposed_fix: extra.proposed_fix ?? null,
+    equipment: row.asset_type_label || row.asset_type
+      ? { type: row.asset_type ?? null, type_label: row.asset_type_label ?? null, location_in_site: row.asset_location_in_site ?? null }
+      : null,
   };
+}
+
+/**
+ * The equipment at a location (migration 117) — active, real equipment only
+ * (ServiceTrade's generic "Building" node is left out), with its service line
+ * and how many open deficiencies it carries.
+ */
+async function listAssets(companyId, locationId) {
+  const { rows } = await db.query(
+    `SELECT a.id, a.type, a.type_label, a.name, a.location_in_site, a.status, a.properties, a.source, a.external_ref,
+            sl.name AS service_line,
+            (SELECT count(*)::int FROM deficiencies d WHERE d.asset_id = a.id AND d.is_resolved = false) AS open_deficiencies
+       FROM assets a
+       LEFT JOIN service_lines sl ON sl.id = a.service_line_id
+      WHERE a.company_id = $1 AND a.location_id = $2 AND a.is_active AND a.type IS DISTINCT FROM 'location'
+      ORDER BY sl.name NULLS LAST, a.type_label NULLS LAST, a.location_in_site NULLS LAST, a.id`,
+    [companyId, locationId]
+  );
+  return rows;
 }
 
 async function list(companyId, { search, customerId, isActive, limit = 50, offset = 0 } = {}) {
@@ -172,4 +206,4 @@ async function getById(id, companyId) {
   return location;
 }
 
-module.exports = { list, getById, listDeficiencies, presentDeficiency, withDeficiencySummary };
+module.exports = { list, getById, listDeficiencies, listAssets, presentDeficiency, withDeficiencySummary };

@@ -33,6 +33,10 @@ const DEFAULTS = {
   arrival_time_style:      "window",
   arrival_minutes_before:  0,
   arrival_minutes_after:   60,
+  // Open deficiencies on a call (migration 117).
+  deficiency_mention_enabled: true,
+  deficiency_offer_repair:    true,
+  deficiency_mention_limit:   3,
 };
 
 const ARRIVAL_TIME_STYLES = ["window", "scheduled_with_tolerance", "scheduled_only"];
@@ -55,6 +59,9 @@ function rowToSettings(row) {
     arrival_time_style:     row.arrival_time_style ?? "window",
     arrival_minutes_before: row.arrival_minutes_before ?? 0,
     arrival_minutes_after:  row.arrival_minutes_after ?? 60,
+    deficiency_mention_enabled: row.deficiency_mention_enabled ?? true,
+    deficiency_offer_repair:    row.deficiency_offer_repair ?? true,
+    deficiency_mention_limit:   row.deficiency_mention_limit ?? 3,
   };
 }
 
@@ -68,7 +75,8 @@ const SELECT_COLS = `
   job_confirmation_inference_enabled,
   call_notification_enabled,
   confirmation_contact_types,
-  arrival_time_style, arrival_minutes_before, arrival_minutes_after
+  arrival_time_style, arrival_minutes_before, arrival_minutes_after,
+  deficiency_mention_enabled, deficiency_offer_repair, deficiency_mention_limit
 `;
 
 async function getByCompanyId(companyId) {
@@ -113,6 +121,7 @@ async function upsert(companyId, fields) {
     // would have; see migration 087).
     "confirmation_contact_types",
     "arrival_time_style", "arrival_minutes_before", "arrival_minutes_after",
+    "deficiency_mention_enabled", "deficiency_offer_repair", "deficiency_mention_limit",
   ];
   const keys = Object.keys(fields).filter((k) => allowed.includes(k));
   if (keys.length === 0) return getByCompanyId(companyId);

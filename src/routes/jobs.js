@@ -278,7 +278,7 @@ router.get("/:id", async (req, res) => {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
 
-    const job = await jobsDb.getJobById(Number(req.params.id), companyId);
+    const job = await jobsDb.getJobById(Number(req.params.id), companyId, { withDeficiencies: true });
     if (!job) return res.status(404).json({ error: "Job not found" });
 
     const tz = await getCompanyTimezone(companyId);
@@ -335,7 +335,7 @@ router.post("/:id/refresh", requirePermission(PERM.SYNC_RUN), async (req, res) =
         timer = setTimeout(() => reject(new jobRefresh.RefreshError("crm_timeout", "The CRM didn't respond in time")), REFRESH_TIMEOUT_MS);
       }),
     ]);
-    const [job, tz] = await Promise.all([jobsDb.getJobById(jobId, companyId), getCompanyTimezone(companyId)]);
+    const [job, tz] = await Promise.all([jobsDb.getJobById(jobId, companyId, { withDeficiencies: true }), getCompanyTimezone(companyId)]);
     return res.json({ job: localizeJob(job, tz), ...result });
   } catch (err) {
     if (err instanceof jobRefresh.RefreshError) {

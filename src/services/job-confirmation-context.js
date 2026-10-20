@@ -125,6 +125,122 @@ function summariseDeficiencies(repairs) {
   return `${headline}, including ${spokenList(parts)}`;
 }
 
+// ── Equipment & ServiceTrade deficiencies (migration 117) ──────────────────
+
+// ServiceTrade's own severity scale, worst first — the order Clara names them.
+const SEVERITY_RANK = { inoperable: 0, deficient: 1, suggested: 2 };
+// "All the details" for the agent, but bounded: a site can carry dozens.
+const MAX_DEFICIENCY_ITEMS = 12;
+const MAX_DEFICIENCY_CHARS = 2400;
+
+const titleCase = (w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : w);
+
+/**
+ * "alarm system in the Main Electrical Room" — the equipment TYPE and WHERE it
+ * is, never the asset name: ServiceTrade names carry make/model ("Alarm System
+ * - Notifier NFS-320C …"), which the product decided Clara must not say.
+ */
+function equipmentPhrase({ type_label, type, location_in_site }) {
+  const label = String(type_label || (type || "").replace(/_/g, " ") || "equipment").trim().toLowerCase();
+  const where = String(location_in_site || "").trim();
+  // Bracketed rather than "in the …": site locations read "Riser Room" but
+  // also "Street Side", "North Wall", "Rear Exit" — the agent phrases it.
+  return where ? `${label} (${where})` : label;
+}
+
+const plural = (label) => (/s$/.test(label) ? label : `${label}s`);
+
+/**
+ * Spoken summary of a visit's equipment, grouped by type:
+ * "the alarm system in the Main Electrical Room and 9 portable fire
+ * extinguishers (Gymnasium, Corridor West and 7 other spots)".
+ */
+function summariseEquipment(items) {
+  if (!items.length) return null;
+  const groups = new Map();
+  for (const e of items) {
+    const label = String(e.type_label || (e.type || "").replace(/_/g, " ") || "equipment").trim().toLowerCase();
+    const g = groups.get(label) || { label, wheres: [] };
+    if (e.location_in_site) g.wheres.push(String(e.location_in_site).trim());
+    groups.set(label, g);
+    g.count = (g.count || 0) + 1;
+  }
+  const parts = [...groups.values()].sort((a, b) => b.count - a.count).map((g) => {
+    const wheres = dedupe(g.wheres);
+    if (g.count === 1) return wheres[0] ? `the ${g.label} (${wheres[0]})` : `the ${g.label}`;
+    if (!wheres.length) return `${g.count} ${plural(g.label)}`;
+    const shown = wheres.length <= 3 ? spokenList(wheres) : `${wheres.slice(0, 2).join(", ")} and ${wheres.length - 2} other spots`;
+    return `${g.count} ${plural(g.label)} (${shown})`;
+  });
+  return spokenList(parts);
+}
+
+const RESOLUTION_NOTE = {
+  out_for_repair: "A repair is already in progress.",
+  out_for_quote: "A repair quote has already been sent.",
+  notified: "The customer has already been notified about it.",
+};
+
+/**
+ * One ServiceTrade deficiency as the agent should understand it:
+ * "Inoperable — backflow preventer in the Riser Room: check valve #2 failed to
+ * hold tight. Recommended fix: rebuild check valve #2. A repair is already in
+ * progress."
+ */
+function deficiencyItem(d) {
+  const severity = d.severity ? titleCase(d.severity) : null;
+  const what = d.asset_type_label || d.asset_type
+    ? equipmentPhrase({ type_label: d.asset_type_label, type: d.asset_type, location_in_site: d.asset_location_in_site })
+    : (d.service_line_name ? String(d.service_line_name).toLowerCase() : "equipment at the site");
+  const desc = cleanServiceDescription(d.description);
+  const fix = d.proposed_fix ? ` Recommended fix: ${String(d.proposed_fix).trim().replace(/\.$/, "")}.` : "";
+  const note = RESOLUTION_NOTE[d.resolution] ? ` ${RESOLUTION_NOTE[d.resolution]}` : "";
+  return `${severity ? `${severity} — ` : ""}${what}${desc ? `: ${desc.replace(/\.$/, "")}.` : "."}${fix}${note}`;
+}
+
+/** "3 open deficiencies at the site, including 1 inoperable" */
+function summariseSiteDeficiencies(rows) {
+  if (!rows.length) return null;
+  const head = `${rows.length} open ${rows.length === 1 ? "deficiency" : "deficiencies"} at the site`;
+  const bySev = new Map();
+  for (const r of rows) if (r.severity) bySev.set(r.severity, (bySev.get(r.severity) || 0) + 1);
+  const parts = Object.keys(SEVERITY_RANK).filter((k) => bySev.has(k)).map((k) => `${bySev.get(k)} ${k}`);
+  return parts.length ? `${head}, including ${spokenList(parts)}` : head;
+}
+
+/** Open ServiceTrade deficiencies at the job's site, worst first, then oldest. */
+async function fetchSiteDeficiencies(companyId, jobId) {
+  const { rows } = await db.query(
+    `SELECT d.id, d.name, d.description, d.opened_at,
+            d.additional_information->>'severity' AS severity,
+            d.additional_information->>'resolution' AS resolution,
+            d.additional_information->>'proposed_fix' AS proposed_fix,
+            a.type AS asset_type, a.type_label AS asset_type_label, a.location_in_site AS asset_location_in_site,
+            sl.name AS service_line_name
+       FROM deficiencies d
+       LEFT JOIN assets a ON a.id = d.asset_id
+       LEFT JOIN service_lines sl ON sl.id = d.service_line_id
+      WHERE d.company_id = $1 AND d.source = 'servicetrade' AND d.is_resolved = false
+        AND d.location_id = (SELECT location_id FROM jobs WHERE id = $2 AND company_id = $1)`,
+    [companyId, jobId]
+  );
+  return rows.sort((a, b) =>
+    (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9)
+    || new Date(a.opened_at || 0) - new Date(b.opened_at || 0));
+}
+
+/** Active equipment at the job's site, for visits whose services name no asset. */
+async function fetchSiteEquipment(companyId, jobId) {
+  const { rows } = await db.query(
+    `SELECT a.type, a.type_label, a.location_in_site, a.service_line_id
+       FROM assets a
+      WHERE a.company_id = $1 AND a.is_active AND a.type <> 'location'
+        AND a.location_id = (SELECT location_id FROM jobs WHERE id = $2 AND company_id = $1)`,
+    [companyId, jobId]
+  );
+  return rows;
+}
+
 function dedupe(values) {
   return [...new Set(values.filter((v) => v != null && String(v).trim() !== ""))];
 }
@@ -253,7 +369,16 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
   // visit on this job — unlike onsite_instructions, which varies per
   // appointment. Returns [] for a job with no job_type (32 of company 14's
   // jobs) and for a company that has authored none, which is the normal case.
-  const [techsByAppt, { comments, notes }, previsitInstructions] = await Promise.all([
+  const isServiceTrade = job.source === "servicetrade";
+  // How this company wants open deficiencies handled on a call (migration
+  // 117; editable on the platform). Defaults apply if settings can't be read.
+  const settings = opts.callSettings || (await callSettingsDb.getByCompanyId(companyId).catch(() => null)) || {};
+  const deficiencyPolicy = {
+    mention: settings.deficiency_mention_enabled !== false,
+    offerRepair: settings.deficiency_offer_repair !== false,
+    mentionLimit: Number.isInteger(settings.deficiency_mention_limit) ? settings.deficiency_mention_limit : 3,
+  };
+  const [techsByAppt, { comments, notes }, previsitInstructions, siteDeficiencies, siteEquipment] = await Promise.all([
     fetchTechniciansByAppointment(all.map((a) => a.id)),
     fetchJobComments(companyId, numericJobId),
     jobTypeInstructionsDb.listForJobType(companyId, job.job_type).catch((err) => {
@@ -262,6 +387,10 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
       logger.warn("previsit instructions lookup failed", { companyId, jobId: numericJobId, error: err.message });
       return [];
     }),
+    // ServiceTrade only: InspectPoint's deficiencies already arrive on the
+    // visit as deficiency_repair rows. Never fail the call over these.
+    isServiceTrade ? fetchSiteDeficiencies(companyId, numericJobId).catch(() => []) : [],
+    isServiceTrade ? fetchSiteEquipment(companyId, numericJobId).catch(() => []) : [],
   ]);
 
   // Only used to name the work when an appointment has no appointment_services.
@@ -369,18 +498,39 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
     // 439 rows in the only live tenant, so a "1 critical, 2 non-critical"
     // variable would be blank almost always — and a variable that is usually
     // blank teaches the model to ignore it.
-    open_issue_count: repairs.length,
-    // Grouped by equipment family, which IS reliably present, so the agent can
-    // lead with "three items on the fire suppression system" before any detail.
-    open_issue_summary: summariseDeficiencies(repairs),
-    // The specifics, for when the customer asks "like what?". Capped: one site
-    // in the live tenant has 29 open items and reading them all would be
-    // unusable. Oldest first — with severity unavailable, age is the only
-    // honest ordering.
-    open_issue_details: repairs
-      .slice(0, MAX_SPOKEN_DEFICIENCIES)
-      .map((r) => cleanServiceDescription(r.description))
-      .filter(Boolean),
+    //
+    // ServiceTrade has no repair rows; its open deficiencies at the site come
+    // from `deficiencies` (with severity, equipment and proposed fix) and are
+    // attached to the NEXT visit — the same place InspectPoint projects its
+    // repairs, so the agent sees one shape for both CRMs.
+    ...(isNext && isServiceTrade && siteDeficiencies.length
+      ? {
+          open_issue_count: siteDeficiencies.length,
+          open_issue_summary: summariseSiteDeficiencies(siteDeficiencies),
+          // Worst first. All of them (bounded) — the agent names only the
+          // first N unprompted (deficiency_mention_limit) and reads the rest
+          // when asked.
+          open_issue_details: siteDeficiencies.slice(0, MAX_DEFICIENCY_ITEMS).map(deficiencyItem),
+          open_issue_source: "servicetrade",
+        }
+      : {
+          open_issue_count: repairs.length,
+          // Grouped by equipment family, which IS reliably present, so the agent can
+          // lead with "three items on the fire suppression system" before any detail.
+          open_issue_summary: summariseDeficiencies(repairs),
+          // The specifics, for when the customer asks "like what?". Capped: one site
+          // in the live tenant has 29 open items and reading them all would be
+          // unusable. Oldest first — with severity unavailable, age is the only
+          // honest ordering.
+          open_issue_details: repairs
+            .slice(0, MAX_SPOKEN_DEFICIENCIES)
+            .map((r) => cleanServiceDescription(r.description))
+            .filter(Boolean),
+        }),
+    // What the visit's services are FOR: the equipment each one names, or —
+    // when none does — the site's equipment on the visit's service lines.
+    // Spoken as type + where only (never make/model).
+    ...visitEquipment(svc, siteEquipment),
     // [{service_line, description}] — the pairing, for anything that needs to
     // state what the visit covers rather than just list categories.
     service_details: serviceDetails.length
@@ -396,6 +546,15 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
   });
   };
 
+  function visitEquipment(svcRows, site) {
+    const linked = svcRows.map((x) => x.equipment).filter(Boolean);
+    if (linked.length) return { equipment: linked, equipment_summary: summariseEquipment(linked), equipment_source: "service" };
+    const lineIds = new Set(svcRows.map((x) => x.service_line_id).filter((id) => id != null));
+    const onLines = lineIds.size ? site.filter((a) => lineIds.has(a.service_line_id)) : [];
+    if (onLines.length) return { equipment: onLines, equipment_summary: summariseEquipment(onLines), equipment_source: "site" };
+    return { equipment: [], equipment_summary: null, equipment_source: null };
+  }
+
   const upcoming = upcomingRaw.map((a, i) => shape(a, { isNext: i === 0 }));
   const history = historyRaw.map((a) => shape(a));
   const unconfirmed = upcoming.filter((a) => !a.customer_confirmed).length;
@@ -405,6 +564,7 @@ async function buildJobConfirmationContext(companyId, jobId, opts = {}) {
   return {
     ok: true,
     tz,
+    deficiency_policy: deficiencyPolicy,
     job: {
       id: job.id,
       job_number: job.job_number ?? null,
@@ -467,7 +627,10 @@ function toDynamicVariables(ctx) {
   // staleness argument above is about confirmation state, which changes while
   // the agent is talking; this does not.
   const next = ctx.appointments?.next || null;
-  const defCount = next?.open_issue_count || 0;
+  const policy = ctx.deficiency_policy || { mention: true, offerRepair: true, mentionLimit: 3 };
+  // "Don't mention deficiencies" turns the whole section off the same way a
+  // site with none does — the prompt branches on "0".
+  const defCount = policy.mention ? (next?.open_issue_count || 0) : 0;
   const previsit = Array.isArray(ctx.previsit_instructions) ? ctx.previsit_instructions : [];
   const mustAck = previsit.filter((i) => i.requires_acknowledgement === true);
   return {
@@ -492,8 +655,14 @@ function toDynamicVariables(ctx) {
     // Pipe-joined rather than a JSON array: dynamic variables are string-only,
     // and a stringified array reads aloud as punctuation.
     open_issue_details: defCount && next?.open_issue_details?.length
-      ? truncate(next.open_issue_details.join(" | "), MAX_COMMENT_CHARS)
+      ? truncate(next.open_issue_details.join(" | "), next.open_issue_source === "servicetrade" ? MAX_DEFICIENCY_CHARS : MAX_COMMENT_CHARS)
       : "none",
+    // Company settings (call_settings.deficiency_*): how many to name before
+    // the customer asks for more, and whether to offer the repair at all.
+    open_issue_mention_limit: String(policy.mentionLimit),
+    open_issue_offer_repair: policy.offerRepair ? "true" : "false",
+    // The equipment the next visit is for, spoken (type + where, no model).
+    next_equipment: next?.equipment_summary || "",
     // ── Pre-visit instructions (CMAP-230) ─────────────────────────────────
     // What the CUSTOMER must do before the technician arrives, authored by the
     // company against this job's type. Job-level by nature, so unlike
@@ -544,6 +713,8 @@ function toAppointmentsPayload(ctx) {
 }
 
 module.exports = {
+  // exported for tests
+  _internal: { equipmentPhrase, summariseEquipment, deficiencyItem, summariseSiteDeficiencies, SEVERITY_RANK },
   UPCOMING_STATUSES,
   buildJobConfirmationContext,
   toDynamicVariables,

@@ -26,6 +26,29 @@ const TOOL_SEEDS = [
   },
   {
     call_type: "customer_confirmation",
+    name: "record_repair_request",
+    description: "Call this ONLY after the customer says YES to having the technician repair the open deficiencies on this visit. Records what they agreed to so the office can arrange it (a todo, and a note on the CRM job). It does NOT book, schedule or price the repair — afterwards say you've passed it to the team.",
+    endpoint: "/retell/tools/record_repair_request",
+    speak_during_execution: false,
+    speak_after_execution: true,
+    execution_message_description: "One moment.",
+    // Not a write to appointments, so it stays available when the agent may
+    // not make changes — but only while the company offers repairs at all.
+    is_write_tool: false,
+    gated_by_setting: "deficiency_offer_repair",
+    sort_order: 15,
+    parameters: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "The job ID for this conversation ({{job_id}})." },
+        items: { type: "string", description: "Which open items they agreed to: \"all\", or their positions in the open-items list (\"1, 3\"), or a short description in the customer's words." },
+        notes: { type: "string", description: "Anything else the customer said about the repair (timing, access, who to contact). Optional." },
+      },
+      required: ["job_id", "items"],
+    },
+  },
+  {
+    call_type: "customer_confirmation",
     name: "search_contact",
     description: "Search ServiceTrade for an existing contact to email the service link to — by name, phone, or email. Use this BEFORE creating a new contact. Returns matching contacts with their contact_id so you can confirm the right person with the customer.",
     endpoint: "/retell/tools/search_contact",
