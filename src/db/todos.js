@@ -17,6 +17,9 @@ const TODO_TYPES = {
   // More contacts matched call_settings.confirmation_contact_types than the
   // per-customer recipient cap allows — see services/confirmation-recipients.js.
   RECIPIENTS_TRUNCATED: "RECIPIENTS_TRUNCATED",
+  // The customer accepted Clara's offer to repair open deficiencies on the
+  // visit (record_repair_request tool, migration 118).
+  REPAIR_REQUESTED: "REPAIR_REQUESTED",
 };
 
 /**

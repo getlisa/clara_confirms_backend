@@ -71,3 +71,15 @@ test("every opt-in flag the DB layer accepts is writable through the route (exce
   const missing = allowed.filter((f) => !ownRoute.has(f) && !new RegExp(`\\b${f}\\s*!== undefined`).test(route));
   assert.deepEqual(missing, [], `fields the DB accepts but PATCH /call-settings silently drops: ${missing.join(", ")}`);
 });
+
+test("deficiency settings: valid values are saved, invalid ones rejected", async () => {
+  let [status] = await patch({ deficiency_mention_enabled: false, deficiency_offer_repair: false, deficiency_mention_limit: 2 });
+  assert.equal(status, 200);
+  assert.deepEqual(upserts.at(-1), { deficiency_mention_enabled: false, deficiency_offer_repair: false, deficiency_mention_limit: 2 });
+  upserts.length = 0;
+  for (const body of [{ deficiency_mention_enabled: "yes" }, { deficiency_offer_repair: 1 }, { deficiency_mention_limit: 0 }, { deficiency_mention_limit: 11 }, { deficiency_mention_limit: 2.5 }]) {
+    [status] = await patch(body);
+    assert.equal(status, 400, JSON.stringify(body));
+  }
+  assert.equal(upserts.length, 0);
+});

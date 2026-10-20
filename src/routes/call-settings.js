@@ -64,7 +64,7 @@ router.patch("/", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
   try {
     const companyId = getCompanyId(req);
     if (!companyId) return res.status(403).json({ error: "Company context required" });
-    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled, crm_comment_writeback_enabled, service_link_enabled, channel_strategy, sms_on_callback_enabled, chat_link_delivery_method, confirmation_contact_types, job_confirmation_inference_enabled } = req.body;
+    const { business_hours_start, business_hours_end, max_attempts, voicemail_behavior, voicemail_message, include_weekends, alert_days_before, agent_can_make_changes, auto_schedule_enabled, auto_dispatch_enabled, crm_comment_writeback_enabled, service_link_enabled, channel_strategy, sms_on_callback_enabled, chat_link_delivery_method, confirmation_contact_types, job_confirmation_inference_enabled, deficiency_mention_enabled, deficiency_offer_repair, deficiency_mention_limit } = req.body;
     const fields = {};
     if (business_hours_start !== undefined) fields.business_hours_start = business_hours_start;
     if (business_hours_end   !== undefined) fields.business_hours_end   = business_hours_end;
@@ -110,6 +110,22 @@ router.patch("/", requirePermission(PERM.SETTINGS_EDIT), async (req, res) => {
       if (typeof crm_comment_writeback_enabled !== "boolean")
         return res.status(400).json({ error: "crm_comment_writeback_enabled must be a boolean" });
       fields.crm_comment_writeback_enabled = crm_comment_writeback_enabled;
+    }
+    // Open deficiencies on a call (migration 117).
+    if (deficiency_mention_enabled !== undefined) {
+      if (typeof deficiency_mention_enabled !== "boolean")
+        return res.status(400).json({ error: "deficiency_mention_enabled must be a boolean" });
+      fields.deficiency_mention_enabled = deficiency_mention_enabled;
+    }
+    if (deficiency_offer_repair !== undefined) {
+      if (typeof deficiency_offer_repair !== "boolean")
+        return res.status(400).json({ error: "deficiency_offer_repair must be a boolean" });
+      fields.deficiency_offer_repair = deficiency_offer_repair;
+    }
+    if (deficiency_mention_limit !== undefined) {
+      if (!Number.isInteger(deficiency_mention_limit) || deficiency_mention_limit < 1 || deficiency_mention_limit > 10)
+        return res.status(400).json({ error: "deficiency_mention_limit must be a whole number from 1 to 10" });
+      fields.deficiency_mention_limit = deficiency_mention_limit;
     }
     if (job_confirmation_inference_enabled !== undefined) {
       if (typeof job_confirmation_inference_enabled !== "boolean")

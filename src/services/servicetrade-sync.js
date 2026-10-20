@@ -486,6 +486,63 @@ async function syncChangedContacts(companyId, credentials, { updatedAfter = null
 }
 
 /**
+ * Deficiencies at the locations we hold (/deficiency). Nothing else in the
+ * regular sync reads them — the month-wide /servicerequest pass that used to
+ * fan them out is disabled — so until a job's Refresh read its location's
+ * deficiencies, the platform had none, and every first Refresh of a job
+ * reported them as "added" although nobody had changed anything in
+ * ServiceTrade. An incremental run reads only what changed since the cursor;
+ * a first/full/custom run reads them all. Deficiencies at locations we don't
+ * hold are skipped (nothing on the platform would show them).
+ */
+async function syncDeficiencies(companyId, credentials, params, counts) {
+  const { rows, complete } = await fetchAllPages(companyId, "/deficiency", "deficiencies", credentials, params);
+  const fetched = rows.filter((d) => d?.id != null);
+  if (!fetched.length) return { count: 0, complete };
+  const locationIds = [...new Set(fetched.map((d) => d.location?.id).filter((id) => id != null).map(String))];
+  const { locationIds: known } = await syncDb.filterKnownRefs(companyId, { locationIds });
+  const keep = fetched.filter((d) => d.location?.id != null && known.has(String(d.location.id)));
+  if (keep.length) {
+    await syncDb.upsertDeficienciesBatch(companyId, keep.map(mapDeficiencyRow));
+    counts.deficiencies += keep.length;
+  }
+  logger.info("ServiceTrade sync: deficiencies", { companyId, fetched: fetched.length, written: keep.length, complete });
+  return { count: keep.length, complete };
+}
+
+/**
+ * Assets (equipment) at the locations we hold (/asset, migration 117). Same
+ * cursor rules as syncDeficiencies: changed-since on an incremental run, all
+ * of them on a first/full/custom run. An asset's service line is written to
+ * the raw service-lines table too, so its FK resolves even when no service
+ * request has named that line yet.
+ */
+async function writeAssets(companyId, assets, counts) {
+  if (!assets.length) return 0;
+  await syncDb.upsertAssetsBatch(companyId, assets.map(mapAssetRow));
+  const lines = new Map();
+  for (const a of assets) if (a.serviceLine?.id != null) lines.set(a.serviceLine.id, a.serviceLine);
+  if (lines.size) await syncDb.upsertServiceLinesBatch(companyId, [...lines.values()].map(mapServiceLineRow));
+  counts.assets = (counts.assets || 0) + assets.length;
+  return assets.length;
+}
+
+async function syncAssets(companyId, credentials, params, counts) {
+  // /asset refuses an unfiltered list (405 "You must provide a locationId, …,
+  // updatedAfter, …") — a full pull is "updated since the epoch".
+  const query = params && Object.keys(params).length ? params : { updatedAfter: "0" };
+  const { rows, complete } = await fetchAllPages(companyId, "/asset", "assets", credentials, query);
+  const fetched = rows.filter((a) => a?.id != null);
+  if (!fetched.length) return { count: 0, complete };
+  const locationIds = [...new Set(fetched.map((a) => a.location?.id).filter((id) => id != null).map(String))];
+  const { locationIds: known } = await syncDb.filterKnownRefs(companyId, { locationIds });
+  const keep = fetched.filter((a) => a.location?.id != null && known.has(String(a.location.id)));
+  await writeAssets(companyId, keep, counts);
+  logger.info("ServiceTrade sync: assets", { companyId, fetched: fetched.length, written: keep.length, complete });
+  return { count: keep.length, complete };
+}
+
+/**
  * Contacts named directly — a webhook `contact` event. Fetched by id, so a
  * contact with no outstanding job (which the job-resolving drain used to skip
  * outright) is still refreshed, deactivations included.
@@ -585,6 +642,17 @@ function mapJobCommentRow(c, servicetradeJobId) {
 function mapDeficiencyRow(d) {
   // /deficiency records carry `title`; older embeds carried `name`.
   return { servicetrade_id: Number(d.id), ref_number: d.refNumber ?? null, name: d.title ?? d.name ?? null, description: d.description ?? null, payload: d };
+}
+
+function mapAssetRow(a) {
+  return {
+    servicetrade_id: Number(a.id),
+    servicetrade_location_id: a.location?.id != null ? Number(a.location.id) : null,
+    type: a.type ?? null,
+    name: a.name ?? null,
+    status: a.status ?? null,
+    payload: a,
+  };
 }
 
 function mapChangeOrderRow(co) {
@@ -807,10 +875,21 @@ async function syncJobRelated(companyId, credentials, jobs, counts) {
   const deficienciesByLocation = Object.fromEntries(
     perLocation.filter((l) => l.complete).map((l) => [l.locationId, l.rows.map((d) => String(d.id))])
   );
+
+  // The equipment at each location — what the visit's services are for.
+  const perLocationAssets = await mapWithConcurrency(locationIds, API_CONCURRENCY, async (locationId) => {
+    const r = await fetchAllPages(companyId, "/asset", "assets", credentials, { locationId });
+    if (!r.complete) complete = false;
+    return { locationId, rows: r.rows.filter((a) => a?.id != null), complete: r.complete };
+  });
+  await writeAssets(companyId, perLocationAssets.flatMap((l) => l.rows), counts);
+  const assetsByLocation = Object.fromEntries(
+    perLocationAssets.filter((l) => l.complete).map((l) => [l.locationId, l.rows.map((a) => String(a.id))])
+  );
   logger.info("ServiceTrade sync: job related records", {
     companyId, jobs: jobs.length, serviceRequests: serviceRequests.length, deficiencies: deficiencies.length, complete,
   });
-  return { complete, deficienciesByLocation };
+  return { complete, deficienciesByLocation, assetsByLocation };
 }
 
 // ── Main sync ───────────────────────────────────────────────────────────────
@@ -856,7 +935,7 @@ async function runSync(companyId, options = {}) {
   const counts = {
     customers: 0, jobs: 0, appointments: 0, technicians: 0, locations: 0, contacts: 0, offices: 0, tags: 0,
     users: 0, projects: 0,
-    serviceRequests: 0, serviceLines: 0, deficiencies: 0, changeOrders: 0, contracts: 0, serviceRecurrences: 0,
+    serviceRequests: 0, serviceLines: 0, deficiencies: 0, assets: 0, changeOrders: 0, contracts: 0, serviceRecurrences: 0,
     appointmentServiceLines: 0, appointmentServiceRequests: 0, jobComments: 0,
   };
   // Tracks which entities' fetches ran to completion this pass — an entity's
@@ -1134,6 +1213,21 @@ async function runSync(companyId, options = {}) {
       await engine.emit("fetched", { entity: "contacts", count: counts.contacts });
       await engine.emit("fetched", { entity: "users", count: counts.users });
       await engine.emit("fetched", { entity: "projects", count: counts.projects });
+    }
+
+    // --- Deficiencies (/deficiency) ---------------------------------------
+    // Same cursor rules as the changed-contacts pass below: incremental runs
+    // borrow the jobs cursor (and hold it back on a failed fetch), a full or
+    // custom-window run reads every deficiency, a first sync (no cursor yet)
+    // reads them all too. Targeted runs skip it — a job Refresh reads its own
+    // location's deficiencies (withRelated).
+    if (!targeted) {
+      const deficiencies = await syncDeficiencies(companyId, credentials,
+        full || customWindow ? {} : cursorParams(state?.last_jobs_updated_at), counts);
+      if (!deficiencies.complete) complete.jobs = false;
+      const assets = await syncAssets(companyId, credentials,
+        full || customWindow ? {} : cursorParams(state?.last_jobs_updated_at), counts);
+      if (!assets.complete) complete.jobs = false;
     }
 
     // --- Contacts that changed without a job changing ---------------------
@@ -1482,4 +1576,6 @@ module.exports = {
   fetchAllPages,
   buildServiceRequestParams,
   buildJobParams,
+  syncDeficiencies,
+  syncAssets,
 };

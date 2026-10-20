@@ -222,7 +222,7 @@ async function registerToolsForAllCompanies() {
 // caller that updates call_settings (REST route, copilot tool, future ones)
 // can trigger the same re-registration by calling the helper below instead of
 // each re-implementing its own "did a tool-relevant field change" check.
-const TOOL_AFFECTING_SETTINGS = ["agent_can_make_changes", "service_link_enabled"];
+const TOOL_AFFECTING_SETTINGS = ["agent_can_make_changes", "service_link_enabled", "deficiency_offer_repair"];
 
 /**
  * Re-register a company's Retell tools if any changed field affects tool

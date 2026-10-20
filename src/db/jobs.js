@@ -348,7 +348,13 @@ async function listJobTypes(companyId) {
   return rows.map((r) => r.job_type);
 }
 
-async function getJobById(id, companyId) {
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.withDeficiencies] — add structured deficiencies to the
+ *   job and to each visit (attachDeficiencies). Off by default: this read sits
+ *   on the voice-dispatch path, where every extra query is dead air.
+ */
+async function getJobById(id, companyId, { withDeficiencies = false } = {}) {
   const result = await db.query(
     `SELECT j.*,
             c.full_name     AS customer_name,
@@ -445,7 +451,91 @@ async function getJobById(id, companyId) {
 
   job.contacts = await getJobContacts(id, companyId, row);
 
+  if (withDeficiencies) await attachDeficiencies(companyId, job, row.location_id ?? null);
+
   return job;
+}
+
+// Visit statuses a deficiency can still be acted on at. Same set the
+// confirmation sweep treats as upcoming work.
+const OPEN_VISIT_STATUSES = new Set(["scheduled", "confirmed", "pending"]);
+
+/**
+ * Structured deficiencies on a job (docs/crm-sync-frontend.md §2a).
+ *
+ * `job.deficiencies` — every OPEN deficiency at the job's site (plus any tied
+ * to the job itself), in the same shape GET /locations/:id/deficiencies
+ * returns, with `severity`, `service_line` and `visit_ids` added.
+ *
+ * `appointment.deficiencies` — the ones that concern that visit, each with a
+ * `relation`:
+ *   - "repair_offered": the visit carries it as a deficiency_repair service
+ *     (InspectPoint projects a site's open deficiencies onto its next visit);
+ *   - "open_at_site": the job's NEXT upcoming visit also lists every other
+ *     open deficiency at the site. ServiceTrade has no visit-level link (10
+ *     service requests in the whole database point at a deficiency), so this
+ *     is how its deficiencies reach a visit at all.
+ *
+ * Capped at 200 per site, like the locations API — plus any deficiency a
+ * visit's repair row points at, so the cap can never drop one off a visit.
+ *
+ * It also SEPARATES the two entities in the response: a deficiency_repair
+ * row is a deficiency, not a service, so it leaves `appt.services` (which is
+ * left with booked work only) and lives on `appt.deficiencies`. Only this
+ * opt-in API path does that — the agent's context (job-confirmation-context)
+ * reads getJobById without the option and still sees the repair rows it
+ * offers on calls.
+ */
+async function attachDeficiencies(companyId, job, locationId) {
+  const { presentDeficiency } = require("./locations");
+  const repairIds = [...new Set((job.appointments || []).flatMap((a) => (a.services || [])
+    .filter((svc) => svc.kind === "deficiency_repair" && svc.deficiency_id != null)
+    .map((svc) => svc.deficiency_id)))];
+  const { rows } = await db.query(
+    `SELECT d.*, sl.name AS service_line_name,
+            ast.type AS asset_type, ast.type_label AS asset_type_label, ast.location_in_site AS asset_location_in_site
+       FROM deficiencies d
+       LEFT JOIN service_lines sl ON sl.id = d.service_line_id
+       LEFT JOIN assets ast ON ast.id = d.asset_id
+      WHERE d.company_id = $1
+        AND ((d.is_resolved = false AND (d.job_id = $2 OR ($3::int IS NOT NULL AND d.location_id = $3)))
+             OR d.id = ANY($4::int[]))
+      ORDER BY d.opened_at DESC NULLS LAST, d.id DESC
+      LIMIT 200`,
+    [companyId, job.id, locationId, repairIds]
+  );
+  const byId = new Map(rows.map((r) => [r.id, {
+    ...presentDeficiency(r),
+    severity: r.additional_information?.severity ?? null,
+    service_line: r.service_line_name ?? null,
+    visit_ids: [],
+  }]));
+
+  const now = Date.now();
+  const nextVisit = (job.appointments || [])
+    .filter((a) => OPEN_VISIT_STATUSES.has(a.status) && a.scheduled_start && new Date(a.scheduled_start).getTime() >= now)
+    .sort((a, b) => new Date(a.scheduled_start) - new Date(b.scheduled_start))[0] || null;
+
+  for (const appt of job.appointments || []) {
+    const linked = [];
+    const seen = new Set();
+    for (const svc of appt.services || []) {
+      const d = svc.deficiency_id != null ? byId.get(svc.deficiency_id) : null;
+      if (d && !seen.has(d.id)) { seen.add(d.id); linked.push({ ...d, relation: "repair_offered" }); }
+    }
+    if (nextVisit && appt.id === nextVisit.id) {
+      for (const d of byId.values()) {
+        if (!seen.has(d.id)) { seen.add(d.id); linked.push({ ...d, relation: "open_at_site" }); }
+      }
+    }
+    for (const d of linked) byId.get(d.id).visit_ids.push(appt.id);
+    appt.deficiencies = linked.map(({ visit_ids, ...d }) => d);
+    // Booked work only — the repair rows are now appt.deficiencies.
+    appt.services = (appt.services || []).filter((svc) => (svc.kind || "service") !== "deficiency_repair");
+  }
+
+  job.deficiencies = [...byId.values()];
+  job.deficiency_summary = { open: job.deficiencies.length };
 }
 
 /**
@@ -516,10 +606,15 @@ async function fetchServicesByAppointment(companyId, appointmentIds) {
             -- (migration 110). job-confirmation-context partitions on it; without
             -- it selected here, repairs fall through as ordinary services and
             -- land in the agent opening line.
-            aps.kind, aps.asset, aps.deficiency_id,
-            sl.name AS service_line_name, sl.trade AS service_line_trade
+            aps.kind, aps.asset, aps.deficiency_id, aps.service_line_id, aps.asset_id,
+            sl.name AS service_line_name, sl.trade AS service_line_trade,
+            -- The equipment this service is for (migration 117). Type and
+            -- where it sits in the site — never the asset name, which carries
+            -- make/model ("Alarm System - Notifier NFS-320C …").
+            ast.type AS asset_type, ast.type_label AS asset_type_label, ast.location_in_site AS asset_location_in_site
        FROM appointment_services aps
        LEFT JOIN service_lines sl ON sl.id = aps.service_line_id
+       LEFT JOIN assets ast ON ast.id = aps.asset_id
       WHERE aps.company_id = $1 AND aps.appointment_id = ANY($2::int[])
       ORDER BY aps.appointment_id, aps.id`,
     [companyId, appointmentIds]
@@ -536,6 +631,11 @@ async function fetchServicesByAppointment(companyId, appointmentIds) {
       kind: r.kind || "service",
       asset: r.asset || null,
       deficiency_id: r.deficiency_id ?? null,
+      service_line_id: r.service_line_id ?? null,
+      asset_id: r.asset_id ?? null,
+      equipment: r.asset_id && r.asset_type !== "location"
+        ? { type: r.asset_type ?? null, type_label: r.asset_type_label ?? null, location_in_site: r.asset_location_in_site ?? null }
+        : null,
       service_line_name: serviceLineName,
       service_line_trade: serviceLineTrade,
       // `service_line` is the NAME, and must keep being emitted: five call
