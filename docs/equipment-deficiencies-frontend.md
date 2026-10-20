@@ -9,6 +9,8 @@
 > Three new company settings control this. There's a new Todo type, and an equipment list
 > per location. Builds on `crm-sync-frontend.md` §2a (deficiencies on a job).
 
+Applies to **voice calls and web chat** alike: the same settings, wording rules and `REPAIR_REQUESTED` Todo. The chat widget needs no changes; it just shows the messages.
+
 Base URL: `VITE_API_URL` · Auth: `Authorization: Bearer <token>` · gate on `user.permissions`.
 
 ## 0. What to build

@@ -29,6 +29,7 @@ const HANDLERS = [
   require("./handlers/propose-remaining-appointments"),
   require("./handlers/decline-remaining-appointments"),
   require("./handlers/capture-confirmer-identity"),
+  require("./handlers/record-repair-request"),
 ];
 
 const byName = new Map(HANDLERS.map((h) => [h.name, h]));
@@ -107,7 +108,13 @@ const CAPABILITY_TOOLS = {
  *   module (defaults to every capability being on when omitted, so existing
  *   callers/tests that don't pass one keep today's ServiceTrade behavior).
  */
-function getToolsForPhase(phase, { isOpeningTurn = false, exclusiveTool = null, workflow = null } = {}) {
+/**
+ * @param {object} [opts.repairOffer] — `{ offerRepair, hasOpenIssues }` from the
+ *   job context (call_settings.deficiency_* + the site's open items).
+ *   record_repair_request is bound only when the company offers repairs AND
+ *   there is something to repair — same gate as the voice tool.
+ */
+function getToolsForPhase(phase, { isOpeningTurn = false, exclusiveTool = null, workflow = null, repairOffer = null } = {}) {
   const toolsByName = build();
   if (exclusiveTool) {
     return [toolsByName.get(exclusiveTool)].filter(Boolean);
@@ -123,6 +130,9 @@ function getToolsForPhase(phase, { isOpeningTurn = false, exclusiveTool = null, 
     ...(isOpeningTurn ? [] : ["end_conversation", "report_customer_intent"]),
   ]);
   for (const n of withheld) names.delete(n);
+  if (!isOpeningTurn && repairOffer?.offerRepair && repairOffer?.hasOpenIssues && (phase === "confirming" || phase === "all_confirmed")) {
+    names.add("record_repair_request");
+  }
   return [...names].map((n) => toolsByName.get(n)).filter(Boolean);
 }
 

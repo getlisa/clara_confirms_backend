@@ -177,6 +177,21 @@ function derive(ctx, opts) {
     // match: they are already resolved for this job by
     // buildJobConfirmationContext and ride in on ctx.
     previsitInstructions: Array.isArray(ctx.previsit_instructions) ? ctx.previsit_instructions : [],
+    // Open deficiencies at the site + how the company wants them handled
+    // (call_settings.deficiency_*, migration 117). "Don't mention" removes
+    // the section entirely, like a site with none.
+    openIssues: (() => {
+      const policy = ctx.deficiency_policy || { mention: true, offerRepair: true, mentionLimit: 3 };
+      const n = ctx.appointments?.next;
+      if (!policy.mention || !n?.open_issue_count) return null;
+      return {
+        count: n.open_issue_count,
+        summary: n.open_issue_summary || `${n.open_issue_count} open items`,
+        details: Array.isArray(n.open_issue_details) ? n.open_issue_details : [],
+        limit: policy.mentionLimit || 3,
+        offerRepair: policy.offerRepair !== false,
+      };
+    })(),
     confirmedBy,
     recipientEmail,
     recipientPhone,
@@ -285,7 +300,7 @@ const APPOINTMENT_DATA = (d) => {
   ${formatServices(next) ? formatServices(next).replace(/^for /, "") : "no services recorded"}
 - Full crew for the next visit:
   ${formatCrewDetail(next) || "no technician assigned yet"}
-
+${next.equipment_summary ? `- The equipment the next visit is for (type and where it is): ${next.equipment_summary}. Use it to say WHAT is being serviced when confirming or when they ask. Equipment type and where it is only — never a make, model, part or serial number.\n` : ""}
 `
     : "";
 
@@ -704,6 +719,38 @@ ${d.recipientEmail
 4. If the customer asks to see the link at any point in the conversation, call get_service_link immediately — even if you're past this section.
 ${optLine(d.companyPhone, `5. If they have questions or want to speak to someone: "You're also welcome to reach the team directly at ${d.companyPhone}."`)}`;
 
+/**
+ * Open deficiencies at the site (ServiceTrade with severity/equipment/fix, or
+ * InspectPoint's failed checks) — same product rules as the voice prompt's
+ * STEP 4: name only the worst few, read the rest when asked, offer the repair
+ * when the company does, and record a yes with record_repair_request.
+ */
+const OPEN_ITEMS = (d) => {
+  const o = d.openIssues;
+  const list = o.details.map((t, i) => `  ${i + 1}. ${t}`).join("\n");
+  return `${BAR}
+OPEN ITEMS AT THIS SITE
+${BAR}
+
+${o.summary}. You have ALL of them (worst first):
+${list}
+
+Send this ONCE, after the appointment is settled (after the arrival time${d.previsitInstructions.length ? " and pre-visit requirements" : ""}) and before ENDING THE CONVERSATION — never in the opening message, and not at all if they cancelled.
+
+→ Tell them there are ${o.summary} from the last inspection, and name the most serious ones — the first ${o.limit} at most, in that order, each as equipment + where it is + the problem, in plain words. Never a make, model, part or serial number. Some items read "<what was checked> — <result>" ("Bulb Gaskets — Fail"): state them as findings, never as questions.
+→ Items that say "A repair is already in progress." or "A repair quote has already been sent." are a status — mention them as such and never offer them again.
+${o.offerRepair
+  ? `→ Then offer: "Our technician can take care of those while they're there for this visit — would you like them to?" Only items not already in progress.
+→ YES: call record_repair_request with the items they agreed to (their numbers from the list above, or "all"), then: "Great — I've passed that to our team so they can arrange it with the technician."
+→ NO: "Understood — the team can follow up separately." Ask once only.`
+  : `→ Do not offer the repair — just say the team can follow up with them about it.`}
+→ They ask whether there are MORE: share the remaining items, two or three at a time.
+→ They ask HOW MUCH: you have no pricing — "I'll have the team follow up with that." Never estimate or call the work small.
+→ They dispute an item or say it was fixed: "Thanks for letting me know — I'll flag that so the team can check."
+Never say the repair is booked, scheduled or added to the work order — you passed it to the team.
+`;
+};
+
 const ENDING = `${BAR}
 ENDING THE CONVERSATION
 ${BAR}
@@ -794,6 +841,7 @@ function build(ctx, opts = {}) {
     // After ARRIVAL WINDOW on purpose: these are delivered last, and a company
     // that has authored none gets no section at all.
     d.previsitInstructions.length > 0 && PREVISIT_REQUIREMENTS(d),
+    d.openIssues && OPEN_ITEMS(d),
     d.showOtherAppointments && OTHER_APPOINTMENTS(d),
     // A CRM with no customer-facing job-tracking link (workflow.capabilities.
     // serviceLink === false) never gets this section — matches
