@@ -170,7 +170,14 @@ async function buildGraph() {
     // bound tools agree on whether the service link is offered at all.
     const workflow = withServiceLinkSetting(getWorkflow(state.workflowSlug), state.serviceLinkEnabled);
 
-    const tools = getToolsForPhase(state.phase, { isOpeningTurn, exclusiveTool, workflow });
+    // Open deficiencies (call_settings.deficiency_*): the repair tool exists
+    // only when the company offers repairs and the site has open items.
+    const defPolicy = state.jobCtx?.deficiency_policy || {};
+    const repairOffer = {
+      offerRepair: defPolicy.mention !== false && defPolicy.offerRepair !== false,
+      hasOpenIssues: (state.jobCtx?.appointments?.next?.open_issue_count || 0) > 0,
+    };
+    const tools = getToolsForPhase(state.phase, { isOpeningTurn, exclusiveTool, workflow, repairOffer });
     // state.jobCtx (buildJobConfirmationContext's raw result) has no `phase`
     // field of its own — phase is a separate Annotation this graph computes
     // alongside it (phaseFromContext) — so it must be merged in explicitly;
